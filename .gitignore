@@ -9,6 +9,12 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Service account keys — never commit
+*.json.key
+*-service-account.json
+**/credentials/*.json
+.secrets/
+
 # Build / dependency artifacts (placeholders for future stacks)
 node_modules/
 dist/
