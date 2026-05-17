@@ -2,14 +2,14 @@
 
 - Status: research notes (FFF-22)
 - Owner: Research Agent
-- Last updated: 2026-05-17 (revised — official integrations page located, see §3.4)
+- Last updated: 2026-05-17 (revision 3 — `/api/devices` confirmed against real hardware; cleanup-on-job-end dropped from scope)
 - Scope: how to assign a SOCKS5 proxy to a specific physical Android device, programmatically, using GenRouter
 
 This document covers what is publicly documented by the vendor (GenFarmer / GenRouter / fast-router-proxy), separates observations from conclusions, and lists what still needs to be verified on real hardware before we commit to a design.
 
 Confidence labels used below: **confirmed** (quoted from vendor docs we read), **likely** (consistent across multiple vendor pages but not directly quoted), **assumption** (our inference), **unknown** (we could not find authoritative information).
 
-> **TL;DR (2026-05-17 revision):** the vendor *does* publish a REST API spec at [`/genrouter/how-to-use/integrations`](https://fast-router-proxy.gitbook.io/genrouter/how-to-use/integrations) — see §3.4. Device-row is keyed by **IP**, no auth, bulk endpoint exists, base is `http://192.168.5.1:9000`. This collapses most of §6's unresolved questions but does NOT replace the need for one hardware verification run, because (a) the GitBook URLs that this product publishes have already produced inconsistent answers (§3.2), and (b) we still need to confirm DHCP-IP stability before designing the orchestrator's device→proxy resolution path.
+> **TL;DR (2026-05-17 revision 3):** the vendor publishes a REST API at [`/genrouter/how-to-use/integrations`](https://fast-router-proxy.gitbook.io/genrouter/how-to-use/integrations) — see §3.4. Device-row is keyed by **IP**, no auth, bulk endpoint exists, base is `http://192.168.5.1:9000`. `GET /api/devices` has now been **hardware-verified** from the operator's phone (§3.4.1) — shape matches the doc with one wrapping `{"data": [...]}` envelope and one extra field `is_current_device`. The remaining hardware checks (`POST /api/update_proxy` round-trip, egress change, IP stability) are gated on the in-flight VPS-side router tunnel. **Scope simplification:** the operator confirmed that end-of-job proxy cleanup is not required — orchestrator only needs to set the right proxy at job start, so question #11 ("how do we clear a proxy?") is **closed (not needed)**.
 
 ---
 
@@ -106,7 +106,7 @@ The vendor publishes a dedicated integrations page that **does** document a REST
 
 Response: `{"success": true}`. Multiple IPs in a single map = one bulk call.
 
-**`GET /api/devices` — response shape (verbatim):**
+**`GET /api/devices` — response shape (verbatim from vendor doc):**
 
 ```json
 {
@@ -126,8 +126,42 @@ Response: `{"success": true}`. Multiple IPs in a single map = one bulk call.
 - **Device key = IP**, not MAC. This is the load-bearing fact. A phone that gets a new DHCP lease becomes a different row for `update_proxy` purposes. The orchestrator must therefore resolve `phone → current IP` at job start by querying `/api/devices` and matching on MAC (the stable identifier). We cannot cache device-row IDs across jobs.
 - **No auth** simplifies the call site but also means anyone on the LAN can rebind proxies — keep GenRouter on the trusted network only (Tailscale subnet, not the public WAN).
 - **Bulk endpoint** lets the orchestrator do an atomic batch rebind if we ever need it (e.g. shift N accounts onto M phones in one shot).
-- **No documented "clear proxy" verb** — open question: do we send a body without that IP key, or send a null/empty value? Needs one hardware test.
-- The page does **not** document GenFarmer ↔ GenRouter relay, webhooks, events, or external/cloud access. External reach (VPS → GenRouter) is an operator-side topology problem (port-forward / Tailscale subnet route / GenFarmer relay), not an API problem.
+- ~~**No documented "clear proxy" verb** — open question: do we send a body without that IP key, or send a null/empty value? Needs one hardware test.~~ — **dropped (rev 3):** operator confirmed end-of-job cleanup is not required. Orchestrator overwrites at job start; whatever proxy is left on a row between jobs is irrelevant. See §4.
+- The page does **not** document GenFarmer ↔ GenRouter relay, webhooks, events, or external/cloud access. External reach (VPS → GenRouter) is an operator-side topology problem (port-forward / Tailscale subnet route / GenFarmer co-located in same LAN), not an API problem — see §3.4.2.
+
+### 3.4.1 Hardware verification of `GET /api/devices` (added 2026-05-17, rev 3) — **confirmed (hardware)**
+
+The operator opened `http://192.168.5.1:9000/api/devices` from a phone on the GenRouter LAN. Real response (excerpt, hostnames redacted where they were identifying):
+
+```json
+{
+  "data": [
+    { "ip": "192.168.5.25", "mac": "dc:04:5a:20:b1:da", "hostname": "*",          "connected": true, "is_current_device": false },
+    { "ip": "192.168.5.35", "mac": "dc:04:5a:20:b1:e4", "hostname": "*",          "connected": true, "is_current_device": false },
+    { "ip": "192.168.5.33", "mac": "dc:04:5a:20:b1:e2", "hostname": "SM-G781B",   "connected": true, "is_current_device": false }
+  ]
+}
+```
+
+Three deltas vs. the vendor doc, all benign:
+
+1. **Wrapper.** Response is `{"data": [...]}`, not a bare array. The doc actually showed this too (re-read §3.4 sample), so no change — note here for clarity because hardware confirmed it.
+2. **Extra field `is_current_device: bool`.** Not in the doc. Probably marks whichever row corresponds to the caller's own MAC/IP. Operator's call returned `false` for every row, consistent with the request originating from a separate client (not from one of the listed devices' own browsers). Orchestrator can **ignore this field** — selection still happens by MAC.
+3. **`hostname` is often `"*"`.** Two of three rows use the placeholder, one carries a real device model (`SM-G781B`, Samsung Galaxy S20 FE 5G). Treat `hostname` as **decorative / unreliable** — never as a stable key. MAC is the only safe anchor.
+
+Also confirmed by inspection of this response: this unit's LAN segment is `192.168.5.0/24` (not `192.168.8.0/24` — both are documented as possible bases). So for this specific deployment, base URL is `http://192.168.5.1:9000`.
+
+Status of §3.4 endpoint table — `GET /api/devices` row is now **confirmed (hardware)**. The other rows remain **confirmed (vendor doc) / unverified (hardware)** until §5 steps 3–4 run from the VPS.
+
+### 3.4.2 GenFarmer ↔ GenRouter binding — clarified (2026-05-17, rev 3)
+
+Operator clarified that GenFarmer's "Setup Router" linkage is **not** an API relay or proxy. It just lets the GenFarmer desktop client drive the GenRouter web UI from inside its own window — both processes must be on the same LAN as the router to use it. So:
+
+- It does **not** give a VPS-side caller a path through GenFarmer to reach GenRouter's API.
+- It is **not relevant** for the FFF-22 design as long as the planned "forward router-UI onto VPS" topology lands separately (which is the actual gate for VPS reach).
+- Deferred until / unless we find a use case beyond what direct HTTP to `/api/...` already covers.
+
+This closes the "is GenFarmer a relay?" speculation from comment 6 above (`6bb85b65`).
 
 **Why we still don't blindly trust this:** the same product publishes the `?ask=…` AI answerer that produced the contradictory answers in §3.2, *and* the integrations page does not show timestamps or version pinning, *and* there is no statement of API stability across firmware updates. One first-hand verification run from the real router (§5) converts these claims to **confirmed (hardware)**.
 
@@ -140,11 +174,13 @@ Our invariants (from `docs/architecture.md` §2):
 
 This produces a clear constraint: **the proxy follows the account, not the phone.** So any GenRouter binding we settle on has to be re-pointable at job start: when account `A` is loaded onto whichever free phone `P` we just claimed, `A`'s SOCKS5 must end up applied to `P`'s traffic.
 
+**Lifecycle simplification (rev 3, operator confirmed):** the orchestrator only needs to guarantee **state at job *start***. End-of-job cleanup is *not* a requirement. Whatever proxy is left on a device row between jobs is irrelevant, because the next job that uses that phone will overwrite it before doing anything observable. This eliminates one whole class of "we crashed before cleanup ran, now the next account leaks egress through the previous account's proxy" failure modes — the start-of-job overwrite is itself the safety barrier.
+
 Three plausible architectures (none are confirmed; each needs a hardware PoC):
 
 | Option | How it would work | Pros | Cons / risks |
 |---|---|---|---|
-| **A. UI-scripted per-job rewrite** | At job start, talk to GenRouter (HTTP or scripted UI) to set the proxy on the row matching phone `P`'s MAC/IP. Restore at job end. | Maps cleanly onto MVP; one source of truth per phone at any moment. | Requires a real API, or scripting the web UI — the latter is brittle and slow. |
+| **A. UI-scripted per-job rewrite** | At job start, talk to GenRouter (HTTP or scripted UI) to set the proxy on the row matching phone `P`'s MAC/IP. No restore at job end (operator-confirmed: not required). | Maps cleanly onto MVP; one source of truth per phone at job start; no cleanup path to fail. | Requires a real API, or scripting the web UI — the latter is brittle and slow. |
 | **B. Per-account SSID** | Pre-create one SSID per account (up to 32 per router); each SSID already has the account's SOCKS5 attached. At job start, make phone `P` connect to account `A`'s SSID. | No live rewrite; isolation by network is strong. | Only works if SSIDs can carry a per-SSID proxy (unconfirmed §2.2). Caps at ~32 accounts per router. Switching SSIDs from ADB needs verification. |
 | **C. Skip GenRouter, set proxy on device** | Configure SOCKS5 on the Android side (Wi-Fi proxy settings, or `iptables` via root, or per-app via Appium proxy capability). | No GenRouter coupling. | Wi-Fi proxy on Android is HTTP-only; SOCKS5 typically needs root or a per-app helper. Loses GenRouter's "no app on device" detectability win. |
 
@@ -154,15 +190,15 @@ Three plausible architectures (none are confirmed; each needs a hardware PoC):
 
 These are scoped to the device-environment-layer project and avoid the "no destructive device commands" rule. Each PoC should land its commands and outputs under `scripts/research/` with secrets redacted.
 
-> **Revision 2026-05-17:** §3.4 located a documented API, so the original "capture the SPA's network traffic" PoC is no longer the critical path. The new critical path is **verify the documented endpoints against the real router** (steps 1–4 below). Browser-traffic capture (step 6) is now only a fallback for if the documented endpoints turn out to be wrong or out-of-date.
+> **Revision 2026-05-17 (rev 3):** §3.4 located a documented API; step 1 below (`GET /api/devices` from phone) is now **done** — see §3.4.1. The remaining critical path is **verify the rest of the endpoints from VPS** once the operator's router-tunnel-onto-VPS work lands (steps 2–4). Browser-traffic capture (step 6) is fallback only.
 
-1. **GET /api/devices from the phone.** From the test phone's browser, open `http://192.168.5.1:9000/api/devices`. Two seconds of work that confirms the endpoint is alive and the response shape matches §3.4. Record the JSON.
+1. ~~**GET /api/devices from the phone.**~~ **Done 2026-05-17.** Operator pulled `http://192.168.5.1:9000/api/devices` from a phone browser; response matches §3.4 shape with a wrapping `{"data": [...]}` envelope and one extra ignorable `is_current_device` field — see §3.4.1.
 2. **GET /api/devices from VPS (once the operator's pending router-on-VPS forward is in place).** Same call, run from the VPS shell. If responses match the phone-side call, VPS reach works. If the base URL from VPS is something other than `http://192.168.5.1:9000` (e.g. `localhost:9000` if it's a TCP forward, or the phone's Tailscale 100.x.y.z IP if subnet routing was used), record the actual URL — this is what `GENROUTER_BASE_URL` needs to be set to in the VPS env.
-3. **POST /api/update_proxy round-trip on one idle device.** From VPS shell, on a phone that is **not** currently running a job, send the `update_proxy` body from §3.4 with a known-harmless test SOCKS5 (e.g. a localhost stub or an unroutable RFC 5737 address like `socks5://test:test@192.0.2.1:1080`). Expect `{"success": true}`. Then restore the original proxy value the device had before the test.
-4. **Verify egress actually changes.** With the test proxy active on the device, ADB `shell curl https://api.ipify.org` from the device. The public IP should reflect the SOCKS5 server, not the router's WAN. Restore the original proxy after.
-5. **IP-stability check (one-time).** Toggle airplane mode on the test phone (or reboot it), wait for it to rejoin the GenRouter SSID, call `/api/devices` again, and confirm whether the same MAC still has the same IP. If IP drifts: orchestrator must lookup `MAC → current IP` at job start (one extra GET per job, no blocker). If IP is stable: simpler.
-6. **Fallback only if step 1–3 fail:** capture the admin UI's actual XHRs (the existing `docs/research/genrouter-operator-checklist.md` covers this). Useful only if the documented endpoints in §3.4 turn out to disagree with the live firmware.
-7. **One vendor question worth asking** (lower priority now): how to *clear* a per-device proxy via `/api/update_proxy` — omit the IP key, send `null`, send empty value, or call a separate endpoint? We need this for job cleanup.
+3. **POST /api/update_proxy round-trip on one idle device.** From VPS shell, on a phone that is **not** currently running a job, send the `update_proxy` body from §3.4 with a known-harmless test SOCKS5 (e.g. a localhost stub or an unroutable RFC 5737 address like `socks5://test:test@192.0.2.1:1080`). Expect `{"success": true}`. No restore step required (cleanup is not in scope — see §4); just leave the test value on the row, or overwrite it with a second POST if you want to leave the device usable.
+4. **Verify egress actually changes.** With the test proxy active on the device, ADB `shell curl https://api.ipify.org` from the device. The public IP should reflect the SOCKS5 server, not the router's WAN.
+5. **IP-stability check (one-time).** Toggle airplane mode on the test phone (or reboot it), wait for it to rejoin the GenRouter SSID, call `/api/devices` again, and confirm whether the same MAC still has the same IP. If IP drifts: orchestrator must lookup `MAC → current IP` at job start (one extra GET per job, no blocker). If IP is stable: simpler. — This step is independent of the VPS tunnel and can be run from the phone right now.
+6. **Fallback only if step 2–3 fail:** capture the admin UI's actual XHRs (the existing `docs/research/genrouter-operator-checklist.md` covers this). Useful only if the documented endpoints in §3.4 turn out to disagree with the live firmware.
+7. ~~**One vendor question worth asking** (lower priority now): how to *clear* a per-device proxy via `/api/update_proxy`…~~ — **dropped (rev 3):** cleanup not required.
 
 ## 6. Unresolved questions
 
@@ -178,16 +214,18 @@ These map back to the architecture's open-questions list (`docs/architecture.md`
 8. **Concurrent writers.** Still **unknown** — bulk-call form in §3.4 suggests the orchestrator should serialize writes through one process anyway.
 9. **Cap on simultaneous bindings.** Still **unknown** at the API layer; vendor marketing says "up to 50 devices" per unit.
 10. **Mini PC Router parity.** Still **unknown** — assume the documented API is the same surface, re-verify when/if we move to that SKU.
-11. **(new) How do we clear a per-device proxy?** Omit the IP key on the next POST? Send empty/null? Separate endpoint? Needed for job cleanup. Vendor ask in §5 step 7.
+11. ~~**(new) How do we clear a per-device proxy?**~~ — **closed (rev 3): not needed.** Operator confirmed cleanup-at-job-end is out of scope; start-of-job overwrite is the only state guarantee we need.
 12. **(new) Reach from VPS.** Operator request to forward router-UI onto VPS is in-flight. Once landed, confirm whether the base URL the VPS hits is `http://192.168.5.1:9000` (subnet route), `localhost:9000` (port-forward), or a Tailscale 100.x address. This is the value that goes into `GENROUTER_BASE_URL`.
+13. **(new) `is_current_device` semantics.** §3.4.1 found this field; the orchestrator can ignore it for proxy assignment, but it's worth one line in the eventual integration doc to note that the field exists and is keyed off the caller's identity, not the row's role.
 
-## 7. Recommendation (revised 2026-05-17 — medium confidence)
+## 7. Recommendation (revised 2026-05-17, rev 3 — medium/high confidence)
 
-- **Evidence:** vendor publishes a REST API at `/genrouter/how-to-use/integrations` (§3.4). The two `?ask=` answers in §3.2 that flagged this whole effort as low-confidence — IP vs MAC, `192.168.5.1` vs `192.168.8.1`, `/api/update_proxy` vs `/api/v1/update_proxy` — are now adjudicated by the integrations page: **IP, `192.168.5.1`, `/api/update_proxy`**. The page is still vendor-published HTML, not a first-hand capture, so we mark it **confirmed (vendor doc)** but not yet **confirmed (hardware)**.
-- **Architecture pick:** Option **A (per-job UI/API rewrite)** is now the working design. Option B (per-SSID proxy) is off the table because `/api/router/create_wifi` does not carry a proxy field. Option C (proxy on the Android side) stays as fallback only if §5 verification fails.
-- **Risk:** depending on a documented-but-unverified API with no published stability guarantee. Mitigate with (a) `GET /api/system/info` build-version fingerprint check at orchestrator startup, (b) one hardware verification run (§5 steps 1–4) before we ship code that calls `update_proxy`.
-- **Next step:** the in-flight operator action — request to forward GenRouter's web/API onto the VPS — is the gate. The moment that lands, run §5 steps 1–5 from the VPS shell. That converts §3.4 to "confirmed (hardware)" and unblocks design.
-- **Confidence:** medium. Up from "low" because we now have a concrete API spec to test, not an abstract "is there one?" question.
+- **Evidence:** vendor publishes a REST API at `/genrouter/how-to-use/integrations` (§3.4). `GET /api/devices` now **confirmed against real hardware** (§3.4.1) — same shape as the doc plus a wrapping `{"data": [...]}` envelope and an ignorable `is_current_device` field; for this deployment LAN is `192.168.5.0/24` so base URL is `http://192.168.5.1:9000`. `POST /api/update_proxy` and the rest remain **confirmed (vendor doc)** until §5 steps 3–4 run from the VPS.
+- **Architecture pick:** Option **A (per-job rewrite via `POST /api/update_proxy`)** is the working design. Option B (per-SSID proxy) is off the table because `/api/router/create_wifi` does not carry a proxy field. Option C (proxy on the Android side) stays as fallback only if §5 verification fails. **Lifecycle: set-on-start only, no cleanup-on-end** (operator-confirmed, rev 3) — the start-of-next-job overwrite is itself the safety barrier.
+- **Resolution strategy at job start:** (1) `GET /api/devices` → match `mac == phone.mac` to find current `ip`; (2) `POST /api/update_proxy {"<ip>": {type, server, port, user, pass}}`; (3) optionally ADB `curl https://api.ipify.org` to verify egress before handing the phone to the worker. `hostname` and `is_current_device` are decorative — do not key off them.
+- **Risk:** depending on a documented-but-not-fully-hardware-verified API. Mitigate with (a) `GET /api/system/info` build-version fingerprint check at orchestrator startup, (b) the remaining hardware verification (§5 steps 3–4) once the VPS-side router tunnel is in place.
+- **Next step:** the in-flight operator action — forward GenRouter's web/API onto the VPS — is the only remaining gate. The moment that lands, run §5 steps 2–4 from the VPS shell. §5 step 5 (IP stability) can be run from the phone right now, independently. GenFarmer↔GenRouter binding is **not** that gate (§3.4.2): it's an in-LAN UI bridge, not an API relay.
+- **Confidence:** medium-high. Up from "medium" because (i) one endpoint is now hardware-confirmed and (ii) the design simplification (no cleanup) eliminates the most fragile failure mode.
 
 ---
 
