@@ -24,6 +24,8 @@ The only safe way forward is to capture real traffic from a real router. This ch
 
 ## 1. Browser DevTools checklist
 
+> **Android-only operator?** If your only client that can reach the router is an Android phone — e.g. you run the lab via RDP → VPS → Tailscale → phone, with no desktop on the same LAN — skip to **[Appendix A](#appendix-a--android-only-operator-path-rdp--vps--tailscale--phone)** and use one of the on-device methods. The rest of this section assumes a desktop browser on the same LAN as the router.
+
 Goal: capture the exact HTTP request the SPA sends when you change one device's proxy.
 
 1. **Open the GenRouter admin UI** in a fresh Chrome / Edge / Firefox window.
@@ -355,6 +357,79 @@ Original proxy restored at <HH:MM TZ>. Device row reverted: <yes / no>.
 [attached: device-row-before.png — proxy password blurred]
 [attached: device-row-after.png  — proxy password blurred]
 ```
+
+---
+
+## Appendix A — Android-only operator path (RDP → VPS → Tailscale → phone)
+
+Use this appendix if the only client that can reach `http://192.168.5.1:9000/` is an Android phone, and your access topology is **operator → RDP → VPS → Tailscale → Android phones** (as reported on FFF-22 on 2026-05-17). The main checklist's §1 assumes a desktop browser on the same LAN, which does not apply. Sections §2, §3, §4, §5, §6, and §7 still apply as written once you have a captured request.
+
+### A.0 — Findings to record up-front
+
+- **If the admin UI loads with no login screen**, the auth scheme is `none`. Write `none` in §3 item 10 and in the §7 "Auth scheme" line, and skip §1 step 2 (manual login). Note this as the first observation of the run — it is itself useful evidence.
+- **The admin UI is plain HTTP** (port 9000, not 9443 or similar). No TLS, so none of the methods below need a custom CA cert installed on the phone.
+- **If a login screen *does* appear** and you were not given credentials, stop and escalate on FFF-22 — do not guess passwords on a vendor admin UI.
+
+### Why not "just route the subnet through Tailscale"
+
+Tailscale's Android client cannot advertise local subnet routes — only Linux/router endpoints can. So you cannot make the VPS reach `192.168.5.1` directly through the existing tailnet. Similarly, an HTTP proxy on the VPS does not help: the phone could proxy *through* the VPS over Tailscale, but the VPS itself cannot then forward to `192.168.5.1`. Capture must happen **on the phone**, or via a debugger attached **to the phone**.
+
+### A.1 — Method 1 (recommended): HTTP Toolkit on the Android phone
+
+[HTTP Toolkit](https://httptoolkit.com/android/) is a free, no-root traffic interceptor for Android (uses the system VPN-service hook). For a plain-HTTP target it just works, and it has a real "Copy as cURL" action.
+
+1. On the test phone, install **HTTP Toolkit** from the Play Store, F-Droid, or the project's APK page.
+2. Open the app → choose the on-device / standalone interception mode (the current build labels it "Scan & intercept on this device" or similar).
+3. Tap **Start** — Android shows the VPN-consent dialog. Confirm. The phone is now logging traffic through HTTP Toolkit.
+4. **Decline** any prompt to install HTTP Toolkit's CA cert — we are not MITMing HTTPS for this task and do not want to leave a CA on a production phone.
+5. In Chrome on the phone, open `http://192.168.5.1:9000/`. The page should load normally.
+6. Run §2 of the main checklist on the phone (pick row, record BEFORE, change proxy, click Update, restore at the end).
+7. Switch back to the HTTP Toolkit app. The Update call will be in the request list (filter for host `192.168.5.1`).
+8. Tap the request → menu → **Copy as cURL**. Paste the result into a notes app, redact per §1's redaction table, then post it as the §7 template content.
+9. When finished, tap **Stop** in HTTP Toolkit and revoke the VPN profile from Android Settings → Network → VPN.
+
+### A.2 — Method 2: Chrome remote-debugging via `chrome://inspect` on the VPS
+
+This option reproduces the desktop-DevTools experience from §1 of the main checklist by attaching the VPS's Chrome to the phone's Chrome through the ADB-over-Tailscale link that GenFarmer already uses.
+
+Prerequisite: ADB on the VPS is already paired with the phone over Tailscale (the channel GenFarmer uses today). Confirm with `adb devices` in a VPS shell — the phone should appear as `<tailscale-ip>:5555  device`.
+
+1. On the test phone, confirm **USB debugging** is enabled (already on if GenFarmer talks to it via ADB).
+2. On the VPS, open Chrome and navigate to `chrome://inspect/#devices`. Tick **Discover USB devices** and **Discover network targets** if visible.
+3. The phone should appear under "Remote Target". If it does not, in the VPS shell run `adb forward tcp:9229 localabstract:chrome_devtools_remote` and reload the page — that bridges the DevTools socket explicitly when auto-discovery does not traverse adb-over-tcp.
+4. On the phone, in Chrome, open `http://192.168.5.1:9000/`. The tab will appear under the device on the VPS's `chrome://inspect` page.
+5. Click **Inspect** next to that tab. A full DevTools window opens **on the VPS**, attached to the phone's Chrome tab. From here, §1 of the main checklist works as written: Network tab → Preserve log → Disable cache → Fetch/XHR filter → trigger the Update on the phone → right-click the request → **Copy as cURL (bash)**.
+6. Continue with §2, §3, §4, §7.
+
+This is the highest-fidelity option — evidence shape matches the main checklist exactly. The one failure mode is a Chrome-version mismatch between VPS and phone; if `Inspect` cannot attach, fall back to A.1.
+
+### A.3 — Method 3 (fallback): Eruda overlay inside the admin UI
+
+If neither A.1 nor A.2 is workable, inject a DevTools-like overlay into the admin UI page itself.
+
+1. On the phone, in Chrome, open `http://192.168.5.1:9000/`.
+2. In the URL bar, **type by hand** (mobile Chrome strips `javascript:` from pastes — typing the prefix manually is the workaround):
+   ```
+   javascript:(()=>{var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/eruda';document.body.appendChild(s);s.onload=()=>eruda.init();})();
+   ```
+3. A floating tool button appears in the page corner. Tap it → **Network** tab.
+4. Reproduce §2 (change proxy → Update). The Update request appears in the Network tab — tap it to see URL, method, request headers, request body, response status, response body.
+5. Eruda has no one-click "Copy as cURL". Copy each field by hand into the §7 template and take a screenshot of the request panel as backup evidence.
+6. Eruda is loaded from a public CDN, so the phone needs internet for this one fetch. If the test phone's SOCKS5 blocks public CDNs, switch its Wi-Fi to a clean network just long enough to load Eruda once, then switch back before triggering Update.
+
+### A.4 — What to send back from this appendix
+
+Same fields as §3 of the main checklist, plus two extras at the top of your §7 result block:
+
+- **Capture method used:** `A.1 HTTP Toolkit` / `A.2 chrome://inspect` / `A.3 Eruda overlay`. This matters for interpreting the evidence — A.3 may show fewer headers than A.1 / A.2.
+- **Login state observed:** `no login screen` / `login screen but no creds — escalated` / `logged in as <user>`.
+
+### A.5 — What NOT to do on this path
+
+- Do not install custom CA certificates on the test phone — plain HTTP makes that unnecessary.
+- Do not root the test phone for this task.
+- Do not reboot the phone, GenRouter, or GenFarmer between A.1 / A.2 / A.3 attempts to "reset state" unless explicitly asked. We are still in evidence-gathering mode and want to capture whatever the live system produces.
+- Do not enable a tailnet exit-node or subnet-route trick to try to reach `192.168.5.1` from the VPS — the Android Tailscale client cannot advertise routes; that path is closed until a Linux endpoint joins the tailnet.
 
 ---
 
