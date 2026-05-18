@@ -52,6 +52,19 @@ Notes:
   Google SDK auto-discovers the credentials without extra glue.
 - The JSON file itself is a secret. Store it outside the repo; never commit it.
 
+### Video downloads
+
+| Variable | Required | Sensitive | Owner | Purpose |
+|---|---|---|---|---|
+| `VIDEO_DOWNLOAD_DIR` | no (defaults to `./.artifacts/videos`) | no | Drive ingestion | Where downloaded `.mp4` files are stored locally. The Poster worker reads videos from this path. |
+
+Notes:
+
+- Relative paths resolve from the repo root.
+- The directory must be writable by the ingestion process and readable by
+  the Poster (Appium worker).
+- See `docs/contracts/video-source.md` for the full video source contract.
+
 ### Device / proxy backends
 
 | Variable | Required | Sensitive | Owner | Purpose |

@@ -24,6 +24,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local artifacts (screenshots, videos, logs)
+.artifacts/
+
 # Logs / temp
 *.log
 .tmp/
