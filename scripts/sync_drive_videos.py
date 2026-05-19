@@ -5,7 +5,24 @@ Scans instagram/<category>/videos/*.mp4 in Google Drive and inserts new
 videos into the database with status='new'. Downloads each file to
 VIDEO_DOWNLOAD_DIR/<google_drive_file_id>.mp4.
 
-Usage:
+Prerequisites
+-------------
+1. Python 3.10+
+2. Install dependencies:
+       pip install -r scripts/requirements.txt
+3. Google service account JSON key with drive.readonly scope.
+   - For local dev: save it to .secrets/google-drive.json (gitignored),
+     then export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/.secrets/google-drive.json"
+   - For production (VPS): see docs/setup/credentials.md
+4. Set SUPABASE_DB_URL to a Postgres connection string
+   (or pass --db-url on the command line).
+5. Optionally set VIDEO_DOWNLOAD_DIR for where to store downloaded mp4s
+   (defaults to ./.artifacts/videos).
+
+See also: docs/contracts/environment.md for the full env var contract.
+
+Usage
+-----
     python scripts/sync_drive_videos.py [--dry-run] [--skip-download]
     python scripts/sync_drive_videos.py --db-url 'postgresql://...'
 """
