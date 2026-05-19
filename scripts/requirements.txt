@@ -1,3 +1,5 @@
 # Dependencies for ad-hoc operational scripts under scripts/.
 # Install with: pip install -r scripts/requirements.txt
 psycopg[binary]>=3.1
+google-auth>=2.0
+google-api-python-client>=2.0
