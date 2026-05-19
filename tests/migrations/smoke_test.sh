@@ -52,7 +52,7 @@ echo "[5/6] Verifying schema state ..."
 EXPECTED_TABLES=(
     account_environments accounts app_states artifacts
     device_events device_profiles global_settings gps_locations
-    job_events jobs physical_devices proxies videos
+    job_events job_logs jobs physical_devices proxies videos
 )
 ACTUAL_TABLES=$("${PSQL[@]}" -At -c \
     "SELECT table_name FROM information_schema.tables \
@@ -64,7 +64,7 @@ for t in "${EXPECTED_TABLES[@]}"; do
         exit 1
     fi
 done
-echo "       ok: all 13 automation.* tables present"
+echo "       ok: all 14 automation.* tables present"
 
 SENTINEL_MARKER=$("${PSQL[@]}" -At -c "SELECT marker FROM fffbt.sentinel WHERE id=1;")
 if [[ "$SENTINEL_MARKER" != "do-not-touch" ]]; then
