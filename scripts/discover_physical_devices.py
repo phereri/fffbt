@@ -17,10 +17,21 @@ Discovery is non-destructive:
   * Never overwrites a non-null adb_serial unless --reassign-serial.
   * Never modifies current_job_id or transitions 'busy' / 'maintenance' rows.
 
-Usage:
+Two transports are supported:
 
-    SUPABASE_DB_URL=postgresql://... \\
-    python scripts/discover_physical_devices.py [--source both] [--dry-run]
+  1. Direct Postgres (default). Needs SUPABASE_DB_URL or --db-url.
+
+         SUPABASE_DB_URL=postgresql://... \\
+         python scripts/discover_physical_devices.py [--source both] [--dry-run]
+
+  2. Supabase Management API. Needs SUPABASE_PAT and --project-ref (or env
+     SUPABASE_PROJECT_REF). Use this when the DB password is unavailable; the
+     PAT is a personal access token from
+     https://supabase.com/dashboard/account/tokens .
+
+         SUPABASE_PAT=sbp_... \\
+         python scripts/discover_physical_devices.py \\
+             --via-management-api --project-ref <ref> [--source both] [--dry-run]
 
 A device row is matched to a live serial by:
 
@@ -35,11 +46,14 @@ flipped to 'offline'.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -288,7 +302,6 @@ def apply_plan(conn, plans: list[Plan]) -> dict[str, int]:
                 counts["serial_set"] += 1
 
             if p.event:
-                import json
                 payload = {
                     "source": p.matched.source if p.matched else None,
                     "matched_serial": p.matched.serial if p.matched else None,
@@ -299,6 +312,180 @@ def apply_plan(conn, plans: list[Plan]) -> dict[str, int]:
                     "event_type": p.event,
                     "payload": json.dumps(payload),
                 })
+    return counts
+
+
+# --- Transport: Supabase Management API --------------------------------------
+
+
+def _json_default(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    raise TypeError(f"unserializable type: {type(o).__name__}")
+
+
+def _parse_timestamptz(value) -> datetime | None:
+    """Parse a Postgres timestamptz string returned by the Management API."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    s = str(value)
+    # Management API returns e.g. "2026-05-19T12:00:00+00:00" or with "Z".
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _management_api_query(project_ref: str, pat: str, sql: str) -> list[dict]:
+    url = f"https://api.supabase.com/v1/projects/{project_ref}/database/query"
+    body = json.dumps({"query": sql}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {pat}",
+            "Content-Type": "application/json",
+            # Cloudflare in front of api.supabase.com rejects the default
+            # Python-urllib User-Agent with a 403 / error 1010.
+            "User-Agent": "fffbt-discover-physical-devices/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Management API query failed ({e.code}): {detail}") from None
+    if not isinstance(data, list):
+        raise RuntimeError(f"unexpected Management API response: {data!r}")
+    return data
+
+
+def fetch_physical_devices_api(project_ref: str, pat: str) -> list[DeviceRow]:
+    sql = (
+        "SELECT id::text AS id, alias, adb_serial, tailscale_ipv4, status, "
+        "last_seen_at FROM automation.physical_devices"
+    )
+    rows = _management_api_query(project_ref, pat, sql)
+    return [
+        DeviceRow(
+            id=r["id"],
+            alias=r["alias"],
+            adb_serial=r.get("adb_serial"),
+            tailscale_ipv4=r.get("tailscale_ipv4"),
+            status=r["status"],
+            last_seen_at=_parse_timestamptz(r.get("last_seen_at")),
+        )
+        for r in rows
+    ]
+
+
+def fetch_heartbeats_api(project_ref: str, pat: str, stale_seconds: int) -> list[LiveDevice]:
+    sql = (
+        "SELECT serial, state, ip, seen_at "
+        "FROM public.device_heartbeats "
+        f"WHERE seen_at > now() - make_interval(secs => {int(stale_seconds)})"
+    )
+    rows = _management_api_query(project_ref, pat, sql)
+    out: list[LiveDevice] = []
+    for r in rows:
+        serial = r["serial"]
+        derived_ip = r.get("ip")
+        if not derived_ip:
+            m = TCP_SERIAL_RE.match(serial or "")
+            if m:
+                derived_ip = m.group(1)
+        seen_at = _parse_timestamptz(r.get("seen_at"))
+        out.append(LiveDevice(
+            serial=serial,
+            state=r["state"],
+            ip=derived_ip,
+            seen_at=seen_at,
+            source="heartbeat",
+        ))
+    return out
+
+
+def apply_plan_api(
+    project_ref: str, pat: str, plans: list[Plan], dry_run: bool
+) -> dict[str, int]:
+    """Apply all updates + event inserts in a single Management API call.
+
+    The Management API runs each /database/query call in its own transaction,
+    so packing everything into one CTE keeps the operation atomic. Dry-run
+    skips the API call entirely.
+    """
+    counts = {"online": 0, "offline": 0, "noop": 0, "serial_set": 0}
+    changes: list[dict] = []
+    for p in plans:
+        changed_status = p.new_status != p.row.status
+        changed_serial = p.new_adb_serial is not None
+        changed_seen = (
+            p.new_last_seen_at is not None
+            and p.new_last_seen_at != p.row.last_seen_at
+        )
+        if not (changed_status or changed_serial or changed_seen):
+            counts["noop"] += 1
+            continue
+        if p.event == "connected":
+            counts["online"] += 1
+        elif p.event == "disconnected":
+            counts["offline"] += 1
+        if changed_serial:
+            counts["serial_set"] += 1
+        changes.append({
+            "id": p.row.id,
+            "new_status": p.new_status,
+            "new_last_seen_at": p.new_last_seen_at,
+            "new_adb_serial": p.new_adb_serial,
+            "event": p.event,
+            "matched_source": p.matched.source if p.matched else None,
+            "matched_serial": p.matched.serial if p.matched else None,
+            "matched_state": p.matched.state if p.matched else None,
+        })
+
+    if dry_run or not changes:
+        return counts
+
+    payload = json.dumps(changes, default=_json_default).replace("'", "''")
+    sql = f"""
+        WITH input AS (
+          SELECT * FROM jsonb_to_recordset('{payload}'::jsonb)
+            AS t(
+              id uuid, new_status text, new_last_seen_at timestamptz,
+              new_adb_serial text, event text,
+              matched_source text, matched_serial text, matched_state text
+            )
+        ),
+        updated AS (
+          UPDATE automation.physical_devices pd
+          SET status       = i.new_status,
+              last_seen_at = COALESCE(i.new_last_seen_at, pd.last_seen_at),
+              adb_serial   = COALESCE(i.new_adb_serial, pd.adb_serial)
+          FROM input i
+          WHERE pd.id = i.id
+          RETURNING pd.id
+        ),
+        inserted_events AS (
+          INSERT INTO automation.device_events (device_id, event_type, payload)
+          SELECT i.id, i.event,
+                 jsonb_build_object(
+                   'source', i.matched_source,
+                   'matched_serial', i.matched_serial,
+                   'matched_state', i.matched_state
+                 )
+          FROM input i
+          WHERE i.event IS NOT NULL
+          RETURNING device_id
+        )
+        SELECT
+          (SELECT count(*) FROM updated) AS updated_count,
+          (SELECT count(*) FROM inserted_events) AS event_count;
+    """
+    _management_api_query(project_ref, pat, sql)
     return counts
 
 
@@ -345,6 +532,22 @@ def main() -> int:
         help="Postgres connection string. Defaults to env SUPABASE_DB_URL.",
     )
     parser.add_argument(
+        "--via-management-api",
+        action="store_true",
+        help=(
+            "Use the Supabase Management API instead of a direct DB connection. "
+            "Requires SUPABASE_PAT and --project-ref (or env SUPABASE_PROJECT_REF)."
+        ),
+    )
+    parser.add_argument(
+        "--project-ref",
+        default=os.environ.get("SUPABASE_PROJECT_REF"),
+        help=(
+            "Supabase project ref (the <ref> in <ref>.supabase.co). "
+            "Required with --via-management-api. Defaults to env SUPABASE_PROJECT_REF."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the plan and roll back. No rows are modified.",
@@ -359,9 +562,38 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.via_management_api:
+        return _run_via_management_api(args)
+    return _run_via_db_url(args)
+
+
+def _print_and_summarize(
+    plans: list[Plan], live_count: int, rows_count: int,
+    counts: dict[str, int], dry_run: bool,
+) -> None:
+    for p in plans:
+        if (
+            p.new_status != p.row.status
+            or p.new_adb_serial is not None
+            or p.event is not None
+        ):
+            print(format_plan(p))
+    prefix = "DRY RUN: " if dry_run else ""
+    print(
+        f"{prefix}live={live_count} rows={rows_count} "
+        f"online+{counts['online']} offline+{counts['offline']} "
+        f"serial_set={counts['serial_set']} noop={counts['noop']}"
+    )
+
+
+def _run_via_db_url(args) -> int:
     if not args.db_url:
-        print("error: SUPABASE_DB_URL is not set and --db-url was not provided.",
-              file=sys.stderr)
+        print(
+            "error: SUPABASE_DB_URL is not set and --db-url was not provided. "
+            "Pass --via-management-api with SUPABASE_PAT to use a personal "
+            "access token instead.",
+            file=sys.stderr,
+        )
         return 2
 
     import psycopg
@@ -381,32 +613,53 @@ def main() -> int:
             rows, by_serial, by_ip, stale_threshold, args.reassign_serial
         )
 
-        for p in plans:
-            if (
-                p.new_status != p.row.status
-                or p.new_adb_serial is not None
-                or p.event is not None
-            ):
-                print(format_plan(p))
-
         counts = apply_plan(conn, plans)
         if args.dry_run:
             conn.rollback()
         else:
             conn.commit()
 
-        prefix = "DRY RUN: " if args.dry_run else ""
-        print(
-            f"{prefix}live={len(live)} rows={len(rows)} "
-            f"online+{counts['online']} offline+{counts['offline']} "
-            f"serial_set={counts['serial_set']} noop={counts['noop']}"
-        )
+        _print_and_summarize(plans, len(live), len(rows), counts, args.dry_run)
         return 0
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _run_via_management_api(args) -> int:
+    pat = os.environ.get("SUPABASE_PAT")
+    if not pat:
+        print(
+            "error: SUPABASE_PAT env var is required with --via-management-api.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.project_ref:
+        print(
+            "error: --project-ref (or env SUPABASE_PROJECT_REF) is required "
+            "with --via-management-api.",
+            file=sys.stderr,
+        )
+        return 2
+
+    live: list[LiveDevice] = []
+    if args.source in ("adb", "both"):
+        live.extend(adb_devices(args.adb_bin))
+    if args.source in ("heartbeat", "both"):
+        live.extend(fetch_heartbeats_api(args.project_ref, pat, args.stale_seconds))
+
+    rows = fetch_physical_devices_api(args.project_ref, pat)
+    by_serial, by_ip = index_live(live)
+    stale_threshold = datetime.now(timezone.utc) - timedelta(seconds=args.stale_seconds)
+    plans = build_plan(
+        rows, by_serial, by_ip, stale_threshold, args.reassign_serial
+    )
+
+    counts = apply_plan_api(args.project_ref, pat, plans, args.dry_run)
+    _print_and_summarize(plans, len(live), len(rows), counts, args.dry_run)
+    return 0
 
 
 if __name__ == "__main__":

@@ -182,5 +182,23 @@ class BuildPlanTests(unittest.TestCase):
         self.assertEqual(plans[0].new_status, "online")
 
 
+class ManagementApiHelperTests(unittest.TestCase):
+    def test_parse_timestamptz_handles_z_suffix(self):
+        ts = discover._parse_timestamptz("2026-05-19T12:00:00Z")
+        self.assertEqual(ts, NOW)
+
+    def test_parse_timestamptz_handles_offset(self):
+        ts = discover._parse_timestamptz("2026-05-19T12:00:00+00:00")
+        self.assertEqual(ts, NOW)
+
+    def test_parse_timestamptz_passthrough_none(self):
+        self.assertIsNone(discover._parse_timestamptz(None))
+
+    def test_json_default_serializes_datetime(self):
+        self.assertEqual(
+            discover._json_default(NOW), "2026-05-19T12:00:00+00:00"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
