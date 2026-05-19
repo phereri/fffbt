@@ -148,6 +148,9 @@ def _management_api_query(project_ref: str, pat: str, sql: str) -> list[dict]:
         headers={
             "Authorization": f"Bearer {pat}",
             "Content-Type": "application/json",
+            # Cloudflare in front of api.supabase.com returns 403 / error code
+            # 1010 to the default urllib User-Agent ("Python-urllib/3.x").
+            "User-Agent": "fffbt-import-physical-devices/1.0",
         },
     )
     try:
