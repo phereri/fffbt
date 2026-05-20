@@ -93,13 +93,41 @@ When a retryable error occurs and `retry_count < max_retries`:
 3. Job immediately transitions back to `queued` (clears finished_at).
 4. Both transitions are recorded in `job_events` as separate `status_changed`
    entries. The re-queue event payload includes `"retry": true`.
-5. The scheduler picks up the re-queued job normally. A new device is assigned;
-   the same video and account are reused.
+5. A `job_events` row with `event_type = 'retry'` is written.
+6. Reserved resources (account, device, video) are **kept** — the retry model
+   re-runs the job in place. The launcher releases and re-assigns the device
+   outside the SQL function.
 
 When retries are exhausted (`retry_count >= max_retries`):
 
 - Job stays `failed` (terminal).
-- The video and account are released by the standard cleanup flow.
+- Resource cleanup runs (see below).
+
+## Terminal resource cleanup (FFF-52)
+
+`process_job_error()` releases reserved resources on **terminal** job states
+(both `failed` and `needs_review`) so that nothing stays stuck. This runs
+inside the SQL function itself, making it correct regardless of the caller.
+
+### What happens on a terminal path
+
+1. A `job_events` row with `event_type = 'error'` is written, capturing the
+   error code and message.
+2. The physical device is released: `physical_devices.status` is set to
+   `'online'` and `current_job_id` is cleared (`NULL`).
+3. A `device_events` row with `event_type = 'job_released'` is written.
+4. The video is moved out of any active state:
+   - **Terminal `failed`**: video status is set to `'new'` (retryable with
+     another account/device). `videos.status = 'failed'` is reserved for a
+     future content-level classification (e.g. bad file, copyright strike).
+   - **Terminal `needs_review`**: video status is set to `'needs_review'`.
+
+### Idempotency
+
+The device release uses `WHERE current_job_id = p_job_id`, so calling
+`process_job_error()` multiple times or releasing the device externally
+(e.g. the launcher's Python `_release_device`) is safe — a second release
+is a no-op.
 
 ## Account side effects
 

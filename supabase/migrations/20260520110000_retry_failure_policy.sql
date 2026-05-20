@@ -57,6 +57,8 @@ ON CONFLICT (key) DO UPDATE SET
 
 -- 5. process_job_error(): high-level error handler that workers call.
 --    Encodes the entire retry/failure policy. Returns a JSONB summary of action taken.
+--    Terminal paths (failed, needs_review) release the physical device and
+--    move the video out of any active state so resources are never stuck.
 CREATE OR REPLACE FUNCTION automation.process_job_error(
     p_job_id        uuid,
     p_error_code    text,
@@ -65,10 +67,13 @@ CREATE OR REPLACE FUNCTION automation.process_job_error(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_catalog  automation.error_catalog%ROWTYPE;
-    v_job      automation.jobs%ROWTYPE;
-    v_message  text;
-    v_result   jsonb;
+    v_catalog             automation.error_catalog%ROWTYPE;
+    v_job                 automation.jobs%ROWTYPE;
+    v_message             text;
+    v_result              jsonb;
+    v_terminal            boolean := false;
+    v_video_cleanup_status text;
+    v_released_device_id  uuid;
 BEGIN
     SELECT * INTO v_catalog
     FROM automation.error_catalog
@@ -90,7 +95,6 @@ BEGIN
     v_message := COALESCE(p_error_message, v_catalog.description);
 
     IF v_catalog.category = 'retryable' AND v_job.retry_count < v_catalog.max_retries THEN
-        -- Transition to failed (records error in audit log)
         PERFORM automation.transition_job_status(
             p_job_id, 'failed',
             jsonb_build_object(
@@ -99,7 +103,6 @@ BEGIN
             )
         );
 
-        -- Increment retry count and re-queue
         UPDATE automation.jobs
         SET retry_count = retry_count + 1
         WHERE id = p_job_id;
@@ -110,6 +113,16 @@ BEGIN
                 'retry', true,
                 'retry_count', v_job.retry_count + 1,
                 'error_code', p_error_code
+            )
+        );
+
+        INSERT INTO automation.job_events (job_id, event_type, from_status, to_status, payload)
+        VALUES (p_job_id, 'retry', 'failed', 'queued',
+            jsonb_build_object(
+                'retry_count', v_job.retry_count + 1,
+                'max_retries', v_catalog.max_retries,
+                'error_code', p_error_code,
+                'error_message', v_message
             )
         );
 
@@ -128,17 +141,16 @@ BEGIN
             )
         );
 
-        -- transition_job_status preserves existing error fields for needs_review
-        -- but they are null when coming from an active state, so set them directly.
         UPDATE automation.jobs
         SET error_code    = p_error_code,
             error_message = v_message
         WHERE id = p_job_id;
 
+        v_terminal := true;
+        v_video_cleanup_status := 'needs_review';
         v_result := jsonb_build_object('action', 'needs_review');
 
     ELSE
-        -- Non-retryable or retries exhausted → terminal failure
         PERFORM automation.transition_job_status(
             p_job_id, 'failed',
             jsonb_build_object(
@@ -146,6 +158,9 @@ BEGIN
                 'error_message', v_message
             )
         );
+
+        v_terminal := true;
+        v_video_cleanup_status := 'new';
 
         IF v_catalog.category = 'retryable' THEN
             v_result := jsonb_build_object(
@@ -158,7 +173,33 @@ BEGIN
         END IF;
     END IF;
 
-    -- Apply account side effects
+    -- Terminal resource cleanup: release device and video so nothing stays stuck.
+    IF v_terminal THEN
+        INSERT INTO automation.job_events (job_id, event_type, payload)
+        VALUES (p_job_id, 'error',
+            jsonb_build_object(
+                'error_code', p_error_code,
+                'error_message', v_message
+            )
+        );
+
+        UPDATE automation.physical_devices
+        SET status = 'online', current_job_id = NULL
+        WHERE current_job_id = p_job_id
+        RETURNING id INTO v_released_device_id;
+
+        IF v_released_device_id IS NOT NULL THEN
+            INSERT INTO automation.device_events (device_id, event_type, payload)
+            VALUES (v_released_device_id, 'job_released',
+                jsonb_build_object('job_id', p_job_id::text)
+            );
+        END IF;
+
+        UPDATE automation.videos
+        SET status = v_video_cleanup_status
+        WHERE id = v_job.video_id;
+    END IF;
+
     IF v_catalog.account_side_effect IS NOT NULL THEN
         UPDATE automation.accounts
         SET status = v_catalog.account_side_effect
