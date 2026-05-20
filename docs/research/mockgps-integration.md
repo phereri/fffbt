@@ -34,6 +34,41 @@ intent reverse-engineering.
 The rest of this document explains why, and answers each sub-question for a
 generic "MockGPS" app as the brief asked.
 
+### 1.1 GPS requirement by phase — confirmed (FFF-24 clarification, 2026-05-20)
+
+GPS is **mandatory for the real MVP and production path**. How strictly it
+gates publishing depends on the rollout phase:
+
+| Phase | GPS requirement | Behaviour on GPS failure |
+|---|---|---|
+| `proof_of_posting` (MVP-0) | **best-effort** | MockGPS apply may fail; the job may still publish. Log the failure, do not block. |
+| `mvp` (MVP-1) | **required** — GPS apply **and** verification must succeed before publishing | If apply or verification fails, **abort the job before publish**. GPS provider is `io.appium.settings` (or whichever mock provider is selected per device). |
+| `production` | **required** — same as `mvp`, plus later anti-detection hardening if needed | Abort before publish on failure. |
+
+Accepted risk (explicit decision, do not silently re-assume): Android mock
+locations are detectable via `Location.isMock()` (see §6). **Root / Magisk /
+ROM-level hiding is out of current scope and must not be implemented now.**
+"Later hardening if needed" in the production row refers to that work — it is
+deferred, not in this MVP.
+
+Implication for the Environment Loader: it needs the current phase as input so
+it can decide whether a MockGPS failure is fatal. For `mvp`/`production` the
+loader must run both the apply step (§3) and a verification read-back (§7
+step 4) and treat either failure as a hard stop.
+
+### 1.2 Mock-location state is not persistent — re-apply every job — confirmed
+
+The mock-location setup is **not durable**. The selected-mock-app AppOp
+(`appops set ... android:mock_location allow`), the location permission grant,
+and the running `LocationService` are all runtime state that **does not survive
+a device reboot** — and the foreground service also stops if it is killed or
+the app is reinstalled.
+
+**The Environment Loader must (re)apply the full §2 + §3 sequence at the start
+of every job**, not once at fleet provisioning time. Do not assume a phone that
+worked yesterday is still in a mock-capable state today. The verification
+read-back (§7 step 4) is what proves the re-apply actually took for that job.
+
 ---
 
 ## 2. How Android mock location actually works — confirmed
@@ -222,7 +257,7 @@ The element selectors are *unknown* until the fleet's actual app is identified
 | **Mock flag detectability.** `Location.isMock()` is `true` for any test-provider location. If Instagram checks it, every approach in this doc (incl. `io.appium.settings`) is detected. | high if IG checks | *unknown* whether IG reads the flag. Defeating it reliably needs root / Magisk / a ROM-level hook — out of MVP scope and against the device-safety rules. Flag for a decision, do not silently assume it's fine. |
 | Only one selected mock-location app per device. | medium | Design choice, not a bug: standardise on `io.appium.settings`. Don't install a second provider. |
 | Android 10 + `driver.setLocation()` failures. | low | Use the direct `am start-foreground-service` call; verify per §7. |
-| Mock provider dropped on reboot / Appium reinstall. | low | `appops`/`pm grant` state and the running service do not survive a reboot. Environment Loader must (re)apply §2 + §3 at the start of every job, not once. |
+| Mock provider dropped on reboot / Appium reinstall. | low | `appops`/`pm grant` state and the running service do not survive a reboot. Environment Loader must (re)apply §2 + §3 at the start of **every** job, not once — see §1.2. |
 | GPS still shows real location if mocking is set up *after* IG already has a fix. | low | Start the `LocationService` **before** launching Instagram. |
 
 ---
