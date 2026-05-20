@@ -35,6 +35,8 @@ Briefly list and why they were rejected.
 ## Index
 
 - `0001-architecture-baseline.md` — initial baseline (this bootstrap).
+- `0002-mobilerun-first-worker.md` — Mobilerun-first Instagram worker behind a
+  shared interface; Appium fallback (resolves FFF-49).
 
 New ADRs are added per change. Use status `open question` for decisions that
 are not yet resolved; the architect agent is responsible for moving them to

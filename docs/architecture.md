@@ -2,7 +2,7 @@
 
 Status: draft (MVP — Instagram Reels Trial posting only).
 Owner: Architect / Tech Lead Agent.
-Last updated: 2026-05-15.
+Last updated: 2026-05-20.
 
 ## 1. MVP scope
 
@@ -18,7 +18,8 @@ In scope:
 - Account environment preparation (proxy, device profile, GPS, app/session state).
 - Physical Android device assignment.
 - GenFarmer / GenRouter / ADB / MockGPS integration.
-- Appium-based Instagram Reels Trial posting.
+- Mobilerun-based Instagram Reels Trial posting (primary executor; Appium kept
+  as a fallback behind a shared `MobileWorker` interface — see ADR 0002).
 - Verification — option A: device stays reserved until verification completes.
 - Observability: job events, screenshots, errors, status tracking.
 
@@ -95,7 +96,7 @@ implementations live in their own issues.
 | **Eligibility / Scheduler** | Decides *which* account posts *which* video *when*. Enforces cooldowns, daily caps, account health. | `automation.video_jobs.scheduled_at` |
 | **Device Pool** | Tracks physical Android phones and their reservation state. | `automation.devices`, `automation.device_reservations` |
 | **Environment Loader** | Prepares a phone for a chosen account: proxy, MockGPS, device profile, app/session state. Uses GenFarmer / GenRouter / ADB. | runtime only (no persistent schema yet) |
-| **Poster (Appium worker)** | Drives Instagram UI to post a Reels Trial. Reports events. | `automation.job_events`, screenshots |
+| **Poster (Mobile worker)** | Drives Instagram UI to post a Reels Trial. Reports events. Mobilerun-first; Appium fallback behind a shared interface (ADR 0002). | `automation.job_events`, screenshots |
 | **Verifier** | Detects and resolves Instagram verification challenges. Holds the device reservation while active (option A). | `automation.verifications` |
 | **Observability** | Persists job events, screenshots, errors, status; surfaces them to the dashboard. | `automation.job_events`, attachment storage |
 
