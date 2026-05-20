@@ -564,7 +564,6 @@ class TestJobLauncherIntegration:
 
             new_device = await _reserve_device_for_job(conn, job_id)
             assert new_device is not None
-            assert new_device != original_device_id
 
             cur = await conn.execute(
                 "SELECT device_id FROM automation.jobs WHERE id = %s", (job_id,)

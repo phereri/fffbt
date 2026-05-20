@@ -126,8 +126,8 @@ async def _process_job_error(
         (job_id, error_code, error_message),
     )
     row = await cur.fetchone()
-    result = json.loads(row[0]) if row and row[0] else {}
-    # Release device after error processing (until FFF-52 moves this into the SQL function).
+    result = row[0] if row and row[0] else {}
+    # Idempotent device release — process_job_error() already handles this in SQL.
     await _release_device(conn, job_id)
     return result
 
