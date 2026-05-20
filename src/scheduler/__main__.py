@@ -7,6 +7,13 @@ import logging
 import os
 import sys
 
+_STUB_WARNING = (
+    "WARNING: The worker pipeline is a STUB — jobs will be created and "
+    "moved to preparing_device, but NO real device automation or posting "
+    "will occur. Do NOT run against the production queue until the real "
+    "worker is implemented."
+)
+
 
 def main() -> int:
     db_url = os.environ.get("SUPABASE_DB_URL")
@@ -19,6 +26,9 @@ def main() -> int:
         level=getattr(logging, level, logging.INFO),
         format="%(levelname)s: %(message)s",
     )
+
+    log = logging.getLogger("scheduler")
+    log.warning(_STUB_WARNING)
 
     from scheduler.launcher import JobLauncher
 

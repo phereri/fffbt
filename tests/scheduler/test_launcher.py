@@ -219,8 +219,8 @@ class TestJobLauncherUnit:
         assert launcher.stats["done"] == 1
 
     @pytest.mark.asyncio
-    async def test_timeout_sets_failed(self):
-        """A job that exceeds job_timeout is marked as timed_out."""
+    async def test_timeout_calls_process_job_error(self):
+        """A timed-out job routes through _handle_worker_error with TIMEOUT."""
         import sys
         sys.path.insert(0, f"{REPO_ROOT}/src")
         from scheduler.launcher import JobLauncher
@@ -235,44 +235,81 @@ class TestJobLauncherUnit:
 
         launcher._run_worker = slow_worker
 
-        with patch("scheduler.launcher.psycopg.AsyncConnection.connect") as mock_conn:
-            mock_async_conn = AsyncMock()
-            mock_conn.return_value.__aenter__ = AsyncMock(return_value=mock_async_conn)
-            mock_conn.return_value.__aexit__ = AsyncMock(return_value=False)
+        captured = {}
 
-            job = {"id": str(uuid.uuid4())}
-            await launcher._dispatch(job)
+        async def mock_handle(job_id, error_code, error_message):
+            captured["error_code"] = error_code
+            launcher.stats["failed"] += 1
+
+        launcher._handle_worker_error = mock_handle
+
+        job = {"id": str(uuid.uuid4())}
+        await launcher._dispatch(job)
 
         assert launcher.stats["timed_out"] == 1
+        assert captured["error_code"] == "TIMEOUT"
 
     @pytest.mark.asyncio
-    async def test_infra_retry(self):
-        """Infra errors are retried up to MAX_INFRA_RETRIES times."""
+    async def test_infra_error_calls_process_job_error(self):
+        """Infra errors route through _handle_worker_error with INFRA."""
         import sys
         sys.path.insert(0, f"{REPO_ROOT}/src")
-        from scheduler.launcher import JobLauncher, MAX_INFRA_RETRIES
+        from scheduler.launcher import JobLauncher
 
         launcher = JobLauncher("postgresql://fake")
         launcher._settings = {"max_parallel_jobs": "10", "job_heartbeat_timeout_seconds": "120"}
         launcher._semaphore = asyncio.Semaphore(10)
         launcher._shutdown = asyncio.Event()
 
-        call_count = 0
+        async def failing_worker(job):
+            raise ConnectionError("db down")
 
-        async def flaky_worker(job):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                raise ConnectionError("transient")
+        launcher._run_worker = failing_worker
 
-        launcher._run_worker = flaky_worker
+        captured = {}
+
+        async def mock_handle(job_id, error_code, error_message):
+            captured["error_code"] = error_code
+            captured["error_message"] = error_message
+            launcher.stats["failed"] += 1
+
+        launcher._handle_worker_error = mock_handle
 
         job = {"id": str(uuid.uuid4())}
         await launcher._dispatch(job)
 
-        assert call_count == 3
-        assert launcher.stats["retried"] == 2
-        assert launcher.stats["done"] == 1
+        assert captured["error_code"] == "INFRA"
+        assert "db down" in captured["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_error_calls_process_job_error(self):
+        """Unexpected exceptions route through _handle_worker_error with UNKNOWN."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake")
+        launcher._settings = {"max_parallel_jobs": "10", "job_heartbeat_timeout_seconds": "120"}
+        launcher._semaphore = asyncio.Semaphore(10)
+        launcher._shutdown = asyncio.Event()
+
+        async def exploding_worker(job):
+            raise RuntimeError("something unexpected")
+
+        launcher._run_worker = exploding_worker
+
+        captured = {}
+
+        async def mock_handle(job_id, error_code, error_message):
+            captured["error_code"] = error_code
+            launcher.stats["failed"] += 1
+
+        launcher._handle_worker_error = mock_handle
+
+        job = {"id": str(uuid.uuid4())}
+        await launcher._dispatch(job)
+
+        assert captured["error_code"] == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -392,3 +429,144 @@ class TestJobLauncherIntegration:
 
             stale = await _detect_stale_jobs(conn, 120)
             assert job_id in [str(s) for s in stale]
+
+    @pytest.mark.asyncio
+    async def test_process_job_error_retries_via_catalog(self, db_url):
+        """process_job_error() retries INFRA errors and re-queues the job."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import _process_job_error, _transition_job
+
+        ids = _insert_fixtures(db_url)
+
+        async with await psycopg.AsyncConnection.connect(db_url, autocommit=True) as conn:
+            cur = await conn.execute("SELECT * FROM automation.create_publishing_job()")
+            row = await cur.fetchone()
+            if row is None:
+                pytest.skip("no resources to create a job")
+            cols = [desc.name for desc in cur.description]
+            job = dict(zip(cols, row))
+            job_id = str(job["id"])
+
+            await _transition_job(conn, job_id, "preparing_device")
+
+            result = await _process_job_error(conn, job_id, "INFRA", "connection reset")
+
+            assert result["action"] == "retried"
+            assert result["retry_count"] == 1
+
+            cur = await conn.execute(
+                "SELECT status, retry_count FROM automation.jobs WHERE id = %s",
+                (job_id,),
+            )
+            row = await cur.fetchone()
+            assert row[0] == "queued"
+            assert row[1] == 1
+
+    @pytest.mark.asyncio
+    async def test_process_job_error_needs_review_for_unknown(self, db_url):
+        """process_job_error() moves UNKNOWN errors to needs_review."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import _process_job_error, _transition_job
+
+        ids = _insert_fixtures(db_url)
+
+        async with await psycopg.AsyncConnection.connect(db_url, autocommit=True) as conn:
+            cur = await conn.execute("SELECT * FROM automation.create_publishing_job()")
+            row = await cur.fetchone()
+            if row is None:
+                pytest.skip("no resources to create a job")
+            cols = [desc.name for desc in cur.description]
+            job = dict(zip(cols, row))
+            job_id = str(job["id"])
+
+            await _transition_job(conn, job_id, "preparing_device")
+
+            result = await _process_job_error(conn, job_id, "UNKNOWN", "bug")
+
+            assert result["action"] == "needs_review"
+
+            cur = await conn.execute(
+                "SELECT status FROM automation.jobs WHERE id = %s", (job_id,)
+            )
+            assert (await cur.fetchone())[0] == "needs_review"
+
+    @pytest.mark.asyncio
+    async def test_process_job_error_releases_device(self, db_url):
+        """Device is released after process_job_error()."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import _process_job_error, _transition_job
+
+        ids = _insert_fixtures(db_url)
+
+        async with await psycopg.AsyncConnection.connect(db_url, autocommit=True) as conn:
+            cur = await conn.execute("SELECT * FROM automation.create_publishing_job()")
+            row = await cur.fetchone()
+            if row is None:
+                pytest.skip("no resources to create a job")
+            cols = [desc.name for desc in cur.description]
+            job = dict(zip(cols, row))
+            job_id = str(job["id"])
+            device_id = str(job["device_id"])
+
+            await _transition_job(conn, job_id, "preparing_device")
+            await _process_job_error(conn, job_id, "INFRA", "conn error")
+
+            cur = await conn.execute(
+                "SELECT status, current_job_id FROM automation.physical_devices WHERE id = %s",
+                (device_id,),
+            )
+            row = await cur.fetchone()
+            assert row[0] == "online"
+            assert row[1] is None
+
+    @pytest.mark.asyncio
+    async def test_requeued_job_picked_up(self, db_url):
+        """Re-queued jobs are fetched and get a new device assigned."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import (
+            _fetch_requeued_jobs,
+            _process_job_error,
+            _reserve_device_for_job,
+            _transition_job,
+        )
+
+        ids = _insert_fixtures(db_url)
+        # Insert a second device for the retry
+        second_device_id = str(uuid.uuid4())
+        with psycopg.connect(db_url) as conn:
+            conn.autocommit = True
+            conn.execute(
+                "INSERT INTO automation.physical_devices (id, alias, adb_serial, status, last_seen_at) "
+                "VALUES (%s, %s, %s, 'online', now())",
+                (second_device_id, f"device_{second_device_id[:8]}", f"emulator-{second_device_id[:4]}"),
+            )
+
+        async with await psycopg.AsyncConnection.connect(db_url, autocommit=True) as conn:
+            cur = await conn.execute("SELECT * FROM automation.create_publishing_job()")
+            row = await cur.fetchone()
+            if row is None:
+                pytest.skip("no resources to create a job")
+            cols = [desc.name for desc in cur.description]
+            job = dict(zip(cols, row))
+            job_id = str(job["id"])
+            original_device_id = str(job["device_id"])
+
+            await _transition_job(conn, job_id, "preparing_device")
+            await _process_job_error(conn, job_id, "INFRA", "retry me")
+
+            requeued = await _fetch_requeued_jobs(conn)
+            requeued_ids = [str(j["id"]) for j in requeued]
+            assert job_id in requeued_ids
+
+            new_device = await _reserve_device_for_job(conn, job_id)
+            assert new_device is not None
+            assert new_device != original_device_id
+
+            cur = await conn.execute(
+                "SELECT device_id FROM automation.jobs WHERE id = %s", (job_id,)
+            )
+            assert str((await cur.fetchone())[0]) == new_device

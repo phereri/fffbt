@@ -52,6 +52,10 @@ Some errors trigger account side effects.
 | `checkpoint` | non_retryable | `failed` | 0 | → `disabled` | Instagram checkpoint/security verification |
 | `two_factor` | non_retryable | `failed` | 0 | → `disabled` | 2FA challenge encountered |
 | `action_blocked` | non_retryable | `failed` | 0 | — | Instagram action block (temporary) |
+| `INFRA` | retryable | `failed` | 3 | — | Launcher infrastructure error (connection, OS) |
+| `TIMEOUT` | retryable | `failed` | 2 | — | Job exceeded the launcher timeout |
+| `UNKNOWN` | needs_review | `needs_review` | — | — | Unhandled exception in worker |
+| `HEARTBEAT_TIMEOUT` | needs_review | `needs_review` | — | — | No heartbeat received within timeout window |
 
 ## Error code → stage mapping
 
@@ -75,6 +79,10 @@ is expected.
 | `checkpoint` | yes | yes | yes |
 | `two_factor` | yes | yes | — |
 | `action_blocked` | — | yes | — |
+| `INFRA` | yes | yes | yes |
+| `TIMEOUT` | yes | yes | yes |
+| `UNKNOWN` | yes | yes | yes |
+| `HEARTBEAT_TIMEOUT` | yes | yes | yes |
 
 ## Retry behavior
 
