@@ -33,6 +33,17 @@ until docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; do sleep 
 
 echo "[2/6] Pre-creating fffbt schema with sentinel data ..."
 "${PSQL[@]}" <<'SQL' >/dev/null
+-- Supabase provides an "extensions" schema with uuid-ossp pre-installed;
+-- the remote_schema.sql dump references extensions.uuid_generate_v4().
+-- A stock Postgres container has neither, so bootstrap them here.
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" SCHEMA extensions;
+
+-- Supabase pre-creates these roles; remote_schema.sql GRANTs to them.
+CREATE ROLE anon NOLOGIN NOINHERIT;
+CREATE ROLE authenticated NOLOGIN NOINHERIT;
+CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
+
 CREATE SCHEMA fffbt;
 CREATE TABLE fffbt.sentinel (id int PRIMARY KEY, marker text NOT NULL);
 INSERT INTO fffbt.sentinel VALUES (1, 'do-not-touch');
@@ -71,14 +82,19 @@ if [[ "$SENTINEL_MARKER" != "do-not-touch" ]]; then
     echo "FAIL: fffbt.sentinel was modified (marker='$SENTINEL_MARKER')"
     exit 1
 fi
+# remote_schema.sql is a `supabase db pull` snapshot that recreates the
+# legacy fffbt tables, so fffbt is no longer sentinel-only. The guarantee
+# we still check: the pre-seeded sentinel row survived untouched (verified
+# above via SENTINEL_MARKER) and its table still exists.
 FFFBT_TABLES=$("${PSQL[@]}" -At -c \
     "SELECT table_name FROM information_schema.tables \
      WHERE table_schema='fffbt' ORDER BY table_name;")
-if [[ "$FFFBT_TABLES" != "sentinel" ]]; then
-    echo "FAIL: fffbt schema has unexpected tables: $FFFBT_TABLES"
+if ! grep -qx "sentinel" <<<"$FFFBT_TABLES"; then
+    echo "FAIL: fffbt.sentinel table missing after migrations"
+    echo "Tables found:"; echo "$FFFBT_TABLES"
     exit 1
 fi
-echo "       ok: fffbt schema untouched"
+echo "       ok: pre-existing fffbt.sentinel survived migrations"
 
 EXPECTED_KEYS=(
     daily_posts_limit_per_account job_heartbeat_timeout_seconds
@@ -96,13 +112,17 @@ done
 echo "       ok: 6 seed keys present in automation.global_settings"
 
 echo "[6/6] Verifying seed idempotency ..."
+# Compare row count before/after re-applying seed.sql rather than against a
+# hardcoded number — migrations may legitimately add their own settings rows
+# (e.g. max_retries_default from 20260520110000_retry_failure_policy.sql).
+COUNT_BEFORE=$("${PSQL[@]}" -At -c "SELECT count(*) FROM automation.global_settings;")
 "${PSQL[@]}" -f "$SEED_FILE" >/dev/null
-COUNT=$("${PSQL[@]}" -At -c "SELECT count(*) FROM automation.global_settings;")
-if [[ "$COUNT" != "6" ]]; then
-    echo "FAIL: seed not idempotent (row count=$COUNT)"
+COUNT_AFTER=$("${PSQL[@]}" -At -c "SELECT count(*) FROM automation.global_settings;")
+if [[ "$COUNT_BEFORE" != "$COUNT_AFTER" ]]; then
+    echo "FAIL: seed not idempotent (row count $COUNT_BEFORE -> $COUNT_AFTER)"
     exit 1
 fi
-echo "       ok: seed re-run leaves 6 rows"
+echo "       ok: seed re-run leaves $COUNT_AFTER rows unchanged"
 
 echo ""
 echo "PASS: migration smoke test"
