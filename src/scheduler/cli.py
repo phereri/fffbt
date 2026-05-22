@@ -14,7 +14,8 @@ Commands:
     status             Show current jobs, devices, and videos summary
 
 Each command accepts --help for detailed usage.
-Environment: SUPABASE_DB_URL must be set for database commands.
+Connection: --db-url / SUPABASE_DB_URL, or --via-management-api with
+SUPABASE_PAT and --project-ref / SUPABASE_PROJECT_REF.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ import logging
 import os
 import signal
 import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 SCRIPTS_DIR = os.path.normpath(
@@ -33,15 +37,102 @@ SCRIPTS_DIR = os.path.normpath(
 )
 
 
-def _require_db_url(args: argparse.Namespace) -> str:
+@dataclass
+class _ConnConfig:
+    mode: str  # "direct" or "api"
+    db_url: str | None = None
+    project_ref: str | None = None
+    pat: str | None = None
+
+
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--db-url",
+        default=os.environ.get("SUPABASE_DB_URL"),
+        help="Postgres connection string. Defaults to env SUPABASE_DB_URL.",
+    )
+    parser.add_argument(
+        "--via-management-api",
+        action="store_true",
+        help=(
+            "Use the Supabase Management API instead of a direct DB connection. "
+            "Requires SUPABASE_PAT and --project-ref (or env SUPABASE_PROJECT_REF)."
+        ),
+    )
+    parser.add_argument(
+        "--project-ref",
+        default=os.environ.get("SUPABASE_PROJECT_REF"),
+        help="Supabase project ref. Required with --via-management-api.",
+    )
+
+
+def _resolve_connection(args: argparse.Namespace) -> _ConnConfig:
+    if getattr(args, "via_management_api", False):
+        pat = os.environ.get("SUPABASE_PAT")
+        if not pat:
+            print(
+                "error: SUPABASE_PAT env var is required with --via-management-api.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        project_ref = getattr(args, "project_ref", None)
+        if not project_ref:
+            print(
+                "error: --project-ref (or env SUPABASE_PROJECT_REF) is required "
+                "with --via-management-api.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return _ConnConfig(mode="api", project_ref=project_ref, pat=pat)
+
     db_url = getattr(args, "db_url", None) or os.environ.get("SUPABASE_DB_URL")
     if not db_url:
         print(
-            "error: SUPABASE_DB_URL is not set and --db-url was not provided.",
+            "error: SUPABASE_DB_URL is not set and --db-url was not provided. "
+            "Pass --via-management-api with SUPABASE_PAT to use a personal "
+            "access token instead.",
             file=sys.stderr,
         )
         raise SystemExit(2)
-    return db_url
+    return _ConnConfig(mode="direct", db_url=db_url)
+
+
+def _require_db_url(config: _ConnConfig) -> str:
+    if config.mode != "direct" or not config.db_url:
+        print(
+            "error: this command requires a direct Postgres connection (--db-url). "
+            "The Management API does not support persistent connections needed "
+            "by the job pipeline.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return config.db_url
+
+
+def _management_api_query(project_ref: str, pat: str, sql: str) -> list[dict]:
+    url = f"https://api.supabase.com/v1/projects/{project_ref}/database/query"
+    body = json.dumps({"query": sql}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {pat}",
+            "Content-Type": "application/json",
+            "User-Agent": "fffbt-cli/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Management API query failed ({e.code}): {detail}"
+        ) from None
+    if not isinstance(data, list):
+        raise RuntimeError(f"unexpected Management API response: {data!r}")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +183,34 @@ def cmd_create_job(argv: list[str]) -> int:
             "automation.create_publishing_job()."
         ),
     )
-    parser.add_argument("--db-url", default=os.environ.get("SUPABASE_DB_URL"))
+    _add_connection_args(parser)
     parser.add_argument(
         "--json", action="store_true", help="Print the full job row as JSON."
     )
     args = parser.parse_args(argv)
-    db_url = _require_db_url(args)
+    config = _resolve_connection(args)
 
-    import psycopg
-
-    with psycopg.connect(db_url, autocommit=True) as conn:
-        cur = conn.execute("SELECT * FROM automation.create_publishing_job()")
-        row = cur.fetchone()
-        if row is None or row[0] is None:
+    if config.mode == "api":
+        rows = _management_api_query(
+            config.project_ref,
+            config.pat,
+            "SELECT * FROM automation.create_publishing_job()",
+        )
+        if not rows or rows[0].get("id") is None:
             print("no job created — no eligible video, account, or device available.")
             return 1
-        cols = [desc.name for desc in cur.description]
-        job = dict(zip(cols, row))
+        job = rows[0]
+    else:
+        import psycopg
+
+        with psycopg.connect(config.db_url, autocommit=True) as conn:
+            cur = conn.execute("SELECT * FROM automation.create_publishing_job()")
+            row = cur.fetchone()
+            if row is None or row[0] is None:
+                print("no job created — no eligible video, account, or device available.")
+                return 1
+            cols = [desc.name for desc in cur.description]
+            job = dict(zip(cols, row))
 
     if args.json:
         print(json.dumps(job, default=str, indent=2))
@@ -130,12 +232,13 @@ def cmd_run_launcher(argv: list[str]) -> int:
         prog="fffbt run-launcher",
         description="Start the async job launcher loop.",
     )
-    parser.add_argument("--db-url", default=os.environ.get("SUPABASE_DB_URL"))
+    _add_connection_args(parser)
     parser.add_argument(
         "--log-level", default=os.environ.get("LOG_LEVEL", "info")
     )
     args = parser.parse_args(argv)
-    db_url = _require_db_url(args)
+    config = _resolve_connection(args)
+    db_url = _require_db_url(config)
 
     level = args.log_level.upper()
     logging.basicConfig(
@@ -167,12 +270,13 @@ def cmd_run_job(argv: list[str]) -> int:
         description="Run a single job through the worker pipeline.",
     )
     parser.add_argument("job_id", help="UUID of the job to execute.")
-    parser.add_argument("--db-url", default=os.environ.get("SUPABASE_DB_URL"))
+    _add_connection_args(parser)
     parser.add_argument(
         "--log-level", default=os.environ.get("LOG_LEVEL", "info")
     )
     args = parser.parse_args(argv)
-    db_url = _require_db_url(args)
+    config = _resolve_connection(args)
+    db_url = _require_db_url(config)
 
     level = args.log_level.upper()
     logging.basicConfig(
@@ -225,7 +329,7 @@ def cmd_status(argv: list[str]) -> int:
         prog="fffbt status",
         description="Show current jobs, devices, and videos summary.",
     )
-    parser.add_argument("--db-url", default=os.environ.get("SUPABASE_DB_URL"))
+    _add_connection_args(parser)
     parser.add_argument(
         "--json", action="store_true", help="Output as JSON."
     )
@@ -237,28 +341,45 @@ def cmd_status(argv: list[str]) -> int:
         help="Show the N most recent job events.",
     )
     args = parser.parse_args(argv)
-    db_url = _require_db_url(args)
-
-    import psycopg
+    config = _resolve_connection(args)
 
     result: dict[str, Any] = {}
-    with psycopg.connect(db_url) as conn:
-        with conn.cursor() as cur:
-            for section, sql in _STATUS_QUERIES.items():
-                cur.execute(sql)
-                result[section] = {row[0]: row[1] for row in cur.fetchall()}
+    events: list[dict[str, Any]] = []
 
-            events: list[dict[str, Any]] = []
-            if args.events > 0:
-                cur.execute(
-                    "SELECT id, job_id, event_type, from_status, "
-                    "to_status, created_at, payload "
-                    "FROM automation.job_events "
-                    "ORDER BY created_at DESC LIMIT %s",
-                    (args.events,),
-                )
-                cols = [d.name for d in cur.description]
-                events = [dict(zip(cols, r)) for r in cur.fetchall()]
+    if config.mode == "api":
+        for section, sql in _STATUS_QUERIES.items():
+            rows = _management_api_query(config.project_ref, config.pat, sql)
+            result[section] = {r["status"]: r["count"] for r in rows}
+
+        if args.events > 0:
+            events_sql = (
+                "SELECT id, job_id, event_type, from_status, "
+                "to_status, created_at, payload "
+                "FROM automation.job_events "
+                f"ORDER BY created_at DESC LIMIT {int(args.events)}"
+            )
+            events = _management_api_query(
+                config.project_ref, config.pat, events_sql
+            )
+    else:
+        import psycopg
+
+        with psycopg.connect(config.db_url) as conn:
+            with conn.cursor() as cur:
+                for section, sql in _STATUS_QUERIES.items():
+                    cur.execute(sql)
+                    result[section] = {row[0]: row[1] for row in cur.fetchall()}
+
+                if args.events > 0:
+                    cur.execute(
+                        "SELECT id, job_id, event_type, from_status, "
+                        "to_status, created_at, payload "
+                        "FROM automation.job_events "
+                        "ORDER BY created_at DESC LIMIT %s",
+                        (args.events,),
+                    )
+                    cols = [d.name for d in cur.description]
+                    events = [dict(zip(cols, r)) for r in cur.fetchall()]
 
     if events:
         result["recent_events"] = events

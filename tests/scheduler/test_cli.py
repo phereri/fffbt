@@ -71,6 +71,7 @@ class TestDispatcher:
         )
         assert result.returncode == 2
         assert "SUPABASE_DB_URL" in result.stderr
+        assert "--via-management-api" in result.stderr
 
     def test_status_missing_db_url(self):
         env = {k: v for k, v in __import__("os").environ.items() if k != "SUPABASE_DB_URL"}
@@ -83,6 +84,67 @@ class TestDispatcher:
         )
         assert result.returncode == 2
         assert "SUPABASE_DB_URL" in result.stderr
+        assert "--via-management-api" in result.stderr
+
+    def test_via_management_api_missing_pat(self):
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k not in ("SUPABASE_DB_URL", "SUPABASE_PAT")}
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "create-job",
+             "--via-management-api", "--project-ref", "test-ref"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "SUPABASE_PAT" in result.stderr
+
+    def test_via_management_api_missing_project_ref(self):
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k not in ("SUPABASE_DB_URL", "SUPABASE_PROJECT_REF")}
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "create-job",
+             "--via-management-api"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "project-ref" in result.stderr
+
+    def test_run_launcher_rejects_management_api(self):
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k != "SUPABASE_DB_URL"}
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "run-launcher",
+             "--via-management-api", "--project-ref", "test-ref"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "direct Postgres connection" in result.stderr
+
+    def test_run_job_rejects_management_api(self):
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k != "SUPABASE_DB_URL"}
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "run-job",
+             "00000000-0000-0000-0000-000000000000",
+             "--via-management-api", "--project-ref", "test-ref"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "direct Postgres connection" in result.stderr
 
     def test_subcommand_help(self):
         env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
