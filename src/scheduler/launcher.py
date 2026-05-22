@@ -1,15 +1,11 @@
 """Async job launcher for the fffbt scheduler.
 
-WARNING: The worker pipeline (_run_worker) is a STUB. It transitions jobs to
-preparing_device and emits heartbeats, but does NOT perform real device
-automation, Instagram posting, or verification. Do NOT run this launcher
-against the live production queue until the real worker is implemented —
-it will park up to max_parallel_jobs jobs (with their devices and videos)
-in preparing_device indefinitely.
-
 Creates publishing jobs via automation.create_publishing_job() and dispatches
-each to an async worker task, bounded by asyncio.Semaphore. The scheduler
-never executes jobs itself -- it reserves resources and hands off to workers.
+each to an async worker task, bounded by asyncio.Semaphore. Each worker runs
+the generic job pipeline (see pipeline.py), which executes steps in order:
+environment_apply, video_preparation, mobile_ui_automation, verification,
+and cleanup. Step implementations are currently stubs that return OK
+immediately — real device automation will be plugged in via follow-up issues.
 """
 
 from __future__ import annotations
@@ -201,35 +197,15 @@ class JobLauncher:
         return 5.0
 
     async def _run_worker(self, job: dict[str, Any]) -> None:
-        """Run a single job through the worker pipeline.
+        """Run a single job through the worker pipeline."""
+        from scheduler.pipeline import run_job_pipeline
 
-        The launcher itself does not execute the job. This method is the
-        boundary where a real worker (Appium, device automation, etc.) would
-        be invoked. For now it transitions the job to preparing_device and
-        emits a heartbeat loop — the actual device/posting work is handled
-        by a separate worker process or will be wired in a follow-up issue.
-        """
-        job_id = str(job["id"])
-        _jsonl("worker_start", job_id=job_id)
-
-        async with await psycopg.AsyncConnection.connect(
-            self.db_url, autocommit=True
-        ) as conn:
-            await _transition_job(conn, job_id, "preparing_device")
-            _jsonl("job_status", job_id=job_id, status="preparing_device")
-
-            # Heartbeat: keep updated_at fresh while the job is active.
-            # A real worker replaces this loop with actual device automation
-            # and calls _update_heartbeat between steps.
-            while not self._shutdown.is_set():
-                await _update_heartbeat(conn, job_id)
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown.wait(), timeout=self.heartbeat_timeout / 4
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    pass
+        await run_job_pipeline(
+            db_url=self.db_url,
+            job=job,
+            settings=self._settings,
+            shutdown=self._shutdown,
+        )
 
     async def _handle_worker_error(
         self, job_id: str, error_code: str, error_message: str

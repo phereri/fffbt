@@ -8,10 +8,10 @@ import os
 import sys
 
 _STUB_WARNING = (
-    "WARNING: The worker pipeline is a STUB — jobs will be created and "
-    "moved to preparing_device, but NO real device automation or posting "
-    "will occur. Do NOT run against the production queue until the real "
-    "worker is implemented."
+    "WARNING: Worker steps are STUBS — jobs run through the full pipeline "
+    "but steps return OK immediately without performing real device "
+    "automation or posting. Do NOT run against the production queue until "
+    "real step implementations are plugged in."
 )
 
 
