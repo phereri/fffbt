@@ -19,6 +19,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import psycopg
 
+from scheduler.hashtags import build_caption, select_hashtags
+
 
 # ---------------------------------------------------------------------------
 # Logging (matches launcher JSONL format)
@@ -155,6 +157,44 @@ async def _load_job_context(
         device_id=str(job["device_id"]),
         settings=settings,
     )
+
+
+async def _prepare_caption(
+    conn: psycopg.AsyncConnection,
+    ctx: StepContext,
+) -> list[str]:
+    """Select hashtags, assemble full caption, and inject into ctx.settings.
+
+    Returns the selected hashtags list. The assembled caption is written to
+    ``ctx.settings["caption_text"]`` (mutates the dict in-place) and the
+    hashtags are recorded in a job event for audit.
+    """
+    base_caption = ctx.settings.get("caption_text", "")
+    hashtag_count = int(ctx.settings.get("hashtag_count", "10"))
+    hashtags = select_hashtags(hashtag_count)
+    full_caption = build_caption(base_caption, hashtags)
+    ctx.settings["caption_text"] = full_caption
+    ctx.settings["hashtags"] = " ".join(hashtags)
+
+    await conn.execute(
+        "UPDATE automation.jobs SET caption = %s, hashtags = %s WHERE id = %s",
+        (full_caption, hashtags, ctx.job_id),
+    )
+    await conn.execute(
+        "INSERT INTO automation.job_events (job_id, event_type, payload) "
+        "VALUES (%s, 'heartbeat', %s::jsonb)",
+        (
+            ctx.job_id,
+            json.dumps({
+                "step": "caption_assembly",
+                "status": "ok",
+                "base_caption": base_caption,
+                "hashtags": hashtags,
+                "full_caption": full_caption,
+            }),
+        ),
+    )
+    return hashtags
 
 
 async def _transition_job(
@@ -324,6 +364,7 @@ async def run_job_pipeline(
         db_url, autocommit=True
     ) as conn:
         ctx = await _load_job_context(conn, job_id, settings)
+        await _prepare_caption(conn, ctx)
         heartbeat_interval = (
             int(settings.get("job_heartbeat_timeout_seconds", "120")) / 4
         )
