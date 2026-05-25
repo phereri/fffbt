@@ -1,8 +1,13 @@
-"""verification step — confirm Trial Reel was posted and optionally capture URL.
+"""verification step — two-level post-publish verification.
 
-Runs after mobile_ui_automation succeeds. The device is still reserved.
-Post URL capture is best-effort (max 3 agent steps); failure to capture
-a URL does not fail the step.
+Level 1 (immediate): confirm the publish screen transitioned away
+(trials_list visible, activity changed, or share_button gone).
+
+Level 2 (delayed): wait verification_delay_seconds, then navigate to
+Professional Dashboard / Trial Reels and confirm the reel is visible.
+
+The device stays reserved throughout both levels.
+Post URL capture is best-effort; missing URL is not failure.
 """
 
 from __future__ import annotations
@@ -21,12 +26,23 @@ from src.worker.session.types import (
 
 logger = logging.getLogger(__name__)
 
-_GOAL_VERIFY_POST = (
+_GOAL_VERIFY_IMMEDIATE = (
     "Check if we are on a post-publish screen. Look for any of: "
     "(1) the trials_list with trial_thumbnail_image tiles, "
     "(2) the home feed, "
     "(3) the profile tab showing recent reels. "
     "Report success=true if a recently posted Trial Reel appears to be live."
+)
+
+_GOAL_VERIFY_DASHBOARD = (
+    "Navigate to verify the Trial Reel is live:\n"
+    "1. Go to the Profile tab.\n"
+    "2. Tap 'Professional dashboard' (may say 'Professional Tools' or "
+    "'Pro dashboard').\n"
+    "3. Inside the dashboard, tap the 'Trial Reels' tile.\n"
+    "4. Check that the most recent Trial Reel thumbnail is present and "
+    "appears freshly posted (top of the list).\n"
+    "Report success=true if a fresh Trial Reel is visible in the list."
 )
 
 _GOAL_CAPTURE_URL = (
@@ -37,9 +53,11 @@ _GOAL_CAPTURE_URL = (
     "with post_url='' (empty). Do NOT retry or re-share."
 )
 
+_DEFAULT_VERIFICATION_DELAY = 180
+
 
 class VerificationStep:
-    """Verify the Trial Reel is visible and optionally capture the post URL."""
+    """Two-level verification: immediate confirmation then delayed dashboard check."""
 
     name = StepName.VERIFICATION
 
@@ -68,15 +86,42 @@ class VerificationStep:
             return self._fail("INFRA", f"GenFarmer connect failed: {e}")
 
         try:
-            verified = await self._verify_post_visible(worker)
+            # Level 1: immediate publish confirmation
+            level1 = await self._verify_immediate(worker)
+            await self._screenshot(worker, "level1_verification")
+
+            if not level1:
+                return StepResult(
+                    step=StepName.VERIFICATION,
+                    status=StepStatus.NEEDS_REVIEW,
+                    code="verification_failed",
+                    message="level 1: could not confirm post-publish screen",
+                )
+
+            # Wait configured delay before Level 2
+            delay = int(
+                ctx.settings.get(
+                    "verification_delay_seconds",
+                    str(_DEFAULT_VERIFICATION_DELAY),
+                )
+            )
+            logger.info(
+                "level 1 passed; waiting %ds for final verification", delay
+            )
+            await asyncio.sleep(delay)
+
+            # Level 2: dashboard verification
+            level2 = await self._verify_dashboard(worker)
+            await self._screenshot(worker, "verification_result")
+
             post_url = await self._try_capture_url(worker)
 
             details: dict[str, Any] = {}
             if post_url:
                 details["post_url"] = post_url
 
-            if verified:
-                msg = "post verified"
+            if level2:
+                msg = "post verified via dashboard"
                 if post_url:
                     msg += f", url: {post_url}"
                 return StepResult(
@@ -85,11 +130,15 @@ class VerificationStep:
                     message=msg,
                     details=details if details else None,
                 )
+
             return StepResult(
                 step=StepName.VERIFICATION,
                 status=StepStatus.NEEDS_REVIEW,
                 code="verification_failed",
-                message="could not confirm post visibility",
+                message=(
+                    "level 2: could not confirm post in "
+                    "Professional Dashboard"
+                ),
             )
         except Exception as e:
             return self._fail("UNKNOWN", f"unhandled: {e}")
@@ -99,10 +148,20 @@ class VerificationStep:
             except Exception:
                 pass
 
-    async def _verify_post_visible(self, worker: MobilerunWorker) -> bool:
+    async def _verify_immediate(self, worker: MobilerunWorker) -> bool:
         try:
             result = await asyncio.to_thread(
-                worker.run_goal, _GOAL_VERIFY_POST, timeout_seconds=30
+                worker.run_goal, _GOAL_VERIFY_IMMEDIATE, timeout_seconds=30
+            )
+            status = str(result.get("status", "")).lower()
+            return status in ("success", "completed", "ok", "done")
+        except Exception:
+            return False
+
+    async def _verify_dashboard(self, worker: MobilerunWorker) -> bool:
+        try:
+            result = await asyncio.to_thread(
+                worker.run_goal, _GOAL_VERIFY_DASHBOARD, timeout_seconds=60
             )
             status = str(result.get("status", "")).lower()
             return status in ("success", "completed", "ok", "done")
@@ -127,6 +186,12 @@ class VerificationStep:
         except Exception:
             pass
         return None
+
+    async def _screenshot(self, worker: MobilerunWorker, label: str) -> None:
+        try:
+            await asyncio.to_thread(worker.screenshot, label)
+        except Exception:
+            pass
 
     def _fail(self, code: str, message: str) -> StepResult:
         return StepResult(
