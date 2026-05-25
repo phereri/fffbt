@@ -1,0 +1,556 @@
+"""Instagram-specific worker tools.
+
+Ported from Mobilerun farm/tools.py. Each tool retains the original
+algorithm but accepts device_serial + ui_nodes instead of ActionContext.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import shlex
+import time
+from typing import Any, Awaitable, Callable
+
+from src.worker.tools._adb import (
+    ime_input_shown,
+    input_tap,
+    shell,
+    top_activity,
+)
+from src.worker.tools._types import ToolResult
+from src.worker.tools._ui import (
+    is_instagram_caption_placeholder,
+    node_resource_id,
+    node_text,
+    normalize_caption_text,
+    parse_bounds,
+)
+
+ReadUi = Callable[[], Awaitable[list[dict[str, Any]]]]
+
+
+# ---------------------------------------------------------------------------
+# IME
+# ---------------------------------------------------------------------------
+
+
+async def hide_ime(serial: str, *, timeout_s: float = 3.0) -> ToolResult:
+    """Force-hide the on-screen IME so it stops covering bottom buttons.
+
+    Strategy: check dumpsys, send KEYCODE_BACK, re-check until hidden.
+    """
+    if not await ime_input_shown(serial):
+        return ToolResult.ok("hide_ime: IME already hidden")
+    try:
+        await shell(serial, "input keyevent 4", timeout=10)
+    except Exception as e:
+        return ToolResult.fail(f"hide_ime: keyevent BACK failed: {e}")
+    deadline = time.perf_counter() + max(0.5, timeout_s)
+    while time.perf_counter() < deadline:
+        await asyncio.sleep(0.25)
+        if not await ime_input_shown(serial):
+            return ToolResult.ok("hide_ime: IME hidden via KEYCODE_BACK")
+    return ToolResult.fail(f"hide_ime: IME still shown after {timeout_s:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# tap_by_resource_id
+# ---------------------------------------------------------------------------
+
+
+async def tap_by_resource_id(
+    serial: str,
+    resource_id: str,
+    *,
+    ui_nodes: list[dict[str, Any]],
+    contains_text: str | None = None,
+    class_name_contains: str | None = None,
+) -> ToolResult:
+    """Tap the centre of the element matching *resource_id* via adb input tap.
+
+    Bypasses index-based resolution which is fragile after layout shifts.
+    For ``caption_input_text_view``, picks the largest AutoCompleteTextView
+    by area. For ``share_button``, picks the lowest on screen.
+    """
+    if not ui_nodes:
+        return ToolResult.fail("tap_by_resource_id: empty UI tree")
+
+    suffix = resource_id.split("/")[-1] if "/" in resource_id else resource_id
+    suffix = suffix.split(":")[-1]
+    needle = (contains_text or "").strip().lower()
+    class_needle = (class_name_contains or "").strip().lower()
+
+    matches: list[dict[str, Any]] = []
+    for node in ui_nodes:
+        rid = node_resource_id(node)
+        if not rid:
+            continue
+        if rid != resource_id and not rid.endswith(suffix):
+            continue
+        if needle and needle not in node_text(node).lower():
+            continue
+        if not parse_bounds(node.get("bounds")):
+            continue
+        matches.append(node)
+
+    if class_needle:
+        filtered = [
+            n
+            for n in matches
+            if class_needle
+            in str(n.get("className") or n.get("class_name") or "").lower()
+        ]
+        if filtered:
+            matches = filtered
+
+    if not matches:
+        return ToolResult.fail(
+            f"tap_by_resource_id: no node with resource_id={resource_id!r}"
+            + (f" text~{contains_text!r}" if contains_text else "")
+            + (f" class~{class_name_contains!r}" if class_name_contains else "")
+        )
+
+    is_share_caption = suffix == "caption_input_text_view" or resource_id.endswith(
+        "caption_input_text_view"
+    )
+    if is_share_caption:
+        ac_only = [
+            n
+            for n in matches
+            if "AutoCompleteTextView"
+            in str(n.get("className") or n.get("class_name") or "")
+        ]
+        pool = ac_only if ac_only else matches
+
+        def _area(n: dict[str, Any]) -> int:
+            b = parse_bounds(n.get("bounds")) or (0, 0, 0, 0)
+            return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+        target = max(pool, key=_area)
+    elif suffix == "share_button" or resource_id.endswith("share_button"):
+        target = max(
+            matches,
+            key=lambda n: (parse_bounds(n.get("bounds")) or (0, 0, 0, 0))[3],
+        )
+    else:
+        target = max(
+            matches,
+            key=lambda n: (
+                (parse_bounds(n.get("bounds")) or (0, 0, 0, 0))[2]
+                - (parse_bounds(n.get("bounds")) or (0, 0, 0, 0))[0]
+            ),
+        )
+
+    bounds = parse_bounds(target.get("bounds")) or (0, 0, 0, 0)
+    x = (bounds[0] + bounds[2]) // 2
+    y = (bounds[1] + bounds[3]) // 2
+    try:
+        await input_tap(serial, x, y)
+    except Exception as e:
+        return ToolResult.fail(f"tap_by_resource_id: {e}")
+    return ToolResult.ok(
+        f"tapped {resource_id} at ({x},{y}) [text={node_text(target)[:40]!r}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# tap_by_text
+# ---------------------------------------------------------------------------
+
+
+async def tap_by_text(
+    serial: str,
+    text: str,
+    *,
+    ui_nodes: list[dict[str, Any]],
+    exact: bool = False,
+    prefer: str = "smallest",
+    exclude_text_exact: tuple[str, ...] = (),
+) -> ToolResult:
+    """Tap the centre of an element whose visible text matches *text*.
+
+    ``prefer='smallest'`` for buttons, ``'largest'`` for caption hints.
+    """
+    if not text:
+        return ToolResult.fail("tap_by_text: empty text")
+    if prefer not in ("smallest", "largest"):
+        prefer = "smallest"
+
+    needle = text.strip().lower()
+    excludes = {x.strip().lower() for x in exclude_text_exact if x.strip()}
+    matches: list[dict[str, Any]] = []
+    for node in ui_nodes:
+        nt = node_text(node).strip()
+        if not nt:
+            continue
+        if nt.lower() in excludes:
+            continue
+        if not parse_bounds(node.get("bounds")):
+            continue
+        if exact:
+            if nt.lower() == needle:
+                matches.append(node)
+        elif needle in nt.lower():
+            matches.append(node)
+
+    if not matches:
+        return ToolResult.fail(f"tap_by_text: no node matches text~{text!r}")
+
+    def _area(n: dict[str, Any]) -> int:
+        b = parse_bounds(n.get("bounds")) or (0, 0, 0, 0)
+        return max(0, (b[2] - b[0])) * max(0, (b[3] - b[1]))
+
+    target = max(matches, key=_area) if prefer == "largest" else min(matches, key=_area)
+    bounds = parse_bounds(target.get("bounds")) or (0, 0, 0, 0)
+    x = (bounds[0] + bounds[2]) // 2
+    y = (bounds[1] + bounds[3]) // 2
+    try:
+        await input_tap(serial, x, y)
+    except Exception as e:
+        return ToolResult.fail(f"tap_by_text: {e}")
+    return ToolResult.ok(
+        f"tapped text~{text!r} at ({x},{y}) "
+        f"[resource_id={node_resource_id(target)!r}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# verify_caption_text
+# ---------------------------------------------------------------------------
+
+
+def verify_caption_text(
+    expected_text: str,
+    *,
+    ui_nodes: list[dict[str, Any]],
+) -> ToolResult:
+    """Pre-share safety check: verify the caption field matches expected text."""
+    expected = normalize_caption_text(expected_text)
+
+    candidates: list[dict[str, Any]] = []
+    for node in ui_nodes:
+        rid = node_resource_id(node)
+        class_name = str(node.get("className") or node.get("class_name") or "")
+        text = str(node.get("text") or "")
+        if rid.endswith("caption_input_text_view"):
+            candidates.append(node)
+            continue
+        if "AutoCompleteTextView" in class_name and (
+            "caption" in text.lower() or "#" in text.lower()
+        ):
+            candidates.append(node)
+
+    if not candidates:
+        return ToolResult.fail(
+            "caption verification: caption input not found in current UI"
+        )
+
+    def _score(node: dict[str, Any]) -> tuple[int, int]:
+        raw = str(node.get("text") or "")
+        if is_instagram_caption_placeholder(raw):
+            return (0, len(raw))
+        return (1, len(raw))
+
+    candidates.sort(key=_score, reverse=True)
+    observed_raw = str(candidates[0].get("text") or "")
+    if is_instagram_caption_placeholder(observed_raw):
+        return ToolResult.fail(
+            "caption verification: field still shows Instagram placeholder "
+            "(paste/focus did not apply - retry paste_text or tap the caption box)"
+        )
+    observed = normalize_caption_text(observed_raw)
+    if observed == expected:
+        return ToolResult.ok(f"caption verified exactly ({len(observed)} chars)")
+
+    expected_flat = " ".join(expected.split())
+    observed_flat = " ".join(observed.split())
+    if observed_flat == expected_flat:
+        return ToolResult.ok(
+            f"caption verified (whitespace-tolerant, {len(observed)} chars)"
+        )
+
+    return ToolResult.fail(
+        "caption verification mismatch: "
+        f"expected={expected[:240]!r}; observed={observed[:240]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# paste_text
+# ---------------------------------------------------------------------------
+
+_ADB_KEYBOARD_COMPONENT = "com.android.adbkeyboard/.AdbIME"
+
+
+async def _adb_keyboard_ensure_active(serial: str) -> str | None:
+    """Switch default IME to ADB Keyboard. Returns previous IME if switched."""
+    try:
+        prev = (
+            await shell(serial, "settings get secure default_input_method", timeout=5)
+        ).strip()
+    except Exception:
+        return None
+    if "adbkeyboard" in prev.lower():
+        return None
+    try:
+        await shell(serial, f"ime enable {_ADB_KEYBOARD_COMPONENT}", timeout=10)
+        await shell(serial, f"ime set {_ADB_KEYBOARD_COMPONENT}", timeout=10)
+        await asyncio.sleep(0.35)
+        cur = (
+            await shell(serial, "settings get secure default_input_method", timeout=5)
+        ).strip()
+        if "adbkeyboard" not in cur.lower():
+            return None
+    except Exception:
+        return None
+    return prev if prev else None
+
+
+async def _adb_keyboard_restore(serial: str, previous: str | None) -> None:
+    if not previous or not previous.strip():
+        return
+    try:
+        await shell(serial, f"ime set {shlex.quote(previous.strip())}", timeout=10)
+    except Exception:
+        pass
+
+
+async def _focus_caption_field(
+    serial: str,
+    ui_nodes: list[dict[str, Any]],
+) -> ToolResult:
+    """Focus the IG Share caption field using stable resource-id strategies."""
+    rid = "com.instagram.android:id/caption_input_text_view"
+    for extra in (
+        {"contains_text": "Write a caption", "class_name_contains": "AutoComplete"},
+        {"class_name_contains": "AutoComplete"},
+        {},
+    ):
+        result = await tap_by_resource_id(serial, rid, ui_nodes=ui_nodes, **extra)
+        if result.success:
+            return result
+    for hint in ("Write a caption", "Add a caption"):
+        result = await tap_by_text(
+            serial,
+            hint,
+            ui_nodes=ui_nodes,
+            prefer="largest",
+            exclude_text_exact=("Prompt",),
+        )
+        if result.success:
+            return result
+    return ToolResult.fail(
+        "focus_caption_field: resource_id + caption hints failed"
+    )
+
+
+async def paste_text(
+    serial: str,
+    text: str,
+    *,
+    ui_nodes: list[dict[str, Any]],
+    resource_id: str | None = None,
+    focus_caption: bool = False,
+    clear: bool = True,
+) -> ToolResult:
+    """Paste full text into a field.
+
+    Focuses the target field (by resource_id or IG caption auto-detection),
+    then pastes via ADB_INPUT_B64 (ADB Keyboard broadcast).
+
+    Set ``focus_caption=True`` for Instagram Trial Reel Share caption field
+    (resolves via caption_input_text_view + "Write a caption" hint).
+    """
+    if not text:
+        return ToolResult.ok("paste_text: (empty)")
+
+    if resource_id:
+        is_ig_caption = resource_id.endswith("caption_input_text_view")
+        if is_ig_caption:
+            result = await _focus_caption_field(serial, ui_nodes)
+        else:
+            result = await tap_by_resource_id(serial, resource_id, ui_nodes=ui_nodes)
+        if not result.success:
+            return ToolResult.fail(f"paste_text: focus failed: {result.message}")
+        await asyncio.sleep(0.55 if is_ig_caption else 0.4)
+    elif focus_caption:
+        result = await _focus_caption_field(serial, ui_nodes)
+        if not result.success:
+            return ToolResult.fail(
+                f"paste_text: caption focus failed: {result.message}"
+            )
+        await asyncio.sleep(0.55)
+
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    prev_ime = await _adb_keyboard_ensure_active(serial)
+    try:
+        try:
+            out = await shell(
+                serial,
+                f'am broadcast -a ADB_INPUT_B64 --es msg "{encoded}"',
+                timeout=10,
+            )
+            if "Broadcast completed" in (out or ""):
+                return ToolResult.ok(f"pasted {len(text)} chars via ADB_INPUT_B64")
+        except Exception:
+            pass
+
+        return ToolResult.fail("paste_text: ADB_INPUT_B64 failed or incomplete")
+    finally:
+        await _adb_keyboard_restore(serial, prev_ime)
+
+
+# ---------------------------------------------------------------------------
+# tap_share_and_confirm
+# ---------------------------------------------------------------------------
+
+
+async def tap_share_and_confirm(
+    serial: str,
+    *,
+    read_ui: ReadUi,
+    confirm_timeout_s: float = 22.0,
+) -> ToolResult:
+    """Tap Instagram's Share button and confirm the post registered.
+
+    Hides IME, taps share_button by resource-id with real-finger swipe,
+    then polls for activity change or share_button disappearing.
+    Retries with escalating tap strategies on failure.
+    """
+
+    def _share_button_bounds(
+        nodes: list[dict[str, Any]],
+    ) -> tuple[int, int] | None:
+        candidates: list[tuple[int, int, int, int]] = []
+        for n in nodes:
+            if node_resource_id(n).endswith("share_button"):
+                b = parse_bounds(n.get("bounds"))
+                if b:
+                    candidates.append(b)
+        if not candidates:
+            return None
+        b = max(candidates, key=lambda bb: bb[3])
+        return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+
+    def _share_button_gone(nodes: list[dict[str, Any]]) -> bool:
+        for n in nodes:
+            if node_resource_id(n).endswith("share_button"):
+                return False
+        return True
+
+    async def _tap_share_once(
+        *,
+        hold_ms: int = 120,
+        mode: str = "swipe",
+    ) -> tuple[bool, str, tuple[int, int] | None]:
+        await hide_ime(serial)
+        await asyncio.sleep(0.45)
+        nodes = await read_ui()
+        coords = _share_button_bounds(nodes)
+        if coords is None:
+            return False, "share_button not in current UI tree", None
+        try:
+            if mode == "shell_tap":
+                await shell(
+                    serial, f"input tap {coords[0]} {coords[1]}", timeout=10
+                )
+            else:
+                await input_tap(serial, coords[0], coords[1], hold_ms=hold_ms)
+        except Exception as e:
+            return False, f"adb tap failed: {e}", coords
+        return True, f"tapped({mode})", coords
+
+    async def _poll_confirmation(
+        started_activity: str,
+        started: float,
+        timeout: float,
+        coords: tuple[int, int] | None,
+        label: str = "",
+    ) -> ToolResult | None:
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            await asyncio.sleep(0.7)
+            cur_activity = await top_activity(serial)
+            if cur_activity and cur_activity != started_activity:
+                elapsed = time.perf_counter() - started
+                return ToolResult.ok(
+                    f"share confirmed{label}: activity {started_activity} -> "
+                    f"{cur_activity} in {elapsed:.1f}s (tap at {coords})"
+                )
+            nodes = await read_ui()
+            if _share_button_gone(nodes):
+                elapsed = time.perf_counter() - started
+                return ToolResult.ok(
+                    f"share confirmed{label}: share_button gone in {elapsed:.1f}s"
+                    f" (tap at {coords})"
+                )
+        return None
+
+    started_activity = await top_activity(serial)
+    started = time.perf_counter()
+
+    # First attempt
+    ok, msg, coords = await _tap_share_once()
+    if not ok:
+        return ToolResult.fail(f"tap_share_and_confirm: {msg}")
+
+    result = await _poll_confirmation(
+        started_activity, started, confirm_timeout_s, coords
+    )
+    if result:
+        return result
+
+    # Retry with shell_tap
+    ok2, msg2, coords2 = await _tap_share_once(hold_ms=180, mode="shell_tap")
+    if not ok2:
+        cur_activity = await top_activity(serial)
+        if cur_activity and cur_activity != started_activity:
+            elapsed = time.perf_counter() - started
+            return ToolResult.ok(
+                f"share confirmed (during retry): activity {started_activity} -> "
+                f"{cur_activity} in {elapsed:.1f}s"
+            )
+        return ToolResult.fail(f"tap_share_and_confirm: retry failed: {msg2}")
+
+    result = await _poll_confirmation(
+        started_activity, started, 12.0, coords2, " on retry"
+    )
+    if result:
+        return result
+
+    # Third attempt with longer hold
+    ok3, _, coords3 = await _tap_share_once(hold_ms=200, mode="swipe")
+    if ok3:
+        result = await _poll_confirmation(
+            started_activity, started, 10.0, coords3, " on 3rd tap"
+        )
+        if result:
+            return result
+
+    # Observe-only window for slow Trial transitions
+    result = await _poll_confirmation(
+        started_activity, started, 16.0, coords, " (slow)"
+    )
+    if result:
+        return result
+
+    # Last resort: tap_by_resource_id
+    last_nodes = await read_ui()
+    rid_result = await tap_by_resource_id(
+        serial,
+        "com.instagram.android:id/share_button",
+        ui_nodes=last_nodes,
+    )
+    if rid_result.success:
+        result = await _poll_confirmation(
+            started_activity, started, 14.0, None, " after resource_id tap"
+        )
+        if result:
+            return result
+
+    return ToolResult.fail(
+        "tap_share_and_confirm: activity did not change and share_button is still "
+        "on screen after swipe + shell_tap + swipe + observe + resource_id - "
+        "share did not register"
+    )
