@@ -1,0 +1,5 @@
+# Dependencies for src/worker/ PoC and runtime.
+# Install with: pip install -r src/worker/requirements.txt
+#
+# Appium path (FFF-27 acceptance criteria):
+Appium-Python-Client>=4.0
