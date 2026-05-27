@@ -22,6 +22,7 @@ from src.worker.session.types import (
     StepStatus,
 )
 from src.worker.tools._ui import walk_plain_ui
+from src.worker.tools._ui import node_text, parse_bounds
 from src.worker.tools.instagram import (
     paste_text,
     tap_share_and_confirm,
@@ -170,6 +171,50 @@ def _route_missing(result: dict[str, Any]) -> bool:
     return "route missing" in text or "404" in text or "/automation/run" in text
 
 
+def _node_bounds(node: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    bounds = parse_bounds(
+        node.get("bounds")
+        or node.get("boundsInScreen")
+        or node.get("bounds_in_screen")
+    )
+    if bounds:
+        return bounds
+    raw = node.get("boundsInScreen") or node.get("bounds_in_screen")
+    if isinstance(raw, dict):
+        try:
+            return (
+                int(raw["left"]),
+                int(raw["top"]),
+                int(raw["right"]),
+                int(raw["bottom"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _bottom_right_next(ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
+    """Find the visible bottom-right editor Next button, ignoring stale top controls."""
+    candidates: list[tuple[int, int, int, int]] = []
+    for node in ui_nodes:
+        text = node_text(node).strip().lower()
+        if text not in {"next", "next →", "next ->"} and "next" not in text:
+            continue
+        if node.get("isEnabled") is False or node.get("enabled") is False:
+            continue
+        bounds = _node_bounds(node)
+        if not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        if x2 < 700 or y2 < 1200:
+            continue
+        candidates.append(bounds)
+    if not candidates:
+        return None
+    x1, y1, x2, y2 = max(candidates, key=lambda b: (b[3], b[2]))
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
 class MobileUIAutomationStep:
     """Drive Instagram app to publish a Trial Reel.
 
@@ -258,6 +303,13 @@ class MobileUIAutomationStep:
                 or result.get("failure_reason")
                 or result.get("status", "unknown")
             )
+            error_code = str(result.get("error_code") or "")
+            if error_code in {
+                "editor_next_not_reached",
+                "share_screen_not_reached",
+                "next_button_inactive",
+            }:
+                return self._needs_review(error_code, str(err))
             err_lower = str(err).lower()
             if "dashboard" in err_lower or "trial" in err_lower:
                 return self._fail("trial_reels_unavailable", str(err))
@@ -376,10 +428,12 @@ class MobileUIAutomationStep:
 
         await tap(540, 850, 2.5)
 
-        # Advance through editor screens until the Share screen appears. The
-        # first editor screen exposes a bottom-right "Next" button even when
-        # the legacy top clips_next_button is present but disabled.
-        await tap(920, 1620, 2.5)
+        # Advance through editor screens until the Share screen appears. Prefer
+        # the visible bottom-right Next button; ignore the legacy top
+        # clips_next_button, which can be present while disabled/inactive.
+        ui = await self._read_ui(worker)
+        next_coords = _bottom_right_next(ui) or (920, 1620)
+        await tap(next_coords[0], next_coords[1], 2.5)
         for _ in range(5):
             ui = await self._read_ui(worker)
             if _has_resource(ui, "caption_input_text_view") and _has_resource(
@@ -387,7 +441,8 @@ class MobileUIAutomationStep:
             ):
                 return {"status": "success", "method": "adb_trial_reels_path"}
             if _has_resource(ui, "post_capture_button_share_container"):
-                await tap(920, 1620, 2.0)
+                next_coords = _bottom_right_next(ui) or (920, 1620)
+                await tap(next_coords[0], next_coords[1], 2.0)
             else:
                 await tap(700, 145, 2.0)
 
@@ -396,9 +451,11 @@ class MobileUIAutomationStep:
             ui, "share_button"
         ):
             return {"status": "success", "method": "adb_trial_reels_path"}
+        await self._screenshot(worker, "share_screen_not_reached")
         return {
             "status": "failed",
-            "error": "Share screen not reached by adb_trial_reels_path",
+            "error_code": "share_screen_not_reached",
+            "error": "Share screen not reached after editor Next fallback",
         }
 
     async def _run_goal(

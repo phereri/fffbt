@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from src.worker.session.types import Mode, StepContext, StepName, StepStatus
 from src.worker.steps.mobile_ui_automation import (
     MobileUIAutomationStep,
+    _bottom_right_next,
     _detect_hard_stop,
     _parse_activity_dump,
     _parse_page_source,
@@ -127,6 +128,29 @@ class TestDetectHardStop:
         assert result[0] == "action_blocked"
 
 
+class TestEditorNext:
+    def test_bottom_right_next_ignores_top_disabled_next(self):
+        nodes = [
+            {
+                "text": "Next",
+                "bounds": "[589,87][800,203]",
+                "isEnabled": False,
+            },
+            {
+                "text": "Next ->",
+                "boundsInScreen": {
+                    "left": 824,
+                    "top": 1566,
+                    "right": 1014,
+                    "bottom": 1676,
+                },
+                "isEnabled": True,
+            },
+        ]
+
+        assert _bottom_right_next(nodes) == (919, 1621)
+
+
 # ---------------------------------------------------------------------------
 # MobileUIAutomationStep
 # ---------------------------------------------------------------------------
@@ -234,6 +258,22 @@ class TestNavigationFailure:
         result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
         assert result.status == StepStatus.NEEDS_REVIEW
         assert result.code == "unknown_screen"
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_share_screen_not_reached_uses_specific_code(self, MockWorker):
+        w = _mock_worker()
+        w.run_goal.return_value = {
+            "status": "failed",
+            "error_code": "share_screen_not_reached",
+            "error": "Share screen not reached after editor Next fallback",
+        }
+        w.page_source.return_value = json.dumps([{"text": "Next"}])
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep()
+        result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
+        assert result.status == StepStatus.NEEDS_REVIEW
+        assert result.code == "share_screen_not_reached"
 
 
 class TestCaptionFlow:
