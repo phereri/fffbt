@@ -3,3 +3,6 @@
 #
 # Appium path (FFF-27 acceptance criteria):
 Appium-Python-Client>=4.0
+
+# Mobilerun-first worker path and VPS diagnostics.
+mobilerun>=0.6.0rc2
