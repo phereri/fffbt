@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from src.worker.session.mobilerun_adapter import MobilerunWorker
+from src.worker.session.mobilerun_adapter import MobilerunRouteMissingError, MobilerunWorker
 
 
 class _MockHandler(BaseHTTPRequestHandler):
@@ -27,8 +27,11 @@ class _MockHandler(BaseHTTPRequestHandler):
         self._respond(body)
 
     def _respond(self, body: Any):
+        status = 200
+        if isinstance(body, tuple):
+            status, body = body
         payload = json.dumps(body).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -147,6 +150,42 @@ def test_run_goal(mock_server):
     worker.connect()
     result = worker.run_goal("Post a Trial Reel", timeout_seconds=60)
     assert result["status"] == "success"
+
+
+def test_run_goal_route_missing_has_clear_error(mock_server):
+    url, handler = mock_server
+    handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
+    handler.responses[("POST", "/automation/run")] = (404, {"error": "Endpoint not found"})
+
+    worker = MobilerunWorker("DEV", genfarmer_url=url)
+    worker.connect()
+    with pytest.raises(MobilerunRouteMissingError, match="POST /automation/run returned 404"):
+        worker.run_goal("Open Instagram", timeout_seconds=1)
+
+
+def test_open_app_uses_adb(monkeypatch):
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+    calls: list[str] = []
+
+    def shell(command, **kwargs):
+        calls.append(command)
+        if "dumpsys activity" in command:
+            return "topResumedActivity=ActivityRecord{ com.instagram.android/.MainActivity }"
+        return "OK"
+
+    monkeypatch.setattr(worker, "_adb_shell", shell)
+
+    result = worker.open_app(
+        "com.instagram.android",
+        activity="com.instagram.mainactivity.InstagramMainActivity",
+        force_stop=True,
+        wait_seconds=0,
+    )
+
+    assert result["status"] == "success"
+    assert calls[0] == "am force-stop com.instagram.android"
+    assert calls[1].startswith("am start -n com.instagram.android/")
 
 
 def test_actions_not_connected():
