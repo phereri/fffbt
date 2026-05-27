@@ -1,0 +1,44 @@
+# ShopAIKey - verified against GET https://api.shopaikey.com/v1/models
+
+# Docs: https://shopaikey.com/docs/openai-format (Gemini via OpenAI base + /v1)
+
+#       https://shopaikey.com/docs/anthropic-format (Claude, NO /v1 on base)
+
+#
+
+# Farm manager: OpenAILike -> gemini-2.5-flash @ openai_base_url
+
+
+
+anthropic_base_url: https://api.shopaikey.com
+
+openai_base_url: https://api.shopaikey.com/v1
+
+
+
+# Trajectory planning (Mobilerun manager/executor) - Claude via Anthropic endpoint
+claude_trajectory_models:
+  - claude-opus-4-6
+  - claude-sonnet-4-6
+
+# Manager (planning) - Gemini on ShopAIKey OpenAI endpoint (when FARM_USE_CLAUDE_TRAJECTORY=0)
+
+manager_models:
+
+  - gemini-2.5-flash
+
+  - gemini-2.5-flash-lite
+
+  - gemini-2.5-flash-nothinking
+
+
+
+# Refresh: python scripts/refresh_shopaikey_models.py
+
+gemini_models_available:
+
+  - gemini-2.5-flash
+
+  - gemini-2.5-flash-lite
+
+  - gemini-2.5-pro
