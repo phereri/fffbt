@@ -30,6 +30,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+import selectors
 from dataclasses import dataclass
 from typing import Any
 
@@ -108,6 +109,15 @@ def _require_db_url(config: _ConnConfig) -> str:
         )
         raise SystemExit(2)
     return config.db_url
+
+
+def _run_async(coro: Any) -> Any:
+    if sys.platform == "win32":
+        return asyncio.run(
+            coro,
+            loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+        )
+    return asyncio.run(coro)
 
 
 def _management_api_query(project_ref: str, pat: str, sql: str) -> list[dict]:
@@ -420,7 +430,10 @@ async def _run_job(db_url: str, job_id: str, mode: str | None) -> None:
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown.set)
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except (NotImplementedError, RuntimeError):
+            pass
 
     await run_job_pipeline(
         db_url=db_url,
@@ -482,7 +495,7 @@ def cmd_run_job(argv: list[str]) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    asyncio.run(_run_job(db_url, args.job_id, args.mode))
+    _run_async(_run_job(db_url, args.job_id, args.mode))
     return 0
 
 
