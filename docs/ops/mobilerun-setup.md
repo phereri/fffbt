@@ -34,6 +34,7 @@ Mobilerun:
 ```powershell
 MOBILERUN_CONFIG=config/mobilerun/config.yaml
 MOBILERUN_TRAJECTORIES_DIR=trajectories
+MOBILERUN_USE_TCP=1
 GOOGLE_API_KEY=<shopaikey-or-google-compatible-key>
 ANTHROPIC_API_KEY=<shopaikey-anthropic-compatible-key>
 ANTHROPIC_BASE_URL=https://api.shopaikey.com
@@ -130,7 +131,9 @@ adb -s <SERIAL> shell content query --uri content://com.mobilerun.portal/state
 ```
 
 If Portal returns an empty tree but `uiautomator dump` works, the current
-worker can use the ADB/uiautomator fallback path.
+worker should still prefer the MobileRun TCP driver path (`MOBILERUN_USE_TCP=1`).
+The raw Portal/no-TCP path is diagnostic only on the VPS because it may return
+an empty `a11y_tree`.
 
 ## Non-Posting Readiness Check
 
@@ -156,6 +159,18 @@ Expected:
 
 This check is non-posting. It connects the `MobilerunWorker`, reads the current
 activity and UI tree, then disconnects.
+
+To validate the MobileRun driver directly without tapping or typing:
+
+```powershell
+python scripts\check_mobilerun_driver.py --serial <SERIAL> --use-tcp
+```
+
+Expected:
+
+- `use_tcp: true`
+- `a11y_tree_count` greater than zero
+- an artifact under `ARTIFACTS_DIR\mobilerun_driver`
 
 ## Safety Gate
 
