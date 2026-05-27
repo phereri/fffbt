@@ -211,6 +211,63 @@ class TestConnectFailure:
         assert "connect failed" in result.message.lower()
 
 
+class TestDriverSelection:
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_proof_of_posting_worker_forces_tcp_without_adb_ui_fallback(self, MockWorker):
+        MockWorker.return_value.connect.side_effect = ConnectionError("stop after construct")
+
+        step = MobileUIAutomationStep()
+        run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
+
+        MockWorker.assert_called_once_with(
+            device_serial="DEV001",
+            genfarmer_url="http://127.0.0.1:55554",
+            adb_fallback=False,
+            use_tcp=True,
+        )
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_mobile_driver_actions_are_reported_in_step_details(self, MockWorker):
+        w = _mock_worker()
+        w.actions_log = [
+            {
+                "action": "tap",
+                "details": {
+                    "driver": "mobilerun_tcp",
+                    "fallback_used": False,
+                    "x": 1,
+                    "y": 2,
+                },
+            },
+            {
+                "action": "type_text",
+                "details": {
+                    "driver": "mobilerun_tcp",
+                    "fallback_used": False,
+                    "length": 3,
+                },
+            },
+        ]
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep()
+        with patch.object(step, "_type_caption", return_value=ToolResult.ok("typed")):
+            with patch.object(step, "_tap_share_and_confirm", return_value=ToolResult.ok("shared")):
+                with patch(
+                    "src.worker.steps.mobile_ui_automation.verify_caption_text",
+                    return_value=ToolResult.ok("verified"),
+                ):
+                    result = run(
+                        step.run(_ctx(), device_serial="DEV001", caption_text="cap")
+                    )
+
+        driver = result.details["mobile_driver"]
+        assert driver["primary"] == "mobilerun_tcp"
+        assert driver["use_tcp"] is True
+        assert driver["adb_fallback_used"] is False
+        assert driver["actions"] == w.actions_log
+
+
 class TestHardStopOnLaunch:
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
     def test_action_blocked_after_open(self, MockWorker):
@@ -302,9 +359,9 @@ class TestNavigationFailure:
 
 
 class TestCaptionFlow:
-    @patch("src.worker.steps.mobile_ui_automation.paste_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
-    def test_caption_paste_failure(self, MockWorker, mock_paste):
+    def test_caption_paste_failure(self, MockWorker, mock_type_caption):
         w = _mock_worker()
         # Successful navigation
         w.run_goal.return_value = {"status": "success"}
@@ -318,7 +375,7 @@ class TestCaptionFlow:
         ])
         MockWorker.return_value = w
 
-        mock_paste.return_value = ToolResult.fail("caption field not found")
+        mock_type_caption.return_value = ToolResult.fail("caption field not found")
 
         step = MobileUIAutomationStep()
         result = run(step.run(_ctx(), device_serial="DEV001", caption_text="My caption"))
@@ -327,9 +384,9 @@ class TestCaptionFlow:
         assert "caption paste" in result.message
 
     @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
-    @patch("src.worker.steps.mobile_ui_automation.paste_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
-    def test_caption_mismatch(self, MockWorker, mock_paste, mock_verify):
+    def test_caption_mismatch(self, MockWorker, mock_type_caption, mock_verify):
         w = _mock_worker()
         w.run_goal.return_value = {"status": "success"}
         w.page_source.return_value = json.dumps([
@@ -342,7 +399,7 @@ class TestCaptionFlow:
         ])
         MockWorker.return_value = w
 
-        mock_paste.return_value = ToolResult.ok("pasted 10 chars")
+        mock_type_caption.return_value = ToolResult.ok("typed 10 chars via MobileRun TCP")
         mock_verify.return_value = ToolResult.fail(
             "caption verification mismatch: expected='My caption'; observed='Wrong caption text'"
         )
@@ -354,17 +411,17 @@ class TestCaptionFlow:
 
 
 class TestShareFlow:
-    @patch("src.worker.steps.mobile_ui_automation.tap_share_and_confirm")
+    @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
     @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
-    @patch("src.worker.steps.mobile_ui_automation.paste_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
-    def test_share_did_not_register(self, MockWorker, mock_paste, mock_verify, mock_share):
+    def test_share_did_not_register(self, MockWorker, mock_type_caption, mock_verify, mock_share):
         w = _mock_worker()
         w.run_goal.return_value = {"status": "success"}
         w.page_source.return_value = json.dumps([{"text": "Share screen"}])
         MockWorker.return_value = w
 
-        mock_paste.return_value = ToolResult.ok("pasted")
+        mock_type_caption.return_value = ToolResult.ok("typed via MobileRun TCP")
         mock_verify.return_value = ToolResult.ok("caption verified")
         mock_share.return_value = ToolResult.fail("share did not register")
 
@@ -375,11 +432,11 @@ class TestShareFlow:
 
 
 class TestHappyPath:
-    @patch("src.worker.steps.mobile_ui_automation.tap_share_and_confirm")
+    @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
     @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
-    @patch("src.worker.steps.mobile_ui_automation.paste_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
-    def test_full_success(self, MockWorker, mock_paste, mock_verify, mock_share):
+    def test_full_success(self, MockWorker, mock_type_caption, mock_verify, mock_share):
         w = _mock_worker()
         w.run_goal.return_value = {"status": "success"}
         w.page_source.return_value = json.dumps([
@@ -398,7 +455,7 @@ class TestHappyPath:
         ])
         MockWorker.return_value = w
 
-        mock_paste.return_value = ToolResult.ok("pasted 17 chars via ADB_INPUT_B64")
+        mock_type_caption.return_value = ToolResult.ok("typed 17 chars via MobileRun TCP")
         mock_verify.return_value = ToolResult.ok("caption verified exactly (17 chars)")
         mock_share.return_value = ToolResult.ok(
             "share confirmed: activity changed in 2.3s"
@@ -416,16 +473,16 @@ class TestHappyPath:
 
 
 class TestStepResultContract:
-    @patch("src.worker.steps.mobile_ui_automation.tap_share_and_confirm")
+    @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
     @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
-    @patch("src.worker.steps.mobile_ui_automation.paste_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
-    def test_success_shape(self, MockWorker, mock_paste, mock_verify, mock_share):
+    def test_success_shape(self, MockWorker, mock_type_caption, mock_verify, mock_share):
         w = _mock_worker()
         w.run_goal.return_value = {"status": "success"}
         w.page_source.return_value = json.dumps([{"text": "ok"}])
         MockWorker.return_value = w
-        mock_paste.return_value = ToolResult.ok("ok")
+        mock_type_caption.return_value = ToolResult.ok("ok")
         mock_verify.return_value = ToolResult.ok("ok")
         mock_share.return_value = ToolResult.ok("ok")
 

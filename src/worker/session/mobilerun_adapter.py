@@ -73,18 +73,29 @@ class MobilerunWorker(MobileWorker):
 
     def screenshot(self, label: str = "") -> bytes:
         self._ensure_connected()
+        fallback_used = False
         try:
             raw = self._mobilerun_screenshot()
         except Exception as e:
             if not self._adb_fallback:
                 raise
             raw = self._adb_screenshot()
+            fallback_used = True
             self._log_action("adb_fallback", {"operation": "screenshot", "error": str(e)[:200]})
-        self._log_action("screenshot", {"label": label, "size": len(raw)})
+        self._log_action(
+            "screenshot",
+            {
+                "label": label,
+                "size": len(raw),
+                "driver": self._driver_name(),
+                "fallback_used": fallback_used,
+            },
+        )
         return raw
 
     def page_source(self) -> str:
         self._ensure_connected()
+        fallback_used = False
         try:
             source = self._mobilerun_page_source()
             if not self._source_has_nodes(str(source)):
@@ -93,25 +104,44 @@ class MobilerunWorker(MobileWorker):
             if not self._adb_fallback:
                 raise
             source = self._adb_page_source()
+            fallback_used = True
             self._log_action("adb_fallback", {"operation": "page_source", "error": str(e)[:200]})
-        self._log_action("page_source", {"length": len(source)})
+        self._log_action(
+            "page_source",
+            {
+                "length": len(source),
+                "driver": self._driver_name(),
+                "fallback_used": fallback_used,
+            },
+        )
         return source
 
     # --- interaction ---
 
     def tap(self, x: int, y: int) -> None:
         self._ensure_connected()
+        fallback_used = False
         try:
             self._mobilerun_tap(x, y)
         except Exception as e:
             if not self._adb_fallback:
                 raise
             self._adb_shell(f"input tap {int(x)} {int(y)}")
+            fallback_used = True
             self._log_action("adb_fallback", {"operation": "tap", "error": str(e)[:200]})
-        self._log_action("tap", {"x": x, "y": y})
+        self._log_action(
+            "tap",
+            {
+                "x": x,
+                "y": y,
+                "driver": self._driver_name(),
+                "fallback_used": fallback_used,
+            },
+        )
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         self._ensure_connected()
+        fallback_used = False
         try:
             self._mobilerun_swipe(x1, y1, x2, y2, duration_ms)
         except Exception as e:
@@ -120,19 +150,40 @@ class MobilerunWorker(MobileWorker):
             self._adb_shell(
                 f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration_ms)}"
             )
+            fallback_used = True
             self._log_action("adb_fallback", {"operation": "swipe", "error": str(e)[:200]})
-        self._log_action("swipe", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration_ms})
+        self._log_action(
+            "swipe",
+            {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "duration_ms": duration_ms,
+                "driver": self._driver_name(),
+                "fallback_used": fallback_used,
+            },
+        )
 
     def type_text(self, text: str) -> None:
         self._ensure_connected()
+        fallback_used = False
         try:
             self._mobilerun_type_text(text)
         except Exception as e:
             if not self._adb_fallback:
                 raise
             self._adb_input_text(text)
+            fallback_used = True
             self._log_action("adb_fallback", {"operation": "type_text", "error": str(e)[:200]})
-        self._log_action("type_text", {"length": len(text)})
+        self._log_action(
+            "type_text",
+            {
+                "length": len(text),
+                "driver": self._driver_name(),
+                "fallback_used": fallback_used,
+            },
+        )
 
     def open_app(
         self,
@@ -251,6 +302,12 @@ class MobilerunWorker(MobileWorker):
             "ui_tree_available": node_count > 0,
             "ui_tree_count": node_count,
             "source": "mobilerun_tcp" if self._use_tcp else "mobilerun",
+            "use_tcp": self._use_tcp,
+            "adb_fallback": any(
+                action.get("action") == "adb_fallback"
+                and action.get("details", {}).get("operation") == "page_source"
+                for action in self._actions_log
+            ),
         }
         self._log_action("preflight_ui_tree", result)
         return result
@@ -271,6 +328,9 @@ class MobilerunWorker(MobileWorker):
             entry["details"] = details
         self._actions_log.append(entry)
         logger.debug("MobilerunWorker action: %s %s", action, details or "")
+
+    def _driver_name(self) -> str:
+        return "mobilerun_tcp" if self._use_tcp else "mobilerun"
 
     def _api_get(self, path: str, timeout: int = 10) -> dict[str, Any]:
         url = f"{self._genfarmer_url}{path}"

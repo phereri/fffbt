@@ -1,8 +1,8 @@
 """mobile_ui_automation step — drive Instagram Trial Reel posting flow.
 
-Uses MobilerunWorker.run_goal() for multi-step navigation and local
-Instagram tools for critical deterministic operations (caption entry,
-caption verification, share confirmation).
+Uses MobilerunWorker.run_goal() for multi-step navigation and MobileRun TCP
+driver methods for deterministic operations (caption entry, caption
+verification, share confirmation).
 """
 
 from __future__ import annotations
@@ -23,11 +23,8 @@ from src.worker.session.types import (
 )
 from src.worker.tools._ui import walk_plain_ui
 from src.worker.tools._ui import node_text, parse_bounds
-from src.worker.tools.instagram import (
-    paste_text,
-    tap_share_and_confirm,
-    verify_caption_text,
-)
+from src.worker.tools._types import ToolResult
+from src.worker.tools.instagram import verify_caption_text
 
 logger = logging.getLogger(__name__)
 
@@ -273,17 +270,31 @@ class MobileUIAutomationStep:
         if not caption:
             return self._fail("INFRA", "no caption_text provided")
 
-        worker = MobilerunWorker(device_serial=serial, genfarmer_url=gf_url)
+        worker = MobilerunWorker(
+            device_serial=serial,
+            genfarmer_url=gf_url,
+            adb_fallback=False,
+            use_tcp=True,
+        )
         try:
             await asyncio.to_thread(worker.connect)
         except Exception as e:
             return self._fail("INFRA", f"GenFarmer connect failed: {e}")
 
         try:
-            return await self._execute(worker, serial, caption)
+            result = await self._execute(worker, serial, caption)
+            if self._has_disallowed_fallback(worker):
+                result = self._needs_review(
+                    "unknown_screen",
+                    "MobileRun UI control used disallowed ADB fallback",
+                )
+            self._attach_driver_details(result, worker)
+            return result
         except Exception as e:
             await self._screenshot(worker, "on_error")
-            return self._fail("UNKNOWN", f"unhandled: {e}")
+            result = self._fail("UNKNOWN", f"unhandled: {e}")
+            self._attach_driver_details(result, worker)
+            return result
         finally:
             try:
                 await asyncio.to_thread(worker.disconnect)
@@ -319,7 +330,7 @@ class MobileUIAutomationStep:
         # --- Navigate to Share screen ---
         result = await self._run_goal(worker, _GOAL_NAVIGATE_TO_SHARE, timeout=180)
         if not _goal_succeeded(result) and _route_missing(result):
-            result = await self._navigate_trial_reel_share_with_adb(worker, serial)
+            result = await self._navigate_trial_reel_share_with_mobilerun(worker, serial)
         if not _goal_succeeded(result):
             ui = await self._read_ui(worker)
             stop = _detect_hard_stop(ui)
@@ -351,7 +362,7 @@ class MobileUIAutomationStep:
             return self._fail(stop[0], f"hard stop on Share screen: {stop[1]}")
 
         # --- Fill caption (local tools) ---
-        paste_result = await paste_text(serial, caption, ui_nodes=ui, focus_caption=True)
+        paste_result = await self._type_caption(worker, ui, caption)
         if not paste_result.success:
             return self._needs_review(
                 "unknown_screen", f"caption paste failed: {paste_result.message}"
@@ -370,10 +381,7 @@ class MobileUIAutomationStep:
         await self._screenshot(worker, "caption_filled")
 
         # --- Share ---
-        async def read_ui() -> list[dict[str, Any]]:
-            return await self._read_ui(worker)
-
-        share_result = await tap_share_and_confirm(serial, read_ui=read_ui)
+        share_result = await self._tap_share_and_confirm(worker)
         if not share_result.success:
             ui = await self._read_ui(worker)
             stop = _detect_hard_stop(ui)
@@ -404,12 +412,12 @@ class MobileUIAutomationStep:
             logger.error("open_app error: %s", e)
             return {"status": "error", "error": str(e)}
 
-    async def _navigate_trial_reel_share_with_adb(
+    async def _navigate_trial_reel_share_with_mobilerun(
         self,
         worker: MobilerunWorker,
         serial: str,
     ) -> dict[str, Any]:
-        """Fallback for the deployed GenFarmer build without /automation/run.
+        """MobileRun TCP fallback for the deployed GenFarmer build without /automation/run.
 
         Coordinates are scoped to the validated 1080x1920 happy-path phone.
         The routine checks screen state between phases and returns needs-review
@@ -485,7 +493,7 @@ class MobileUIAutomationStep:
             if _has_resource(ui, "caption_input_text_view") and _has_resource(
                 ui, "share_button"
             ):
-                return {"status": "success", "method": "adb_trial_reels_path"}
+                return {"status": "success", "method": "mobilerun_tcp_trial_reels_path"}
             if _has_resource(ui, "post_capture_button_share_container"):
                 next_coords = _bottom_right_next(ui) or (920, 1620)
                 await tap(next_coords[0], next_coords[1], 2.0)
@@ -496,7 +504,7 @@ class MobileUIAutomationStep:
         if _has_resource(ui, "caption_input_text_view") and _has_resource(
             ui, "share_button"
         ):
-            return {"status": "success", "method": "adb_trial_reels_path"}
+            return {"status": "success", "method": "mobilerun_tcp_trial_reels_path"}
         await self._screenshot(worker, "share_screen_not_reached")
         return {
             "status": "failed",
@@ -525,29 +533,125 @@ class MobileUIAutomationStep:
             nodes = _parse_page_source(source)
         except Exception:
             nodes = []
-        try:
-            dump = await asyncio.to_thread(worker.activity_page_source)
-            activity_nodes = _parse_activity_dump(dump)
-        except Exception:
-            activity_nodes = []
-        if activity_nodes:
-            existing = {
-                (n.get("resourceId"), n.get("bounds"))
-                for n in nodes
-                if n.get("resourceId") and n.get("bounds")
-            }
-            nodes.extend(
-                n
-                for n in activity_nodes
-                if (n.get("resourceId"), n.get("bounds")) not in existing
-            )
         return nodes
+
+    async def _tap_by_resource_id(
+        self,
+        worker: MobilerunWorker,
+        resource_id: str,
+        *,
+        ui_nodes: list[dict[str, Any]],
+        class_name_contains: str | None = None,
+    ) -> ToolResult:
+        suffix = resource_id.split("/")[-1] if "/" in resource_id else resource_id
+        suffix = suffix.split(":")[-1]
+        class_needle = (class_name_contains or "").lower()
+        matches: list[dict[str, Any]] = []
+        for node in ui_nodes:
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if rid != resource_id and not rid.endswith(suffix):
+                continue
+            if class_needle:
+                class_name = str(node.get("className") or node.get("class_name") or "").lower()
+                if class_needle not in class_name:
+                    continue
+            if _node_bounds(node):
+                matches.append(node)
+
+        if not matches:
+            return ToolResult.fail(f"tap_by_resource_id: no node with resource_id={resource_id!r}")
+
+        def area(node: dict[str, Any]) -> int:
+            x1, y1, x2, y2 = _node_bounds(node) or (0, 0, 0, 0)
+            return max(0, x2 - x1) * max(0, y2 - y1)
+
+        target = max(matches, key=area)
+        x1, y1, x2, y2 = _node_bounds(target) or (0, 0, 0, 0)
+        await asyncio.to_thread(worker.tap, (x1 + x2) // 2, (y1 + y2) // 2)
+        return ToolResult.ok(f"tapped {resource_id} via MobileRun TCP")
+
+    async def _focus_caption_field(
+        self,
+        worker: MobilerunWorker,
+        ui_nodes: list[dict[str, Any]],
+    ) -> ToolResult:
+        result = await self._tap_by_resource_id(
+            worker,
+            "com.instagram.android:id/caption_input_text_view",
+            ui_nodes=ui_nodes,
+            class_name_contains="AutoComplete",
+        )
+        if result.success:
+            return result
+        coords = _text_center(ui_nodes, "write a caption", "add a caption")
+        if coords:
+            await asyncio.to_thread(worker.tap, coords[0], coords[1])
+            return ToolResult.ok("focused caption field via MobileRun TCP")
+        return ToolResult.fail("focus_caption_field: caption input not found")
+
+    async def _type_caption(
+        self,
+        worker: MobilerunWorker,
+        ui_nodes: list[dict[str, Any]],
+        caption: str,
+    ) -> ToolResult:
+        focus = await self._focus_caption_field(worker, ui_nodes)
+        if not focus.success:
+            return focus
+        await asyncio.sleep(0.55)
+        try:
+            await asyncio.to_thread(worker.type_text, caption)
+        except Exception as exc:
+            return ToolResult.fail(f"type_caption: MobileRun input_text failed: {exc}")
+        return ToolResult.ok(f"typed {len(caption)} chars via MobileRun TCP")
+
+    async def _tap_share_and_confirm(self, worker: MobilerunWorker) -> ToolResult:
+        deadline = asyncio.get_running_loop().time() + 22.0
+        while asyncio.get_running_loop().time() < deadline:
+            ui = await self._read_ui(worker)
+            coords = self._share_button_center(ui)
+            if coords:
+                await asyncio.to_thread(worker.tap, coords[0], coords[1])
+                await asyncio.sleep(2.0)
+                after = await self._read_ui(worker)
+                if not self._share_button_center(after):
+                    return ToolResult.ok("share confirmed: share button disappeared")
+            await asyncio.sleep(1.0)
+        return ToolResult.fail("share did not register before timeout")
+
+    def _share_button_center(self, ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
+        candidates: list[tuple[int, int, int, int]] = []
+        for node in ui_nodes:
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if not rid.endswith("share_button"):
+                continue
+            bounds = _node_bounds(node)
+            if bounds:
+                candidates.append(bounds)
+        if not candidates:
+            return None
+        x1, y1, x2, y2 = max(candidates, key=lambda b: b[3])
+        return (x1 + x2) // 2, (y1 + y2) // 2
 
     async def _screenshot(self, worker: MobilerunWorker, label: str) -> None:
         try:
             await asyncio.to_thread(worker.screenshot, label)
         except Exception:
             pass
+
+    def _attach_driver_details(self, result: StepResult, worker: MobilerunWorker) -> None:
+        actions = worker.actions_log
+        details = dict(result.details or {})
+        details["mobile_driver"] = {
+            "primary": "mobilerun_tcp",
+            "use_tcp": True,
+            "adb_fallback_used": any(a.get("action") == "adb_fallback" for a in actions),
+            "actions": actions,
+        }
+        result.details = details
+
+    def _has_disallowed_fallback(self, worker: MobilerunWorker) -> bool:
+        return any(action.get("action") == "adb_fallback" for action in worker.actions_log)
 
     def _fail(
         self, code: str, message: str, *, retryable: bool | None = None

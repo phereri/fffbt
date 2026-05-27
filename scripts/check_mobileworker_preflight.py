@@ -51,6 +51,9 @@ def _check_serial(serial: str, *, genfarmer_url: str) -> dict[str, Any]:
                 "ui_tree_available": ui_tree_available,
                 "ui_tree_count": int(preflight.get("ui_tree_count") or 0),
                 "activityName": _activity_name(preflight.get("activity")),
+                "source": preflight.get("source"),
+                "use_tcp": bool(preflight.get("use_tcp")),
+                "adb_fallback": bool(preflight.get("adb_fallback")),
             }
         )
     except Exception as exc:

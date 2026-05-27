@@ -119,7 +119,9 @@ def test_tap(mock_server):
     worker._mobilerun_tap = lambda x, y: calls.append((x, y))
     worker.tap(100, 200)
     assert calls == [(100, 200)]
-    assert any(a["action"] == "tap" for a in worker.actions_log)
+    log = next(a for a in worker.actions_log if a["action"] == "tap")
+    assert log["details"]["driver"] == "mobilerun_tcp"
+    assert log["details"]["fallback_used"] is False
 
 
 def test_swipe(mock_server):
@@ -134,6 +136,8 @@ def test_swipe(mock_server):
     assert calls == [(100, 1500, 100, 500, 400)]
     log = next(a for a in worker.actions_log if a["action"] == "swipe")
     assert log["details"]["x1"] == 100
+    assert log["details"]["driver"] == "mobilerun_tcp"
+    assert log["details"]["fallback_used"] is False
 
 
 def test_type_text(mock_server):
@@ -148,6 +152,8 @@ def test_type_text(mock_server):
     assert calls == ["hello world"]
     log = next(a for a in worker.actions_log if a["action"] == "type_text")
     assert log["details"]["length"] == 11
+    assert log["details"]["driver"] == "mobilerun_tcp"
+    assert log["details"]["fallback_used"] is False
 
 
 def test_run_goal(mock_server):
