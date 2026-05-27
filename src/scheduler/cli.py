@@ -29,6 +29,7 @@ import signal
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -135,6 +136,110 @@ def _management_api_query(project_ref: str, pat: str, sql: str) -> list[dict]:
     return data
 
 
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _validate_uuid(value: str | None, label: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        print(f"error: {label} must be a UUID.", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _targeted_create_job_sql(device_serial: str, account_id: str | None = None) -> str:
+    """SQL for one validation job pinned to a specific online device."""
+    serial_sql = _sql_literal(device_serial)
+    account_sql = f"{_sql_literal(account_id)}::uuid" if account_id else "NULL::uuid"
+    return f"""
+WITH requested AS (
+    SELECT {serial_sql}::text AS device_serial, {account_sql} AS account_id
+),
+target_device AS (
+    SELECT pd.id
+    FROM automation.physical_devices pd, requested r
+    WHERE pd.status = 'online'
+      AND pd.current_job_id IS NULL
+      AND pd.last_seen_at IS NOT NULL
+      AND pd.last_seen_at >= now() - interval '300 seconds'
+      AND (
+          pd.adb_serial = r.device_serial
+          OR pd.adb_connect_target = r.device_serial
+          OR pd.tailscale_ipv4 = split_part(r.device_serial, ':', 1)
+      )
+    ORDER BY pd.last_seen_at DESC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+),
+eligible_account AS (
+    SELECT ea.account_id, ea.environment_id
+    FROM automation.find_eligible_account() ea, requested r
+    WHERE r.account_id IS NULL OR ea.account_id = r.account_id
+    LIMIT 1
+),
+candidate_video AS (
+    SELECT v.id
+    FROM automation.videos v
+    WHERE v.status = 'new'
+      AND EXISTS (SELECT 1 FROM target_device)
+      AND EXISTS (SELECT 1 FROM eligible_account)
+    ORDER BY v.created_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+),
+reserved_video AS (
+    UPDATE automation.videos v
+       SET status = 'reserved'
+      FROM candidate_video cv
+     WHERE v.id = cv.id
+     RETURNING v.*
+),
+inserted_job AS (
+    INSERT INTO automation.jobs (video_id, account_id, environment_id, device_id, status)
+    SELECT rv.id, ea.account_id, ea.environment_id, td.id, 'queued'
+      FROM reserved_video rv
+      CROSS JOIN eligible_account ea
+      CROSS JOIN target_device td
+    RETURNING *
+),
+device_update AS (
+    UPDATE automation.physical_devices pd
+       SET status = 'busy',
+           current_job_id = ij.id
+      FROM inserted_job ij
+     WHERE pd.id = ij.device_id
+    RETURNING pd.id, ij.id AS job_id
+),
+job_event AS (
+    INSERT INTO automation.job_events (job_id, event_type, to_status, payload)
+    SELECT ij.id, 'created', 'queued', jsonb_build_object(
+        'video_id', ij.video_id,
+        'account_id', ij.account_id,
+        'environment_id', ij.environment_id,
+        'device_id', ij.device_id,
+        'target_device_serial', (SELECT device_serial FROM requested),
+        'validation_targeted', true
+    )
+    FROM inserted_job ij
+    RETURNING id
+),
+device_event AS (
+    INSERT INTO automation.device_events (device_id, event_type, payload)
+    SELECT du.id, 'job_assigned', jsonb_build_object(
+        'job_id', du.job_id,
+        'target_device_serial', (SELECT device_serial FROM requested),
+        'validation_targeted', true
+    )
+    FROM device_update du
+    RETURNING id
+)
+SELECT * FROM inserted_job;
+"""
+
+
 # ---------------------------------------------------------------------------
 # discover-devices / reconnect-devices / sync-drive
 # ---------------------------------------------------------------------------
@@ -187,14 +292,34 @@ def cmd_create_job(argv: list[str]) -> int:
     parser.add_argument(
         "--json", action="store_true", help="Print the full job row as JSON."
     )
+    parser.add_argument(
+        "--device-serial",
+        help=(
+            "Validation-only: create one queued job pinned to this device "
+            "serial/connect target instead of using the generic device pool."
+        ),
+    )
+    parser.add_argument(
+        "--account-id",
+        help="Validation-only: with --device-serial, also pin the eligible account UUID.",
+    )
     args = parser.parse_args(argv)
     config = _resolve_connection(args)
+    account_id = _validate_uuid(args.account_id, "--account-id")
+    if args.account_id and not args.device_serial:
+        print("error: --account-id requires --device-serial.", file=sys.stderr)
+        raise SystemExit(2)
+    sql = (
+        _targeted_create_job_sql(args.device_serial, account_id)
+        if args.device_serial
+        else "SELECT * FROM automation.create_publishing_job()"
+    )
 
     if config.mode == "api":
         rows = _management_api_query(
             config.project_ref,
             config.pat,
-            "SELECT * FROM automation.create_publishing_job()",
+            sql,
         )
         if not rows or rows[0].get("id") is None:
             print("no job created — no eligible video, account, or device available.")
@@ -204,7 +329,7 @@ def cmd_create_job(argv: list[str]) -> int:
         import psycopg
 
         with psycopg.connect(config.db_url, autocommit=True) as conn:
-            cur = conn.execute("SELECT * FROM automation.create_publishing_job()")
+            cur = conn.execute(sql)
             row = cur.fetchone()
             if row is None or row[0] is None:
                 print("no job created — no eligible video, account, or device available.")

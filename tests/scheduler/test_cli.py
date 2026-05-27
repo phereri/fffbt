@@ -115,6 +115,39 @@ class TestDispatcher:
         assert result.returncode == 2
         assert "project-ref" in result.stderr
 
+    def test_create_job_account_id_requires_device_serial(self):
+        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli", "create-job",
+                "--via-management-api", "--project-ref", "test-ref",
+                "--account-id", "00000000-0000-0000-0000-000000000000",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "--account-id requires --device-serial" in result.stderr
+
+    def test_create_job_rejects_invalid_account_id(self):
+        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli", "create-job",
+                "--via-management-api", "--project-ref", "test-ref",
+                "--device-serial", "serial-1",
+                "--account-id", "not-a-uuid",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "--account-id must be a UUID" in result.stderr
+
     def test_run_launcher_rejects_management_api(self):
         env = {k: v for k, v in __import__("os").environ.items()
                if k != "SUPABASE_DB_URL"}
@@ -343,3 +376,101 @@ class TestCreateJobCommand:
         data = json.loads(result.stdout)
         assert data["id"] is not None
         assert data["video_id"] is not None
+
+    def test_create_job_with_device_serial_targets_requested_device(self, db_url: str):
+        import json
+
+        with psycopg.connect(db_url) as conn:
+            conn.autocommit = True
+
+            proxy_id = str(uuid.uuid4())
+            dp_id = str(uuid.uuid4())
+            gps_id = str(uuid.uuid4())
+            app_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO automation.proxies (id, host, port) "
+                "VALUES (%s, '127.0.0.1', 8080)",
+                (proxy_id,),
+            )
+            conn.execute(
+                "INSERT INTO automation.device_profiles "
+                "(id, brand, model, android_version, "
+                "screen_width, screen_height, screen_density) "
+                "VALUES (%s, 'Samsung', 'S21', '12', 1080, 2400, 420)",
+                (dp_id,),
+            )
+            conn.execute(
+                "INSERT INTO automation.gps_locations "
+                "(id, label, latitude, longitude) "
+                "VALUES (%s, 'NYC', 40.7128, -74.0060)",
+                (gps_id,),
+            )
+            conn.execute(
+                "INSERT INTO automation.app_states (id) VALUES (%s)",
+                (app_id,),
+            )
+
+            acct_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO automation.accounts "
+                "(id, username, password) "
+                "VALUES (%s, 'targeted_cli_user', 'pass')",
+                (acct_id,),
+            )
+
+            env_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO automation.account_environments "
+                "(id, account_id, proxy_id, device_profile_id, "
+                "gps_location_id, app_state_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (env_id, acct_id, proxy_id, dp_id, gps_id, app_id),
+            )
+
+            vid_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO automation.videos "
+                "(id, source_path, filename, status) "
+                "VALUES (%s, 'instagram/test/videos/', 'targeted_cli.mp4', 'new')",
+                (vid_id,),
+            )
+
+            other_dev_id = str(uuid.uuid4())
+            target_dev_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO automation.physical_devices "
+                "(id, alias, adb_serial, status, last_seen_at) "
+                "VALUES (%s, 'other-dev', 'other:5555', 'online', now())",
+                (other_dev_id,),
+            )
+            conn.execute(
+                "INSERT INTO automation.physical_devices "
+                "(id, alias, adb_serial, status, last_seen_at) "
+                "VALUES (%s, 'target-dev', 'target:5555', 'online', now())",
+                (target_dev_id,),
+            )
+
+        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli",
+                "create-job", "--db-url", db_url, "--json",
+                "--device-serial", "target:5555",
+                "--account-id", acct_id,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert data["device_id"] == target_dev_id
+        assert data["account_id"] == acct_id
+
+        with psycopg.connect(db_url) as conn:
+            current = conn.execute(
+                "SELECT status, current_job_id FROM automation.physical_devices WHERE id = %s",
+                (target_dev_id,),
+            ).fetchone()
+            assert current[0] == "busy"
+            assert str(current[1]) == data["id"]
