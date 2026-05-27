@@ -160,13 +160,21 @@ def _validate_uuid(value: str | None, label: str) -> str | None:
         raise SystemExit(2)
 
 
-def _targeted_create_job_sql(device_serial: str, account_id: str | None = None) -> str:
+def _targeted_create_job_sql(
+    device_serial: str,
+    account_id: str | None = None,
+    video_id: str | None = None,
+) -> str:
     """SQL for one validation job pinned to a specific online device."""
     serial_sql = _sql_literal(device_serial)
     account_sql = f"{_sql_literal(account_id)}::uuid" if account_id else "NULL::uuid"
+    video_sql = f"{_sql_literal(video_id)}::uuid" if video_id else "NULL::uuid"
     return f"""
 WITH requested AS (
-    SELECT {serial_sql}::text AS device_serial, {account_sql} AS account_id
+    SELECT
+        {serial_sql}::text AS device_serial,
+        {account_sql} AS account_id,
+        {video_sql} AS video_id
 ),
 target_device AS (
     SELECT pd.id
@@ -205,10 +213,20 @@ eligible_account AS (
 ),
 candidate_video AS (
     SELECT v.id
-    FROM automation.videos v
+    FROM automation.videos v, requested r
     WHERE v.status = 'new'
+      AND (r.video_id IS NULL OR v.id = r.video_id)
       AND EXISTS (SELECT 1 FROM target_device)
       AND EXISTS (SELECT 1 FROM eligible_account)
+      AND (
+          r.video_id IS NULL
+          OR (
+              v.category = 'validation'
+              AND v.platform = 'instagram'
+              AND v.google_drive_file_id IS NULL
+              AND v.local_video_path IS NOT NULL
+          )
+      )
     ORDER BY v.created_at ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -244,6 +262,7 @@ job_event AS (
         'environment_id', ij.environment_id,
         'device_id', ij.device_id,
         'target_device_serial', (SELECT device_serial FROM requested),
+        'target_video_id', (SELECT video_id FROM requested),
         'validation_targeted', true
     )
     FROM inserted_job ij
@@ -254,6 +273,7 @@ device_event AS (
     SELECT du.id, 'job_assigned', jsonb_build_object(
         'job_id', du.job_id,
         'target_device_serial', (SELECT device_serial FROM requested),
+        'target_video_id', (SELECT video_id FROM requested),
         'validation_targeted', true
     )
     FROM device_update du
@@ -326,14 +346,22 @@ def cmd_create_job(argv: list[str]) -> int:
         "--account-id",
         help="Validation-only: with --device-serial, also pin the eligible account UUID.",
     )
+    parser.add_argument(
+        "--video-id",
+        help=(
+            "Validation-only: with --device-serial, reserve this validation "
+            "video UUID instead of selecting from the generic queue."
+        ),
+    )
     args = parser.parse_args(argv)
     config = _resolve_connection(args)
     account_id = _validate_uuid(args.account_id, "--account-id")
-    if args.account_id and not args.device_serial:
-        print("error: --account-id requires --device-serial.", file=sys.stderr)
+    video_id = _validate_uuid(args.video_id, "--video-id")
+    if (args.account_id or args.video_id) and not args.device_serial:
+        print("error: --account-id/--video-id requires --device-serial.", file=sys.stderr)
         raise SystemExit(2)
     sql = (
-        _targeted_create_job_sql(args.device_serial, account_id)
+        _targeted_create_job_sql(args.device_serial, account_id, video_id)
         if args.device_serial
         else "SELECT * FROM automation.create_publishing_job()"
     )
