@@ -215,6 +215,33 @@ def _bottom_right_next(ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def _text_center(
+    ui_nodes: list[dict[str, Any]],
+    *needles: str,
+    min_y: int = 0,
+) -> tuple[int, int] | None:
+    lowered = [needle.lower() for needle in needles if needle]
+    candidates: list[tuple[int, int, int, int]] = []
+    for node in ui_nodes:
+        text = node_text(node).strip().lower()
+        if not text:
+            continue
+        if not any(needle in text for needle in lowered):
+            continue
+        if node.get("isEnabled") is False or node.get("enabled") is False:
+            continue
+        bounds = _node_bounds(node)
+        if not bounds:
+            continue
+        if bounds[1] < min_y:
+            continue
+        candidates.append(bounds)
+    if not candidates:
+        return None
+    x1, y1, x2, y2 = max(candidates, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
 class MobileUIAutomationStep:
     """Drive Instagram app to publish a Trial Reel.
 
@@ -308,6 +335,7 @@ class MobileUIAutomationStep:
                 "editor_next_not_reached",
                 "share_screen_not_reached",
                 "next_button_inactive",
+                "trial_reels_gallery_not_reached",
             }:
                 return self._needs_review(error_code, str(err))
             err_lower = str(err).lower()
@@ -405,15 +433,31 @@ class MobileUIAutomationStep:
             return {"status": "failed", "error": f"hard stop: {stop[1]}"}
 
         await tap(520, 870, 2.0)
-        await swipe()
-        await tap(225, 920, 2.0)
+        ui = await self._read_ui(worker)
+        trial_coords = _text_center(ui, "trial reels", "trial reel")
+        if trial_coords is None:
+            await swipe()
+            ui = await self._read_ui(worker)
+            trial_coords = _text_center(ui, "trial reels", "trial reel")
+        if trial_coords is None:
+            await self._screenshot(worker, "trial_reels_tile_not_found")
+            return {
+                "status": "failed",
+                "error": "Trial Reels tile not found in Professional dashboard",
+            }
+
+        await tap(trial_coords[0], trial_coords[1], 2.0)
         ui = await self._read_ui(worker)
         if not (
             _has_resource(ui, "gallery_recycler_view")
             or _has_resource(ui, "clips_next_button")
             or _has_resource(ui, "feed_gallery_fragment_holder")
         ):
-            await tap(540, 1710, 2.5)
+            create_coords = _text_center(ui, "create trial reel", "create", min_y=1200)
+            if create_coords:
+                await tap(create_coords[0], create_coords[1], 2.5)
+            else:
+                await tap(540, 1710, 2.5)
 
         # Select the newest non-camera media cell in the Trial Reel gallery.
         ui = await self._read_ui(worker)
@@ -421,8 +465,10 @@ class MobileUIAutomationStep:
             _has_resource(ui, "gallery_recycler_view")
             or _has_resource(ui, "gallery_grid_item_thumbnail")
         ):
+            await self._screenshot(worker, "trial_reels_gallery_not_reached")
             return {
                 "status": "failed",
+                "error_code": "trial_reels_gallery_not_reached",
                 "error": "Trial Reels gallery not detected after create",
             }
 

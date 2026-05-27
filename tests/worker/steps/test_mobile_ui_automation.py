@@ -13,6 +13,7 @@ from src.worker.steps.mobile_ui_automation import (
     _detect_hard_stop,
     _parse_activity_dump,
     _parse_page_source,
+    _text_center,
     _parse_xml_ui,
 )
 from src.worker.tools._types import ToolResult
@@ -150,6 +151,14 @@ class TestEditorNext:
 
         assert _bottom_right_next(nodes) == (919, 1621)
 
+    def test_text_center_finds_trial_reels_tile(self):
+        nodes = [
+            {"text": "Partnership ads", "bounds": "[0,100][600,220]"},
+            {"text": "Trial reels", "bounds": "[20,820][460,910]", "isEnabled": True},
+        ]
+
+        assert _text_center(nodes, "trial reels") == (240, 865)
+
 
 # ---------------------------------------------------------------------------
 # MobileUIAutomationStep
@@ -274,6 +283,22 @@ class TestNavigationFailure:
         result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
         assert result.status == StepStatus.NEEDS_REVIEW
         assert result.code == "share_screen_not_reached"
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_trial_gallery_not_reached_uses_specific_code(self, MockWorker):
+        w = _mock_worker()
+        w.run_goal.return_value = {
+            "status": "failed",
+            "error_code": "trial_reels_gallery_not_reached",
+            "error": "Trial Reels gallery not detected after create",
+        }
+        w.page_source.return_value = json.dumps([{"text": "Partnership ads"}])
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep()
+        result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
+        assert result.status == StepStatus.NEEDS_REVIEW
+        assert result.code == "trial_reels_gallery_not_reached"
 
 
 class TestCaptionFlow:
