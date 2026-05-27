@@ -133,7 +133,7 @@ class TestDispatcher:
             env=env,
         )
         assert result.returncode == 2
-        assert "--account-id requires --device-serial" in result.stderr
+        assert "--account-id/--video-id requires --device-serial" in result.stderr
 
     def test_create_job_rejects_invalid_account_id(self):
         env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
@@ -152,6 +152,22 @@ class TestDispatcher:
         assert result.returncode == 2
         assert "--account-id must be a UUID" in result.stderr
 
+    def test_create_job_rejects_video_id_without_device_serial(self):
+        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli", "create-job",
+                "--via-management-api", "--project-ref", "test-ref",
+                "--video-id", "00000000-0000-0000-0000-000000000000",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "--account-id/--video-id requires --device-serial" in result.stderr
+
     def test_targeted_create_job_sql_is_self_contained(self):
         sql = _targeted_create_job_sql("100.110.232.89:5555")
         assert "find_eligible_account" not in sql
@@ -160,6 +176,14 @@ class TestDispatcher:
         assert "automation.accounts" in sql
         assert "automation.physical_devices" in sql
         assert "100.110.232.89:5555" in sql
+
+    def test_targeted_create_job_sql_can_pin_validation_video(self):
+        video_id = "00000000-0000-0000-0000-000000000123"
+        sql = _targeted_create_job_sql("100.110.232.89:5555", video_id=video_id)
+        assert video_id in sql
+        assert "v.category = 'validation'" in sql
+        assert "v.google_drive_file_id IS NULL" in sql
+        assert "v.local_video_path IS NOT NULL" in sql
 
     def test_run_launcher_rejects_management_api(self):
         env = {k: v for k, v in __import__("os").environ.items()
