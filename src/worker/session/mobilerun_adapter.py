@@ -7,11 +7,13 @@ behind the MobileWorker interface.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
+import subprocess
 import time
 from typing import Any
-from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from src.worker.session.interface import MobileWorker
@@ -27,10 +29,12 @@ class MobilerunWorker(MobileWorker):
         device_serial: str,
         genfarmer_url: str = "http://127.0.0.1:55554",
         config_overrides: dict[str, Any] | None = None,
+        adb_fallback: bool = True,
     ) -> None:
         self._device_serial = device_serial
         self._genfarmer_url = genfarmer_url.rstrip("/")
         self._config_overrides = config_overrides or {}
+        self._adb_fallback = adb_fallback
         self._connected = False
         self._user_id: str | None = None
         self._actions_log: list[dict[str, Any]] = []
@@ -59,24 +63,37 @@ class MobilerunWorker(MobileWorker):
 
     def screenshot(self, label: str = "") -> bytes:
         self._ensure_connected()
-        resp = self._api_post(
-            "/automation/screenshot",
-            {"deviceSerial": self._device_serial},
-        )
-        raw = resp.get("data", b"")
-        if isinstance(raw, str):
-            import base64
-            raw = base64.b64decode(raw)
+        try:
+            resp = self._api_post(
+                "/automation/screenshot",
+                {"deviceSerial": self._device_serial},
+            )
+            raw = resp.get("data", b"")
+            if isinstance(raw, str):
+                raw = base64.b64decode(raw)
+        except Exception as e:
+            if not self._adb_fallback:
+                raise
+            raw = self._adb_screenshot()
+            self._log_action("adb_fallback", {"operation": "screenshot", "error": str(e)[:200]})
         self._log_action("screenshot", {"label": label, "size": len(raw)})
         return raw
 
     def page_source(self) -> str:
         self._ensure_connected()
-        resp = self._api_post(
-            "/automation/page_source",
-            {"deviceSerial": self._device_serial},
-        )
-        source = resp.get("data", "")
+        try:
+            resp = self._api_post(
+                "/automation/page_source",
+                {"deviceSerial": self._device_serial},
+            )
+            source = resp.get("data", "")
+            if not self._source_has_nodes(str(source)):
+                raise RuntimeError("empty page_source")
+        except Exception as e:
+            if not self._adb_fallback:
+                raise
+            source = self._adb_page_source()
+            self._log_action("adb_fallback", {"operation": "page_source", "error": str(e)[:200]})
         self._log_action("page_source", {"length": len(source)})
         return source
 
@@ -84,31 +101,51 @@ class MobilerunWorker(MobileWorker):
 
     def tap(self, x: int, y: int) -> None:
         self._ensure_connected()
-        self._api_post(
-            "/automation/tap",
-            {"deviceSerial": self._device_serial, "x": x, "y": y},
-        )
+        try:
+            self._api_post(
+                "/automation/tap",
+                {"deviceSerial": self._device_serial, "x": x, "y": y},
+            )
+        except Exception as e:
+            if not self._adb_fallback:
+                raise
+            self._adb_shell(f"input tap {int(x)} {int(y)}")
+            self._log_action("adb_fallback", {"operation": "tap", "error": str(e)[:200]})
         self._log_action("tap", {"x": x, "y": y})
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         self._ensure_connected()
-        self._api_post(
-            "/automation/swipe",
-            {
-                "deviceSerial": self._device_serial,
-                "x1": x1, "y1": y1,
-                "x2": x2, "y2": y2,
-                "durationMs": duration_ms,
-            },
-        )
+        try:
+            self._api_post(
+                "/automation/swipe",
+                {
+                    "deviceSerial": self._device_serial,
+                    "x1": x1, "y1": y1,
+                    "x2": x2, "y2": y2,
+                    "durationMs": duration_ms,
+                },
+            )
+        except Exception as e:
+            if not self._adb_fallback:
+                raise
+            self._adb_shell(
+                f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration_ms)}"
+            )
+            self._log_action("adb_fallback", {"operation": "swipe", "error": str(e)[:200]})
         self._log_action("swipe", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration_ms})
 
     def type_text(self, text: str) -> None:
         self._ensure_connected()
-        self._api_post(
-            "/automation/type",
-            {"deviceSerial": self._device_serial, "text": text},
-        )
+        try:
+            self._api_post(
+                "/automation/type",
+                {"deviceSerial": self._device_serial, "text": text},
+            )
+        except Exception as e:
+            if not self._adb_fallback:
+                raise
+            self._adb_input_text(text)
+            self._log_action("adb_fallback", {"operation": "type_text", "error": str(e)[:200]})
         self._log_action("type_text", {"length": len(text)})
 
     # --- high-level agent execution ---
@@ -145,6 +182,33 @@ class MobilerunWorker(MobileWorker):
     def actions_log(self) -> list[dict[str, Any]]:
         return list(self._actions_log)
 
+    def preflight_ui_tree(self) -> dict[str, Any]:
+        """Check current foreground activity and UI-tree availability.
+
+        This is a non-posting readiness probe. It prefers the same page_source
+        path normal callers use, so a working result may come from Mobilerun or
+        from the ADB/uiautomator fallback.
+        """
+        self._ensure_connected()
+        activity = ""
+        try:
+            activity = self._adb_shell(
+                "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'",
+                timeout=10,
+            ).strip()
+        except Exception:
+            pass
+        source = self.page_source()
+        node_count = self._source_node_count(source)
+        result = {
+            "device_serial": self._device_serial,
+            "activity": activity,
+            "ui_tree_available": node_count > 0,
+            "ui_tree_count": node_count,
+        }
+        self._log_action("preflight_ui_tree", result)
+        return result
+
     # --- internals ---
 
     def _ensure_connected(self) -> None:
@@ -177,3 +241,98 @@ class MobilerunWorker(MobileWorker):
         })
         resp = urlopen(req, timeout=timeout)
         return json.loads(resp.read())
+
+    def _adb_path(self) -> str:
+        return os.environ.get("ADB_PATH", "adb")
+
+    def _adb(self, args: list[str], *, timeout: int = 60, text: bool = True) -> subprocess.CompletedProcess:
+        cmd = [self._adb_path(), "-s", self._device_serial, *args]
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=text,
+            encoding="utf-8" if text else None,
+            errors="replace" if text else None,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            out = proc.stderr if text else proc.stderr.decode(errors="replace")
+            if not out:
+                out = proc.stdout if text else proc.stdout.decode(errors="replace")
+            raise RuntimeError(f"adb rc={proc.returncode}: {str(out).strip()[:300]}")
+        return proc
+
+    def _adb_shell(self, command: str, *, timeout: int = 60) -> str:
+        proc = self._adb(["shell", command], timeout=timeout, text=True)
+        return str(proc.stdout or "")
+
+    def _adb_screenshot(self) -> bytes:
+        proc = self._adb(["exec-out", "screencap", "-p"], timeout=30, text=False)
+        return bytes(proc.stdout or b"")
+
+    def _adb_page_source(self) -> str:
+        remote = "/sdcard/window.xml"
+        try:
+            self._adb_shell(f"uiautomator dump {remote}", timeout=30)
+        except RuntimeError:
+            source = self._adb_shell(f"cat {remote}", timeout=30)
+            if self._source_has_nodes(source):
+                return source
+            raise
+        return self._adb_shell(f"cat {remote}", timeout=30)
+
+    def _adb_input_text(self, text: str) -> None:
+        escaped = (
+            text.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace(" ", "%s")
+            .replace('"', '\\"')
+            .replace("'", "\\'")
+        )
+        self._adb_shell(f"input text \"{escaped}\"", timeout=30)
+
+    def _source_has_nodes(self, source: str) -> bool:
+        stripped = source.strip()
+        if not stripped:
+            return False
+        if "<node" in stripped:
+            return True
+        try:
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            return True
+        return self._json_has_nodes(data)
+
+    def _json_has_nodes(self, data: Any) -> bool:
+        return self._json_node_count(data) > 0
+
+    def _source_node_count(self, source: str) -> int:
+        stripped = source.strip()
+        if not stripped:
+            return 0
+        if "<node" in stripped:
+            return stripped.count("<node")
+        try:
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            return 0
+        return self._json_node_count(data)
+
+    def _json_node_count(self, data: Any) -> int:
+        if isinstance(data, list):
+            return sum(self._json_node_count(item) for item in data)
+        if isinstance(data, dict):
+            node_keys = {
+                "text",
+                "resourceId",
+                "resource-id",
+                "contentDescription",
+                "content-desc",
+                "bounds",
+                "className",
+                "class",
+            }
+            count = 1 if any(key in data for key in node_keys) else 0
+            return count + sum(self._json_node_count(value) for value in data.values())
+        return 0
