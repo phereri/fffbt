@@ -376,14 +376,20 @@ class MobileUIAutomationStep:
 
         await tap(540, 850, 2.5)
 
-        # Advance through editor screens until the Share screen appears.
+        # Advance through editor screens until the Share screen appears. The
+        # first editor screen exposes a bottom-right "Next" button even when
+        # the legacy top clips_next_button is present but disabled.
+        await tap(920, 1620, 2.5)
         for _ in range(5):
             ui = await self._read_ui(worker)
             if _has_resource(ui, "caption_input_text_view") and _has_resource(
                 ui, "share_button"
             ):
                 return {"status": "success", "method": "adb_trial_reels_path"}
-            await tap(700, 145, 2.0)
+            if _has_resource(ui, "post_capture_button_share_container"):
+                await tap(920, 1620, 2.0)
+            else:
+                await tap(700, 145, 2.0)
 
         ui = await self._read_ui(worker)
         if _has_resource(ui, "caption_input_text_view") and _has_resource(
