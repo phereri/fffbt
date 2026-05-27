@@ -14,11 +14,16 @@ import os
 import subprocess
 import time
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from src.worker.session.interface import MobileWorker
 
 logger = logging.getLogger(__name__)
+
+
+class MobilerunRouteMissingError(RuntimeError):
+    """Raised when GenFarmer does not expose an expected automation route."""
 
 
 class MobilerunWorker(MobileWorker):
@@ -148,6 +153,65 @@ class MobilerunWorker(MobileWorker):
             self._log_action("adb_fallback", {"operation": "type_text", "error": str(e)[:200]})
         self._log_action("type_text", {"length": len(text)})
 
+    def open_app(
+        self,
+        package: str,
+        *,
+        activity: str | None = None,
+        force_stop: bool = False,
+        wait_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        """Open an app through ADB.
+
+        The deployed GenFarmer build does not expose imperative app-control
+        routes such as /automation/run or /automation/open_app. Launching via
+        ADB is the confirmed non-destructive path on the VPS.
+        """
+        self._ensure_connected()
+        if force_stop:
+            self._adb_shell(f"am force-stop {package}", timeout=20)
+            time.sleep(0.4)
+
+        if activity:
+            component = f"{package}/{activity}"
+            out = self._adb_shell(f"am start -n {component}", timeout=20)
+        else:
+            out = self._adb_shell(
+                f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+                timeout=20,
+            )
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        activity_out = self.current_activity()
+        ok = package in activity_out
+        result = {
+            "status": "success" if ok else "error",
+            "package": package,
+            "activity": activity_out,
+            "output": out.strip()[:500],
+        }
+        self._log_action("open_app", result)
+        return result
+
+    def current_activity(self) -> str:
+        """Return the current resumed activity text, best-effort."""
+        self._ensure_connected()
+        try:
+            out = self._adb_shell(
+                "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'",
+                timeout=10,
+            )
+        except Exception:
+            out = self._adb_shell("dumpsys activity top | head -n 40", timeout=10)
+        return out.strip()
+
+    def activity_page_source(self) -> str:
+        """Return Android activity dump for fallback resource-id parsing."""
+        self._ensure_connected()
+        source = self._adb_shell("dumpsys activity top", timeout=20)
+        self._log_action("activity_page_source", {"length": len(source)})
+        return source
+
     # --- high-level agent execution ---
 
     def run_goal(
@@ -229,7 +293,14 @@ class MobilerunWorker(MobileWorker):
     def _api_get(self, path: str, timeout: int = 10) -> dict[str, Any]:
         url = f"{self._genfarmer_url}{path}"
         req = Request(url, headers={"Accept": "application/json"})
-        resp = urlopen(req, timeout=timeout)
+        try:
+            resp = urlopen(req, timeout=timeout)
+        except HTTPError as e:
+            if e.code == 404:
+                raise MobilerunRouteMissingError(
+                    f"GenFarmer route missing: GET {path} returned 404"
+                ) from e
+            raise
         return json.loads(resp.read())
 
     def _api_post(self, path: str, body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -239,7 +310,14 @@ class MobilerunWorker(MobileWorker):
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
-        resp = urlopen(req, timeout=timeout)
+        try:
+            resp = urlopen(req, timeout=timeout)
+        except HTTPError as e:
+            if e.code == 404:
+                raise MobilerunRouteMissingError(
+                    f"GenFarmer route missing: POST {path} returned 404"
+                ) from e
+            raise
         return json.loads(resp.read())
 
     def _adb_path(self) -> str:

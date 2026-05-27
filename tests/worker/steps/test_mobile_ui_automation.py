@@ -10,6 +10,7 @@ from src.worker.session.types import Mode, StepContext, StepName, StepStatus
 from src.worker.steps.mobile_ui_automation import (
     MobileUIAutomationStep,
     _detect_hard_stop,
+    _parse_activity_dump,
     _parse_page_source,
     _parse_xml_ui,
 )
@@ -80,6 +81,20 @@ class TestParsePageSource:
         assert _parse_page_source("{bad json") == []
 
 
+class TestParseActivityDump:
+    def test_instagram_resource_nodes(self):
+        dump = (
+            "com.instagram.common.ui.base.IgButton{5ce5136 "
+            "VFED..... 589,87-800,203 #7f0b0c02 app:id/clips_next_button}\n"
+            "com.instagram.common.ui.base.IgTextView{abc "
+            "V.ED..... 0,0-0,0 #7f0b0000 app:id/hidden}"
+        )
+        nodes = _parse_activity_dump(dump)
+        assert len(nodes) == 1
+        assert nodes[0]["resourceId"].endswith("clips_next_button")
+        assert nodes[0]["bounds"] == "[589,87][800,203]"
+
+
 # ---------------------------------------------------------------------------
 # _detect_hard_stop
 # ---------------------------------------------------------------------------
@@ -121,8 +136,10 @@ def _mock_worker():
     w = MagicMock()
     w.connect = MagicMock()
     w.disconnect = MagicMock()
+    w.open_app = MagicMock(return_value={"status": "success"})
     w.screenshot = MagicMock(return_value=b"png")
     w.page_source = MagicMock(return_value="")
+    w.activity_page_source = MagicMock(return_value="")
     w.run_goal = MagicMock(return_value={"status": "success"})
     return w
 
@@ -165,9 +182,6 @@ class TestHardStopOnLaunch:
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
     def test_action_blocked_after_open(self, MockWorker):
         w = _mock_worker()
-        w.run_goal.side_effect = [
-            {"status": "success"},  # open_instagram
-        ]
         w.page_source.return_value = json.dumps(
             [{"text": "Action blocked. We restrict certain activity to protect our community."}]
         )
@@ -181,7 +195,7 @@ class TestHardStopOnLaunch:
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
     def test_logged_out_on_launch(self, MockWorker):
         w = _mock_worker()
-        w.run_goal.return_value = {"status": "failed", "error": "app not loaded"}
+        w.open_app.return_value = {"status": "failed", "error": "app not loaded"}
         w.page_source.return_value = json.dumps(
             [{"text": "Log in to Instagram"}, {"text": "Create new account"}]
         )
@@ -197,10 +211,10 @@ class TestNavigationFailure:
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
     def test_trial_reels_unavailable(self, MockWorker):
         w = _mock_worker()
-        w.run_goal.side_effect = [
-            {"status": "success"},  # open
-            {"status": "failed", "error": "Professional dashboard tile not found"},
-        ]
+        w.run_goal.return_value = {
+            "status": "failed",
+            "error": "Professional dashboard tile not found",
+        }
         w.page_source.return_value = json.dumps([{"text": "Settings"}])
         MockWorker.return_value = w
 
@@ -212,10 +226,7 @@ class TestNavigationFailure:
     @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
     def test_unknown_screen(self, MockWorker):
         w = _mock_worker()
-        w.run_goal.side_effect = [
-            {"status": "success"},  # open
-            {"status": "failed", "error": "cannot find element"},
-        ]
+        w.run_goal.return_value = {"status": "failed", "error": "cannot find element"}
         w.page_source.return_value = json.dumps([{"text": "Some random screen"}])
         MockWorker.return_value = w
 
