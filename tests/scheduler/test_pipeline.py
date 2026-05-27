@@ -46,6 +46,7 @@ from scheduler.pipeline import (
     default_steps,
     proof_of_posting_steps,
     run_job_pipeline,
+    _prepare_caption,
 )
 
 
@@ -273,6 +274,38 @@ class TestProofOfPostingSteps:
             "mutates_environment": False,
         }
         assert "ChangeInfo" in result.message
+
+
+class TestCaptionAssembly:
+    def test_prepare_caption_writes_non_placeholder_caption_and_hashtags(self):
+        conn = AsyncMock()
+        ctx = _make_ctx(settings={"job_heartbeat_timeout_seconds": "120"})
+
+        hashtags = asyncio.run(_prepare_caption(conn, ctx))
+
+        caption = ctx.settings["caption_text"]
+        assert "football" in caption.lower() or "fifa" in caption.lower()
+        assert 3 <= len(hashtags) <= 7
+        assert ctx.settings["hashtags"] == " ".join(hashtags)
+        update_call = conn.execute.await_args_list[0]
+        assert "UPDATE automation.jobs SET caption" in update_call.args[0]
+        assert update_call.args[1][0] == caption
+        assert update_call.args[1][1] == hashtags
+
+    def test_prepare_caption_honors_requested_hashtag_range(self):
+        conn = AsyncMock()
+        ctx = _make_ctx(
+            settings={
+                "job_heartbeat_timeout_seconds": "120",
+                "caption_text": "Football fans are ready.",
+                "hashtag_count": "3",
+            }
+        )
+
+        hashtags = asyncio.run(_prepare_caption(conn, ctx))
+
+        assert ctx.settings["caption_text"].startswith("Football fans are ready.")
+        assert len(hashtags) == 3
 
 
 # ---------------------------------------------------------------------------

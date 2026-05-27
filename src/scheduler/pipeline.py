@@ -20,7 +20,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import psycopg
 
-from scheduler.hashtags import build_caption, select_hashtags
+from scheduler.hashtags import build_validation_caption
 from src.worker.session.types import (
     Mode,
     StepContext as WorkerStepContext,
@@ -325,10 +325,12 @@ async def _prepare_caption(
     ``ctx.settings["caption_text"]`` (mutates the dict in-place) and the
     hashtags are recorded in a job event for audit.
     """
-    base_caption = ctx.settings.get("caption_text", "")
-    hashtag_count = int(ctx.settings.get("hashtag_count", "10"))
-    hashtags = select_hashtags(hashtag_count)
-    full_caption = build_caption(base_caption, hashtags)
+    requested_caption = ctx.settings.get("caption_text", "")
+    hashtag_count = int(ctx.settings.get("hashtag_count", "5"))
+    full_caption, hashtags, base_caption = build_validation_caption(
+        requested_caption,
+        hashtag_count=hashtag_count,
+    )
     ctx.settings["caption_text"] = full_caption
     ctx.settings["hashtags"] = " ".join(hashtags)
 
