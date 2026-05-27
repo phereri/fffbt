@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import psycopg
 import pytest
@@ -24,7 +25,7 @@ MIGRATIONS_DIR = f"{REPO_ROOT}/supabase/migrations"
 SEED_FILE = f"{REPO_ROOT}/supabase/seed.sql"
 sys.path.insert(0, f"{REPO_ROOT}/src")
 
-from scheduler.cli import _targeted_create_job_sql
+from scheduler.cli import _run_job, _targeted_create_job_sql, cmd_run_job
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +213,18 @@ class TestDispatcher:
         assert "unrecognized arguments" not in result.stderr
         assert "DIRECT_DB_REQUIRED" in result.stdout
 
-    def test_run_job_proof_of_posting_refuses_stub_pipeline(self):
-        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+    def test_run_job_missing_direct_db_url_returns_direct_db_required(self):
+        env = {
+            k: v
+            for k, v in __import__("os").environ.items()
+            if k != "SUPABASE_DB_URL"
+        }
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
         result = subprocess.run(
             [
                 sys.executable, "-m", "scheduler.cli", "run-job",
                 "00000000-0000-0000-0000-000000000000",
                 "--mode", "proof_of_posting",
-                "--db-url", "postgresql://example.invalid/postgres",
                 "--json",
             ],
             capture_output=True,
@@ -227,7 +232,29 @@ class TestDispatcher:
             env=env,
         )
         assert result.returncode == 2
-        assert "REAL_WORKER_NOT_WIRED" in result.stdout
+        assert "DIRECT_DB_REQUIRED" in result.stdout
+
+    def test_run_job_proof_of_posting_dispatches_runner(self):
+        job_id = "00000000-0000-0000-0000-000000000000"
+
+        with (
+            patch("scheduler.cli._run_job", new_callable=AsyncMock) as mock_run_job,
+            patch("scheduler.cli.asyncio.run") as mock_asyncio_run,
+        ):
+            mock_asyncio_run.side_effect = lambda coro: coro.close()
+            rc = cmd_run_job([
+                job_id,
+                "--mode", "proof_of_posting",
+                "--db-url", "postgresql://example.invalid/postgres",
+                "--json",
+            ])
+
+        assert rc == 0
+        mock_run_job.assert_called_once_with(
+            "postgresql://example.invalid/postgres",
+            job_id,
+            "proof_of_posting",
+        )
 
     def test_subcommand_help(self):
         env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
@@ -239,6 +266,77 @@ class TestDispatcher:
                 env=env,
             )
             assert result.returncode == 0, f"{cmd} --help failed"
+
+
+class TestRunJobAsync:
+    @pytest.mark.asyncio
+    async def test_proof_of_posting_selects_real_steps_without_launcher(self):
+        mock_conn = AsyncMock()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[
+            ("job_heartbeat_timeout_seconds", "120"),
+        ])
+        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        proof_steps = [object()]
+
+        with (
+            patch(
+                "psycopg.AsyncConnection.connect",
+                new=AsyncMock(return_value=mock_cm),
+            ),
+            patch(
+                "scheduler.pipeline.proof_of_posting_steps",
+                return_value=proof_steps,
+            ) as mock_factory,
+            patch(
+                "scheduler.pipeline.run_job_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+            patch("scheduler.launcher.JobLauncher") as mock_launcher,
+        ):
+            await _run_job(
+                "postgresql://fake",
+                "00000000-0000-0000-0000-000000000000",
+                "proof_of_posting",
+            )
+
+        mock_factory.assert_called_once_with()
+        mock_launcher.assert_not_called()
+        mock_pipeline.assert_awaited_once()
+        assert mock_pipeline.await_args.kwargs["steps"] is proof_steps
+
+    @pytest.mark.asyncio
+    async def test_default_mode_uses_default_pipeline_steps(self):
+        mock_conn = AsyncMock()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch(
+                "psycopg.AsyncConnection.connect",
+                new=AsyncMock(return_value=mock_cm),
+            ),
+            patch("scheduler.pipeline.proof_of_posting_steps") as mock_factory,
+            patch(
+                "scheduler.pipeline.run_job_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+        ):
+            await _run_job(
+                "postgresql://fake",
+                "00000000-0000-0000-0000-000000000000",
+                None,
+            )
+
+        mock_factory.assert_not_called()
+        assert mock_pipeline.await_args.kwargs["steps"] is None
 
 
 # ---------------------------------------------------------------------------

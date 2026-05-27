@@ -402,6 +402,35 @@ def cmd_run_launcher(argv: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+async def _run_job(db_url: str, job_id: str, mode: str | None) -> None:
+    import psycopg
+
+    async with await psycopg.AsyncConnection.connect(
+        db_url, autocommit=True
+    ) as conn:
+        cur = await conn.execute(
+            "SELECT key, value FROM automation.global_settings"
+        )
+        settings = {row[0]: row[1] for row in await cur.fetchall()}
+
+    from scheduler.pipeline import proof_of_posting_steps, run_job_pipeline
+
+    steps = proof_of_posting_steps() if mode == "proof_of_posting" else None
+
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown.set)
+
+    await run_job_pipeline(
+        db_url=db_url,
+        job={"id": job_id},
+        settings=settings,
+        shutdown=shutdown,
+        steps=steps,
+    )
+
+
 def cmd_run_job(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="fffbt run-job",
@@ -422,7 +451,6 @@ def cmd_run_job(argv: list[str]) -> int:
         "--json", action="store_true", help="Output a structured status/error payload."
     )
     args = parser.parse_args(argv)
-    config = _resolve_connection(args)
 
     def _emit_error(code: str, message: str, *, rc: int = 2) -> int:
         if args.json:
@@ -430,6 +458,15 @@ def cmd_run_job(argv: list[str]) -> int:
         else:
             print(f"error: {message}", file=sys.stderr)
         return rc
+
+    if not args.via_management_api and not args.db_url:
+        return _emit_error(
+            "DIRECT_DB_REQUIRED",
+            "run-job requires a direct Postgres connection via --db-url or "
+            "SUPABASE_DB_URL.",
+        )
+
+    config = _resolve_connection(args)
 
     if config.mode == "api":
         return _emit_error(
@@ -439,46 +476,13 @@ def cmd_run_job(argv: list[str]) -> int:
         )
     db_url = _require_db_url(config)
 
-    if args.mode == "proof_of_posting":
-        return _emit_error(
-            "REAL_WORKER_NOT_WIRED",
-            "proof_of_posting is not wired into scheduler.run-job yet; the "
-            "current default pipeline uses stub worker steps and would not "
-            "perform real device automation safely.",
-        )
-
     level = args.log_level.upper()
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
         format="%(levelname)s: %(message)s",
     )
 
-    async def _run() -> None:
-        import psycopg
-
-        async with await psycopg.AsyncConnection.connect(
-            db_url, autocommit=True
-        ) as conn:
-            cur = await conn.execute(
-                "SELECT key, value FROM automation.global_settings"
-            )
-            settings = {row[0]: row[1] for row in await cur.fetchall()}
-
-        from scheduler.pipeline import run_job_pipeline
-
-        shutdown = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, shutdown.set)
-
-        await run_job_pipeline(
-            db_url=db_url,
-            job={"id": args.job_id},
-            settings=settings,
-            shutdown=shutdown,
-        )
-
-    asyncio.run(_run())
+    asyncio.run(_run_job(db_url, args.job_id, args.mode))
     return 0
 
 

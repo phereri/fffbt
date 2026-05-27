@@ -15,11 +15,22 @@ import json
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 import psycopg
 
 from scheduler.hashtags import build_caption, select_hashtags
+from src.worker.session.types import (
+    Mode,
+    StepContext as WorkerStepContext,
+    StepResult as WorkerStepResult,
+)
+from src.worker.steps import (
+    MobileUIAutomationStep as RealMobileUIAutomationStep,
+    VerificationStep as RealVerificationStep,
+    VideoPreparationStep as RealVideoPreparationStep,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +133,130 @@ def default_steps() -> list:
     ]
 
 
+def _value(value: Any) -> Any:
+    return value.value if isinstance(value, Enum) else value
+
+
+def _stringify_records(records: list[Any]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for record in records:
+        if hasattr(record, "__dataclass_fields__"):
+            result.append({
+                key: str(_value(getattr(record, key)))
+                for key in record.__dataclass_fields__
+            })
+        elif isinstance(record, dict):
+            result.append({str(k): str(_value(v)) for k, v in record.items()})
+        else:
+            result.append({"detail": str(record)})
+    return result
+
+
+def _to_pipeline_result(result: WorkerStepResult) -> StepResult:
+    return StepResult(
+        step=str(_value(result.step)),
+        status=str(_value(result.status)),
+        code=result.code,
+        message=result.message,
+        retryable=result.retryable,
+        warnings=_stringify_records(result.warnings),
+        artifacts=_stringify_records(result.artifacts),
+        details=result.details,
+    )
+
+
+def _to_worker_context(ctx: StepContext) -> WorkerStepContext:
+    return WorkerStepContext(
+        job_id=ctx.job_id,
+        video_id=ctx.video_id,
+        account_id=ctx.account_id,
+        account_environment_id=ctx.account_environment_id,
+        device_id=ctx.device_id,
+        mode=Mode.PROOF_OF_POSTING,
+        settings=ctx.settings,
+    )
+
+
+class ProofOfPostingEnvironmentStep:
+    """No-op environment step for already prepared proof-of-posting devices."""
+
+    name = "environment_apply"
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        return StepResult(
+            step=self.name,
+            status="ok",
+            message=(
+                "proof_of_posting: device environment is pre-prepared; "
+                "ChangeInfo, proxy, and profile mutation skipped"
+            ),
+            details={
+                "mode": "proof_of_posting",
+                "mutates_environment": False,
+            },
+        )
+
+
+class ProofOfPostingWorkerStep:
+    """Adapter from worker step implementations to scheduler pipeline steps."""
+
+    def __init__(self, step: Any) -> None:
+        self._step = step
+
+    @property
+    def name(self) -> str:
+        return str(_value(self._step.name))
+
+    @property
+    def implementation(self) -> Any:
+        return self._step
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        worker_ctx = _to_worker_context(ctx)
+        serial = ctx.settings.get("device_serial")
+
+        if isinstance(self._step, RealVideoPreparationStep):
+            if not serial:
+                return StepResult(
+                    step=self.name,
+                    status="failed",
+                    code="INFRA",
+                    message="no device_serial provided",
+                )
+            result = await self._step.run(
+                worker_ctx,
+                video_url=ctx.settings.get("video_url"),
+                local_video_path=ctx.settings.get("local_video_path"),
+                device_serial=serial,
+            )
+            return _to_pipeline_result(result)
+
+        if isinstance(self._step, RealMobileUIAutomationStep):
+            result = await self._step.run(
+                worker_ctx,
+                device_serial=serial,
+                caption_text=ctx.settings.get("caption_text"),
+            )
+            return _to_pipeline_result(result)
+
+        if isinstance(self._step, RealVerificationStep):
+            result = await self._step.run(worker_ctx, device_serial=serial)
+            return _to_pipeline_result(result)
+
+        result = await self._step.run(worker_ctx)
+        return _to_pipeline_result(result)
+
+
+def proof_of_posting_steps() -> list:
+    """Return real proof-of-posting steps; no production env mutation."""
+    return [
+        ProofOfPostingEnvironmentStep(),
+        ProofOfPostingWorkerStep(RealVideoPreparationStep()),
+        ProofOfPostingWorkerStep(RealMobileUIAutomationStep()),
+        ProofOfPostingWorkerStep(RealVerificationStep()),
+    ]
+
+
 # State transition before each step (by step name).
 # Steps not listed here run in the current job state.
 _PRE_TRANSITIONS: dict[str, str] = {
@@ -140,8 +275,14 @@ async def _load_job_context(
     conn: psycopg.AsyncConnection, job_id: str, settings: dict[str, str]
 ) -> StepContext:
     cur = await conn.execute(
-        "SELECT id, video_id, account_id, environment_id, device_id "
-        "FROM automation.jobs WHERE id = %s",
+        "SELECT j.id, j.video_id, j.account_id, j.environment_id, j.device_id, "
+        "v.local_video_path, v.source_path, v.filename, "
+        "pd.adb_serial, pd.adb_connect_target, pd.tailscale_ipv4, "
+        "pd.genfarmer_device_id "
+        "FROM automation.jobs j "
+        "JOIN automation.videos v ON v.id = j.video_id "
+        "JOIN automation.physical_devices pd ON pd.id = j.device_id "
+        "WHERE j.id = %s",
         (job_id,),
     )
     row = await cur.fetchone()
@@ -149,13 +290,28 @@ async def _load_job_context(
         raise ValueError(f"job not found: {job_id}")
     cols = [d.name for d in cur.description]
     job = dict(zip(cols, row))
+    runtime_settings = dict(settings)
+    device_serial = (
+        job.get("adb_serial")
+        or job.get("adb_connect_target")
+        or job.get("tailscale_ipv4")
+        or job.get("genfarmer_device_id")
+    )
+    if device_serial:
+        runtime_settings.setdefault("device_serial", str(device_serial))
+    if job.get("local_video_path"):
+        runtime_settings.setdefault("local_video_path", str(job["local_video_path"]))
+    if job.get("source_path"):
+        runtime_settings.setdefault("video_source_path", str(job["source_path"]))
+    if job.get("filename"):
+        runtime_settings.setdefault("video_filename", str(job["filename"]))
     return StepContext(
         job_id=str(job["id"]),
         video_id=str(job["video_id"]),
         account_id=str(job["account_id"]),
         account_environment_id=str(job["environment_id"]),
         device_id=str(job["device_id"]),
-        settings=settings,
+        settings=runtime_settings,
     )
 
 

@@ -27,16 +27,24 @@ import sys
 
 sys.path.insert(0, f"{REPO_ROOT}/src")
 
+from src.worker.steps import (
+    MobileUIAutomationStep as RealMobileUIAutomationStep,
+    VerificationStep as RealVerificationStep,
+    VideoPreparationStep as RealVideoPreparationStep,
+)
 from scheduler.pipeline import (
     CleanupStep,
     EnvironmentApplyStep,
     MobileUIAutomationStep,
+    ProofOfPostingEnvironmentStep,
+    ProofOfPostingWorkerStep,
     StepContext,
     StepResult,
     VerificationStep,
     VideoPreparationStep,
     _execute_step,
     default_steps,
+    proof_of_posting_steps,
     run_job_pipeline,
 )
 
@@ -101,9 +109,22 @@ def _make_mock_conn(job_id: str = "job-1"):
     async def _execute(query, params=None):
         cursor = AsyncMock()
         q = str(query)
-        if "FROM automation.jobs WHERE" in q:
+        if "FROM automation.jobs" in q and "WHERE" in q:
             cursor.fetchone = AsyncMock(
-                return_value=(job_id, "vid-1", "acct-1", "env-1", "dev-1")
+                return_value=(
+                    job_id,
+                    "vid-1",
+                    "acct-1",
+                    "env-1",
+                    "dev-1",
+                    "/tmp/clip.mp4",
+                    "instagram/test/videos/",
+                    "clip.mp4",
+                    "DEVICE001",
+                    None,
+                    None,
+                    None,
+                )
             )
             cursor.description = [
                 types.SimpleNamespace(name=n)
@@ -113,6 +134,13 @@ def _make_mock_conn(job_id: str = "job-1"):
                     "account_id",
                     "environment_id",
                     "device_id",
+                    "local_video_path",
+                    "source_path",
+                    "filename",
+                    "adb_serial",
+                    "adb_connect_target",
+                    "tailscale_ipv4",
+                    "genfarmer_device_id",
                 ]
             ]
         elif "RETURNING id" in q:
@@ -212,6 +240,39 @@ class TestStubs:
             "mobile_ui_automation",
             "verification",
         ]
+
+
+class TestProofOfPostingSteps:
+    def test_proof_of_posting_steps_are_real_worker_steps(self):
+        steps = proof_of_posting_steps()
+
+        assert [s.name for s in steps] == [
+            "environment_apply",
+            "video_preparation",
+            "mobile_ui_automation",
+            "verification",
+        ]
+        assert isinstance(steps[0], ProofOfPostingEnvironmentStep)
+        assert isinstance(steps[1], ProofOfPostingWorkerStep)
+        assert isinstance(steps[1].implementation, RealVideoPreparationStep)
+        assert isinstance(steps[2].implementation, RealMobileUIAutomationStep)
+        assert isinstance(steps[3].implementation, RealVerificationStep)
+        assert not any(
+            isinstance(s, (EnvironmentApplyStep, VideoPreparationStep,
+                           MobileUIAutomationStep, VerificationStep))
+            for s in steps
+        )
+
+    @pytest.mark.asyncio
+    async def test_environment_step_does_not_mutate_environment(self):
+        result = await ProofOfPostingEnvironmentStep().run(_make_ctx())
+
+        assert result.status == "ok"
+        assert result.details == {
+            "mode": "proof_of_posting",
+            "mutates_environment": False,
+        }
+        assert "ChangeInfo" in result.message
 
 
 # ---------------------------------------------------------------------------
