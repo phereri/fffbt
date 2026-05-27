@@ -412,9 +412,40 @@ def cmd_run_job(argv: list[str]) -> int:
     parser.add_argument(
         "--log-level", default=os.environ.get("LOG_LEVEL", "info")
     )
+    parser.add_argument(
+        "--mode",
+        choices=("proof_of_posting",),
+        default=os.environ.get("FFFBT_MODE"),
+        help="Run mode. proof_of_posting requires real worker steps and will not run stubs.",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Output a structured status/error payload."
+    )
     args = parser.parse_args(argv)
     config = _resolve_connection(args)
+
+    def _emit_error(code: str, message: str, *, rc: int = 2) -> int:
+        if args.json:
+            print(json.dumps({"ok": False, "code": code, "message": message}, indent=2))
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return rc
+
+    if config.mode == "api":
+        return _emit_error(
+            "DIRECT_DB_REQUIRED",
+            "run-job requires a direct Postgres connection; Management API "
+            "cannot run the multi-step worker pipeline.",
+        )
     db_url = _require_db_url(config)
+
+    if args.mode == "proof_of_posting":
+        return _emit_error(
+            "REAL_WORKER_NOT_WIRED",
+            "proof_of_posting is not wired into scheduler.run-job yet; the "
+            "current default pipeline uses stub worker steps and would not "
+            "perform real device automation safely.",
+        )
 
     level = args.log_level.upper()
     logging.basicConfig(

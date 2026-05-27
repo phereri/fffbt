@@ -191,6 +191,44 @@ class TestDispatcher:
         assert result.returncode == 2
         assert "direct Postgres connection" in result.stderr
 
+    def test_run_job_accepts_mode_and_json_but_rejects_management_api(self):
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k != "SUPABASE_DB_URL"}
+        env["PYTHONPATH"] = f"{REPO_ROOT}/src"
+        env["SUPABASE_PAT"] = "sbp_test_token"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli", "run-job",
+                "00000000-0000-0000-0000-000000000000",
+                "--mode", "proof_of_posting",
+                "--via-management-api", "--project-ref", "test-ref",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "unrecognized arguments" not in result.stderr
+        assert "DIRECT_DB_REQUIRED" in result.stdout
+
+    def test_run_job_proof_of_posting_refuses_stub_pipeline(self):
+        env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "scheduler.cli", "run-job",
+                "00000000-0000-0000-0000-000000000000",
+                "--mode", "proof_of_posting",
+                "--db-url", "postgresql://example.invalid/postgres",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "REAL_WORKER_NOT_WIRED" in result.stdout
+
     def test_subcommand_help(self):
         env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
         for cmd in ("create-job", "run-launcher", "run-job", "status"):
