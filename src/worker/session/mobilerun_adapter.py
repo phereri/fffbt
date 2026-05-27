@@ -8,6 +8,7 @@ behind the MobileWorker interface.
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import os
@@ -35,14 +36,17 @@ class MobilerunWorker(MobileWorker):
         genfarmer_url: str = "http://127.0.0.1:55554",
         config_overrides: dict[str, Any] | None = None,
         adb_fallback: bool = True,
+        use_tcp: bool | None = None,
     ) -> None:
         self._device_serial = device_serial
         self._genfarmer_url = genfarmer_url.rstrip("/")
         self._config_overrides = config_overrides or {}
         self._adb_fallback = adb_fallback
+        self._use_tcp = _truthy(os.environ.get("MOBILERUN_USE_TCP", "1")) if use_tcp is None else use_tcp
         self._connected = False
         self._user_id: str | None = None
         self._actions_log: list[dict[str, Any]] = []
+        self._driver: Any | None = None
 
     @property
     def device_serial(self) -> str:
@@ -62,6 +66,7 @@ class MobilerunWorker(MobileWorker):
 
     def disconnect(self) -> None:
         self._connected = False
+        self._driver = None
         self._log_action("disconnect")
 
     # --- screen inspection ---
@@ -69,13 +74,7 @@ class MobilerunWorker(MobileWorker):
     def screenshot(self, label: str = "") -> bytes:
         self._ensure_connected()
         try:
-            resp = self._api_post(
-                "/automation/screenshot",
-                {"deviceSerial": self._device_serial},
-            )
-            raw = resp.get("data", b"")
-            if isinstance(raw, str):
-                raw = base64.b64decode(raw)
+            raw = self._mobilerun_screenshot()
         except Exception as e:
             if not self._adb_fallback:
                 raise
@@ -87,11 +86,7 @@ class MobilerunWorker(MobileWorker):
     def page_source(self) -> str:
         self._ensure_connected()
         try:
-            resp = self._api_post(
-                "/automation/page_source",
-                {"deviceSerial": self._device_serial},
-            )
-            source = resp.get("data", "")
+            source = self._mobilerun_page_source()
             if not self._source_has_nodes(str(source)):
                 raise RuntimeError("empty page_source")
         except Exception as e:
@@ -107,10 +102,7 @@ class MobilerunWorker(MobileWorker):
     def tap(self, x: int, y: int) -> None:
         self._ensure_connected()
         try:
-            self._api_post(
-                "/automation/tap",
-                {"deviceSerial": self._device_serial, "x": x, "y": y},
-            )
+            self._mobilerun_tap(x, y)
         except Exception as e:
             if not self._adb_fallback:
                 raise
@@ -121,15 +113,7 @@ class MobilerunWorker(MobileWorker):
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         self._ensure_connected()
         try:
-            self._api_post(
-                "/automation/swipe",
-                {
-                    "deviceSerial": self._device_serial,
-                    "x1": x1, "y1": y1,
-                    "x2": x2, "y2": y2,
-                    "durationMs": duration_ms,
-                },
-            )
+            self._mobilerun_swipe(x1, y1, x2, y2, duration_ms)
         except Exception as e:
             if not self._adb_fallback:
                 raise
@@ -142,10 +126,7 @@ class MobilerunWorker(MobileWorker):
     def type_text(self, text: str) -> None:
         self._ensure_connected()
         try:
-            self._api_post(
-                "/automation/type",
-                {"deviceSerial": self._device_serial, "text": text},
-            )
+            self._mobilerun_type_text(text)
         except Exception as e:
             if not self._adb_fallback:
                 raise
@@ -269,6 +250,7 @@ class MobilerunWorker(MobileWorker):
             "activity": activity,
             "ui_tree_available": node_count > 0,
             "ui_tree_count": node_count,
+            "source": "mobilerun_tcp" if self._use_tcp else "mobilerun",
         }
         self._log_action("preflight_ui_tree", result)
         return result
@@ -319,6 +301,53 @@ class MobilerunWorker(MobileWorker):
                 ) from e
             raise
         return json.loads(resp.read())
+
+    def _await_if_needed(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            import asyncio
+
+            return asyncio.run(value)
+        return value
+
+    def _mobilerun_driver(self) -> Any:
+        if self._driver is not None:
+            return self._driver
+        try:
+            from mobilerun import AndroidDriver
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("mobilerun is not installed") from exc
+        driver = AndroidDriver(serial=self._device_serial, use_tcp=self._use_tcp)
+        self._await_if_needed(driver.connect())
+        self._driver = driver
+        self._log_action("mobilerun_connect", {"use_tcp": self._use_tcp})
+        return driver
+
+    def _mobilerun_page_source(self) -> str:
+        payload = self._await_if_needed(self._mobilerun_driver().get_ui_tree())
+        source = json.dumps(payload, ensure_ascii=False)
+        self._log_action("mobilerun_page_source", {"use_tcp": self._use_tcp, "length": len(source)})
+        return source
+
+    def _mobilerun_screenshot(self) -> bytes:
+        raw = self._await_if_needed(self._mobilerun_driver().screenshot())
+        if isinstance(raw, str):
+            return base64.b64decode(raw)
+        return bytes(raw or b"")
+
+    def _mobilerun_tap(self, x: int, y: int) -> None:
+        self._await_if_needed(self._mobilerun_driver().tap(int(x), int(y)))
+
+    def _mobilerun_swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int) -> None:
+        self._await_if_needed(
+            self._mobilerun_driver().swipe(
+                int(x1), int(y1), int(x2), int(y2), duration_ms=float(duration_ms)
+            )
+        )
+
+    def _mobilerun_type_text(self, text: str) -> None:
+        ok = self._await_if_needed(self._mobilerun_driver().input_text(text))
+        if ok is False:
+            raise RuntimeError("mobilerun input_text returned false")
 
     def _adb_path(self) -> str:
         return os.environ.get("ADB_PATH", "adb")
@@ -414,3 +443,7 @@ class MobilerunWorker(MobileWorker):
             count = 1 if any(key in data for key in node_keys) else 0
             return count + sum(self._json_node_count(value) for value in data.values())
         return 0
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}

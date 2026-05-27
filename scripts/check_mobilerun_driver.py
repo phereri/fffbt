@@ -27,6 +27,8 @@ def _tree_len(payload: Any) -> int:
         tree = payload.get("a11y_tree")
         if isinstance(tree, list):
             return len(tree)
+        if isinstance(tree, dict):
+            return _count_tree_nodes(tree)
         inner = payload.get("result")
         if isinstance(inner, str):
             try:
@@ -38,6 +40,15 @@ def _tree_len(payload: Any) -> int:
             if isinstance(tree, list):
                 return len(tree)
     return 0
+
+
+def _count_tree_nodes(node: Any) -> int:
+    if isinstance(node, list):
+        return sum(_count_tree_nodes(item) for item in node)
+    if not isinstance(node, dict):
+        return 0
+    children = node.get("children") or []
+    return 1 + _count_tree_nodes(children)
 
 
 def _phone_state(payload: Any) -> dict[str, Any]:
@@ -78,7 +89,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--use-tcp",
         action="store_true",
-        help="Pass use_tcp=True to AndroidDriver. Default is False, matching the imported farm code.",
+        default=os.environ.get("MOBILERUN_USE_TCP", "1").strip().lower() not in {"0", "false", "no", "off"},
+        help="Pass use_tcp=True to AndroidDriver. Default is true; disable with --no-use-tcp.",
+    )
+    parser.add_argument(
+        "--no-use-tcp",
+        action="store_false",
+        dest="use_tcp",
+        help="Pass use_tcp=False to AndroidDriver for diagnostics only.",
     )
     parser.add_argument(
         "--artifacts-dir",

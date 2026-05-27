@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import base64
 import json
+import sys
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import Any
@@ -83,48 +84,54 @@ def test_screenshot(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
     png_data = b"\x89PNG\r\n\x1a\nfakedata"
-    handler.responses[("POST", "/automation/screenshot")] = {
-        "data": base64.b64encode(png_data).decode()
-    }
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    worker._mobilerun_screenshot = lambda: png_data
     result = worker.screenshot(label="test_capture")
     assert result == png_data
 
 
-def test_page_source(mock_server):
+def test_page_source_uses_mobilerun_tcp(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
-    handler.responses[("POST", "/automation/page_source")] = {
-        "data": "<hierarchy><node /></hierarchy>"
-    }
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    worker._mobilerun_page_source = lambda: json.dumps({
+        "a11y_tree": {
+            "className": "android.widget.FrameLayout",
+            "children": [{"text": "Home", "className": "android.widget.TextView"}],
+        }
+    })
     source = worker.page_source()
-    assert "<hierarchy>" in source
+    assert "Home" in source
+    assert worker._use_tcp is True
 
 
 def test_tap(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
-    handler.responses[("POST", "/automation/tap")] = {"ok": True}
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    calls = []
+    worker._mobilerun_tap = lambda x, y: calls.append((x, y))
     worker.tap(100, 200)
+    assert calls == [(100, 200)]
     assert any(a["action"] == "tap" for a in worker.actions_log)
 
 
 def test_swipe(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
-    handler.responses[("POST", "/automation/swipe")] = {"ok": True}
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    calls = []
+    worker._mobilerun_swipe = lambda *args: calls.append(args)
     worker.swipe(100, 1500, 100, 500, duration_ms=400)
+    assert calls == [(100, 1500, 100, 500, 400)]
     log = next(a for a in worker.actions_log if a["action"] == "swipe")
     assert log["details"]["x1"] == 100
 
@@ -132,11 +139,13 @@ def test_swipe(mock_server):
 def test_type_text(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
-    handler.responses[("POST", "/automation/type")] = {"ok": True}
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    calls = []
+    worker._mobilerun_type_text = lambda text: calls.append(text)
     worker.type_text("hello world")
+    assert calls == ["hello world"]
     log = next(a for a in worker.actions_log if a["action"] == "type_text")
     assert log["details"]["length"] == 11
 
@@ -197,21 +206,21 @@ def test_actions_not_connected():
 def test_actions_log_records_all(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
-    handler.responses[("POST", "/automation/tap")] = {"ok": True}
-    handler.responses[("POST", "/automation/page_source")] = {"data": "<x/>"}
 
     worker = MobilerunWorker("DEV", genfarmer_url=url)
     worker.connect()
+    worker._mobilerun_tap = lambda x, y: None
+    worker._mobilerun_page_source = lambda: '<hierarchy><node text="x" /></hierarchy>'
     worker.tap(10, 20)
     worker.page_source()
     actions = [a["action"] for a in worker.actions_log]
     assert actions == ["connect", "tap", "page_source"]
 
 
-def test_page_source_falls_back_to_adb_on_empty_api(monkeypatch):
+def test_page_source_falls_back_to_adb_on_empty_mobilerun(monkeypatch):
     worker = MobilerunWorker("DEV")
     worker._connected = True
-    monkeypatch.setattr(worker, "_api_post", lambda *args, **kwargs: {"data": ""})
+    monkeypatch.setattr(worker, "_mobilerun_page_source", lambda: "")
     monkeypatch.setattr(
         worker,
         "_adb_page_source",
@@ -233,7 +242,7 @@ def test_screenshot_falls_back_to_adb_on_api_error(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("api unavailable")
 
-    monkeypatch.setattr(worker, "_api_post", fail)
+    monkeypatch.setattr(worker, "_mobilerun_screenshot", fail)
     monkeypatch.setattr(worker, "_adb_screenshot", lambda: b"\x89PNG\r\n\x1a\nadb")
 
     assert worker.screenshot("fallback") == b"\x89PNG\r\n\x1a\nadb"
@@ -248,13 +257,55 @@ def test_tap_falls_back_to_adb_on_api_error(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("api unavailable")
 
-    monkeypatch.setattr(worker, "_api_post", fail)
+    monkeypatch.setattr(worker, "_mobilerun_tap", fail)
     monkeypatch.setattr(worker, "_adb_shell", lambda command, **kwargs: shell_calls.append(command) or "")
 
     worker.tap(10, 20)
 
     assert shell_calls == ["input tap 10 20"]
     assert any(a["action"] == "tap" for a in worker.actions_log)
+
+
+def test_mobilerun_driver_uses_tcp_by_default(monkeypatch):
+    created = {}
+
+    class FakeDriver:
+        def __init__(self, serial, use_tcp):
+            created["serial"] = serial
+            created["use_tcp"] = use_tcp
+
+        def connect(self):
+            return None
+
+    fake_module = types.ModuleType("mobilerun")
+    fake_module.AndroidDriver = FakeDriver
+    monkeypatch.setitem(sys.modules, "mobilerun", fake_module)
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+
+    assert worker._mobilerun_driver() is not None
+    assert created == {"serial": "DEV", "use_tcp": True}
+
+
+def test_mobilerun_driver_honors_tcp_env_disabled(monkeypatch):
+    created = {}
+
+    class FakeDriver:
+        def __init__(self, serial, use_tcp):
+            created["use_tcp"] = use_tcp
+
+        def connect(self):
+            return None
+
+    monkeypatch.setenv("MOBILERUN_USE_TCP", "0")
+    fake_module = types.ModuleType("mobilerun")
+    fake_module.AndroidDriver = FakeDriver
+    monkeypatch.setitem(sys.modules, "mobilerun", fake_module)
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+
+    worker._mobilerun_driver()
+    assert created["use_tcp"] is False
 
 
 def test_preflight_ui_tree_reports_node_count(monkeypatch):
