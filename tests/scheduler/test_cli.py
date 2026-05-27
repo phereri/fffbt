@@ -239,9 +239,9 @@ class TestDispatcher:
 
         with (
             patch("scheduler.cli._run_job", new_callable=AsyncMock) as mock_run_job,
-            patch("scheduler.cli.asyncio.run") as mock_asyncio_run,
+            patch("scheduler.cli._run_async") as mock_run_async,
         ):
-            mock_asyncio_run.side_effect = lambda coro: coro.close()
+            mock_run_async.side_effect = lambda coro: coro.close()
             rc = cmd_run_job([
                 job_id,
                 "--mode", "proof_of_posting",
@@ -255,6 +255,7 @@ class TestDispatcher:
             job_id,
             "proof_of_posting",
         )
+        mock_run_async.assert_called_once()
 
     def test_subcommand_help(self):
         env = {**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"}
