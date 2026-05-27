@@ -281,30 +281,46 @@ def verify_caption_text(
 # ---------------------------------------------------------------------------
 
 _ADB_KEYBOARD_COMPONENT = "com.android.adbkeyboard/.AdbIME"
+_MOBILERUN_KEYBOARD_COMPONENT = "com.mobilerun.portal/.input.MobilerunKeyboardIME"
 
 
-async def _adb_keyboard_ensure_active(serial: str) -> str | None:
-    """Switch default IME to ADB Keyboard. Returns previous IME if switched."""
+async def _keyboard_ensure_active(serial: str) -> tuple[str | None, str | None]:
+    """Switch default IME to a machine-input keyboard.
+
+    Returns ``(previous_ime, active_kind)``. MobileRun Portal's IME is preferred
+    because the current VPS path already requires MobileRun TCP/Portal and the
+    legacy ADB Keyboard component is not installed on all validation phones.
+    """
     try:
         prev = (
             await shell(serial, "settings get secure default_input_method", timeout=5)
         ).strip()
     except Exception:
-        return None
-    if "adbkeyboard" in prev.lower():
-        return None
-    try:
-        await shell(serial, f"ime enable {_ADB_KEYBOARD_COMPONENT}", timeout=10)
-        await shell(serial, f"ime set {_ADB_KEYBOARD_COMPONENT}", timeout=10)
-        await asyncio.sleep(0.35)
-        cur = (
-            await shell(serial, "settings get secure default_input_method", timeout=5)
-        ).strip()
-        if "adbkeyboard" not in cur.lower():
-            return None
-    except Exception:
-        return None
-    return prev if prev else None
+        return None, None
+
+    prev_lower = prev.lower()
+    if "mobilerun" in prev_lower:
+        return None, "mobilerun"
+    if "adbkeyboard" in prev_lower:
+        return None, "adbkeyboard"
+
+    for component, marker, kind in (
+        (_MOBILERUN_KEYBOARD_COMPONENT, "mobilerun", "mobilerun"),
+        (_ADB_KEYBOARD_COMPONENT, "adbkeyboard", "adbkeyboard"),
+    ):
+        try:
+            await shell(serial, f"ime enable {component}", timeout=10)
+            await shell(serial, f"ime set {component}", timeout=10)
+            await asyncio.sleep(0.35)
+            cur = (
+                await shell(serial, "settings get secure default_input_method", timeout=5)
+            ).strip()
+            if marker in cur.lower():
+                return (prev if prev else None), kind
+        except Exception:
+            continue
+
+    return None, None
 
 
 async def _adb_keyboard_restore(serial: str, previous: str | None) -> None:
@@ -314,6 +330,21 @@ async def _adb_keyboard_restore(serial: str, previous: str | None) -> None:
         await shell(serial, f"ime set {shlex.quote(previous.strip())}", timeout=10)
     except Exception:
         pass
+
+
+async def _mobilerun_keyboard_input(serial: str, encoded_text: str, *, clear: bool) -> bool:
+    """Input base64 text through MobileRun Portal's keyboard provider."""
+    clear_str = "true" if clear else "false"
+    cmd = (
+        'content insert --uri "content://com.mobilerun.portal/keyboard/input" '
+        f'--bind base64_text:s:"{encoded_text}" '
+        f"--bind clear:b:{clear_str}"
+    )
+    try:
+        await shell(serial, cmd, timeout=10)
+    except Exception:
+        return False
+    return True
 
 
 async def _focus_caption_field(
@@ -357,7 +388,8 @@ async def paste_text(
     """Paste full text into a field.
 
     Focuses the target field (by resource_id or IG caption auto-detection),
-    then pastes via ADB_INPUT_B64 (ADB Keyboard broadcast).
+    then inputs via MobileRun Portal keyboard when available. Falls back to the
+    legacy ADB_INPUT_B64 broadcast for older devices with ADB Keyboard.
 
     Set ``focus_caption=True`` for Instagram Trial Reel Share caption field
     (resolves via caption_input_text_view + "Write a caption" hint).
@@ -383,8 +415,12 @@ async def paste_text(
         await asyncio.sleep(0.55)
 
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    prev_ime = await _adb_keyboard_ensure_active(serial)
+    prev_ime, keyboard_kind = await _keyboard_ensure_active(serial)
     try:
+        if keyboard_kind == "mobilerun":
+            if await _mobilerun_keyboard_input(serial, encoded, clear=clear):
+                return ToolResult.ok(f"pasted {len(text)} chars via MobileRun keyboard")
+
         try:
             out = await shell(
                 serial,
@@ -396,7 +432,7 @@ async def paste_text(
         except Exception:
             pass
 
-        return ToolResult.fail("paste_text: ADB_INPUT_B64 failed or incomplete")
+        return ToolResult.fail("paste_text: MobileRun keyboard/ADB_INPUT_B64 failed")
     finally:
         await _adb_keyboard_restore(serial, prev_ime)
 

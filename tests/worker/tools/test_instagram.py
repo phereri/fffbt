@@ -334,9 +334,9 @@ class TestHideIme:
 class TestPasteText:
     @patch("src.worker.tools.instagram._adb_keyboard_restore", new_callable=AsyncMock)
     @patch(
-        "src.worker.tools.instagram._adb_keyboard_ensure_active",
+        "src.worker.tools.instagram._keyboard_ensure_active",
         new_callable=AsyncMock,
-        return_value=None,
+        return_value=(None, None),
     )
     @patch("src.worker.tools.instagram.shell", new_callable=AsyncMock)
     def test_empty_text(self, mock_shell, mock_ensure, mock_restore):
@@ -346,12 +346,12 @@ class TestPasteText:
 
     @patch("src.worker.tools.instagram._adb_keyboard_restore", new_callable=AsyncMock)
     @patch(
-        "src.worker.tools.instagram._adb_keyboard_ensure_active",
+        "src.worker.tools.instagram._keyboard_ensure_active",
         new_callable=AsyncMock,
-        return_value=None,
+        return_value=(None, "adbkeyboard"),
     )
     @patch("src.worker.tools.instagram.shell", new_callable=AsyncMock)
-    def test_successful_paste(self, mock_shell, mock_ensure, mock_restore):
+    def test_successful_paste_legacy_adb_keyboard(self, mock_shell, mock_ensure, mock_restore):
         mock_shell.return_value = "Broadcasting: ...\nBroadcast completed: result=0"
         result = asyncio.run(
             paste_text("DEV001", "Hello world", ui_nodes=[])
@@ -360,13 +360,35 @@ class TestPasteText:
         assert "ADB_INPUT_B64" in result.message
 
     @patch("src.worker.tools.instagram._adb_keyboard_restore", new_callable=AsyncMock)
+    @patch("src.worker.tools.instagram._mobilerun_keyboard_input", new_callable=AsyncMock)
     @patch(
-        "src.worker.tools.instagram._adb_keyboard_ensure_active",
+        "src.worker.tools.instagram._keyboard_ensure_active",
         new_callable=AsyncMock,
-        return_value="com.mobilerun.portal/.IME",
+        return_value=(None, "mobilerun"),
     )
     @patch("src.worker.tools.instagram.shell", new_callable=AsyncMock)
-    def test_restores_ime(self, mock_shell, mock_ensure, mock_restore):
-        mock_shell.return_value = "Broadcast completed: result=0"
+    def test_successful_paste_mobilerun_keyboard(
+        self, mock_shell, mock_ensure, mock_mobilerun_input, mock_restore
+    ):
+        mock_mobilerun_input.return_value = True
+        result = asyncio.run(paste_text("DEV001", "Hello world", ui_nodes=[]))
+        assert result.success
+        assert "MobileRun keyboard" in result.message
+        mock_mobilerun_input.assert_called_once()
+        mock_shell.assert_not_called()
+
+    @patch("src.worker.tools.instagram._adb_keyboard_restore", new_callable=AsyncMock)
+    @patch(
+        "src.worker.tools.instagram._keyboard_ensure_active",
+        new_callable=AsyncMock,
+        return_value=("com.android.inputmethod.latin/.LatinIME", "mobilerun"),
+    )
+    @patch(
+        "src.worker.tools.instagram._mobilerun_keyboard_input",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    @patch("src.worker.tools.instagram.shell", new_callable=AsyncMock)
+    def test_restores_ime(self, mock_shell, mock_mobilerun_input, mock_ensure, mock_restore):
         asyncio.run(paste_text("DEV001", "text", ui_nodes=[]))
-        mock_restore.assert_called_once_with("DEV001", "com.mobilerun.portal/.IME")
+        mock_restore.assert_called_once_with("DEV001", "com.android.inputmethod.latin/.LatinIME")
