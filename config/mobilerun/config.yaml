@@ -1,0 +1,143 @@
+# =============================================================================
+# fffbt-mobilerun :: Mobilerun MobileConfig
+# Local-first setup for the fffbt device farm (Instagram Trial Reels MVP).
+#
+# Conventions:
+# - All agents work strictly off the UI-tree (vision: false). Vision is reserved
+#   as an emergency fallback you switch on per-run via overrides.
+# - Reasoning mode is enabled: Manager plans, Executor performs.
+# - Stealth is on globally. Coordinate-based tools (click_at, click_area,
+#   long_press_at) stay disabled - Mobilerun's default.
+# - Trajectories are saved per action so we can audit / build CRM viewer.
+# - LLM profiles: default ShopAIKey Gemini (OpenAI /v1). Set FARM_USE_CLAUDE_TRAJECTORY=1
+#   for Mobilerun manager/executor trajectories via Claude (Anthropic / ShopAIKey).
+#   Model IDs: config/mobilerun/shopaikey_models.yaml.
+#   Provider names follow Mobilerun (GoogleGenAI, Anthropic, OpenAI, ...).
+# =============================================================================
+
+_version: 5
+
+agent:
+  name: mobilerun
+  max_steps: 40
+  reasoning: true
+  streaming: true
+  vision_only: false
+  after_sleep_action: 1.0
+  wait_for_stable_ui: 0.5
+  use_normalized_coordinates: false
+
+  fast_agent:
+    vision: false
+    parallel_tools: true
+
+  manager:
+    vision: false
+    stateless: false
+
+  executor:
+    vision: false
+
+  app_cards:
+    enabled: true
+    mode: local
+    app_cards_dir: config/mobilerun/app_cards
+
+# -----------------------------------------------------------------------------
+# LLM profiles. Mobilerun picks profile by role name; everything defaults to
+# Gemini. To switch, change `provider`/`model` in just one block.
+# -----------------------------------------------------------------------------
+llm_profiles:
+  default:
+    provider: OpenAILike
+    model: gemini-2.5-flash
+    temperature: 0.2
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  manager:
+    provider: OpenAILike
+    model: gemini-2.5-flash
+    temperature: 0.2
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  executor:
+    provider: OpenAILike
+    model: gemini-2.5-flash
+    temperature: 0.1
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  fast_agent:
+    provider: OpenAILike
+    model: gemini-2.5-flash-lite
+    temperature: 0.1
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  vision:
+    provider: OpenAILike
+    model: gemini-2.5-flash
+    temperature: 0.2
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  app_opener:
+    provider: OpenAILike
+    model: gemini-2.5-flash-lite
+    temperature: 0.0
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+  structured_output:
+    provider: OpenAILike
+    model: gemini-2.5-flash
+    temperature: 0.0
+    api_key_source: env
+    base_url: https://api.shopaikey.com/v1
+    provider_family: openai
+
+# -----------------------------------------------------------------------------
+# Device defaults. Per-task overrides happen in the runner (serial = device IP).
+# -----------------------------------------------------------------------------
+device:
+  serial: null
+  control_backend: null
+  device_id: auto
+  use_tcp: true
+  platform: android
+  auto_setup: false
+
+telemetry:
+  enabled: true
+
+tracing:
+  enabled: false
+  provider: phoenix
+
+logging:
+  debug: false
+  save_trajectory: action
+  trajectory_path: trajectories
+  rich_text: false
+  trajectory_gifs: true
+
+tools:
+  stealth: true
+  disabled_tools:
+    - click_at
+    - click_area
+    - long_press_at
+
+credentials:
+  enabled: false
+  file_path: config/mobilerun/credentials.yaml
+
+external_agents: {}

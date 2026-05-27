@@ -1,0 +1,13 @@
+# Optional per-platform defaults merged before per-task ``overrides``.
+# Keys: default, instagram, ... (any logical platform name).
+# Values mirror ``MobileConfig`` fragments after ``_flatten_shortcuts`` -
+# you may use nested ``agent`` / ``tools`` blocks OR flat shortcuts like
+# ``stealth: true`` / ``max_steps: 30``.
+
+default: {}
+
+instagram:
+  stealth: true
+  max_steps: 25
+  manager_vision: false
+  executor_vision: false
