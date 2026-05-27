@@ -22,6 +22,9 @@ REPO_ROOT = subprocess.check_output(
 ).strip()
 MIGRATIONS_DIR = f"{REPO_ROOT}/supabase/migrations"
 SEED_FILE = f"{REPO_ROOT}/supabase/seed.sql"
+sys.path.insert(0, f"{REPO_ROOT}/src")
+
+from scheduler.cli import _targeted_create_job_sql
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +150,15 @@ class TestDispatcher:
         )
         assert result.returncode == 2
         assert "--account-id must be a UUID" in result.stderr
+
+    def test_targeted_create_job_sql_is_self_contained(self):
+        sql = _targeted_create_job_sql("100.110.232.89:5555")
+        assert "find_eligible_account" not in sql
+        assert "reserve_next_video" not in sql
+        assert "reserve_physical_device" not in sql
+        assert "automation.accounts" in sql
+        assert "automation.physical_devices" in sql
+        assert "100.110.232.89:5555" in sql
 
     def test_run_launcher_rejects_management_api(self):
         env = {k: v for k, v in __import__("os").environ.items()

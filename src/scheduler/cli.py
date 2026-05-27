@@ -175,9 +175,22 @@ target_device AS (
     FOR UPDATE SKIP LOCKED
 ),
 eligible_account AS (
-    SELECT ea.account_id, ea.environment_id
-    FROM automation.find_eligible_account() ea, requested r
-    WHERE r.account_id IS NULL OR ea.account_id = r.account_id
+    SELECT a.id AS account_id, ae.id AS environment_id
+    FROM automation.accounts a
+    JOIN automation.account_environments ae ON ae.account_id = a.id
+    JOIN automation.proxies p ON p.id = ae.proxy_id AND p.status = 'active'
+    JOIN automation.device_profiles dp ON dp.id = ae.device_profile_id AND dp.status = 'active'
+    JOIN automation.gps_locations gl ON gl.id = ae.gps_location_id AND gl.status = 'active'
+    JOIN automation.app_states aps ON aps.id = ae.app_state_id AND aps.status = 'active'
+    CROSS JOIN requested r
+    WHERE a.status = 'active'
+      AND (r.account_id IS NULL OR a.id = r.account_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM automation.jobs j
+          WHERE j.account_id = a.id
+            AND j.status NOT IN ('done', 'failed', 'cancelled')
+      )
+    ORDER BY a.updated_at ASC NULLS FIRST
     LIMIT 1
 ),
 candidate_video AS (
