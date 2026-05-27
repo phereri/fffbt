@@ -111,8 +111,8 @@ class VideoPreparationStep:
         cleanup_paths: list[Path],
     ) -> Path | None:
         if local_video_path:
-            p = Path(local_video_path).expanduser().resolve()
-            if p.is_file():
+            p = Path(os.path.abspath(os.path.expanduser(local_video_path)))
+            if os.path.isfile(p):
                 return p
             return None
 

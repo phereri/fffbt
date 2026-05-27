@@ -167,3 +167,73 @@ def test_actions_log_records_all(mock_server):
     worker.page_source()
     actions = [a["action"] for a in worker.actions_log]
     assert actions == ["connect", "tap", "page_source"]
+
+
+def test_page_source_falls_back_to_adb_on_empty_api(monkeypatch):
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+    monkeypatch.setattr(worker, "_api_post", lambda *args, **kwargs: {"data": ""})
+    monkeypatch.setattr(
+        worker,
+        "_adb_page_source",
+        lambda: '<hierarchy><node text="Instagram" /></hierarchy>',
+    )
+
+    source = worker.page_source()
+
+    assert "Instagram" in source
+    actions = [a["action"] for a in worker.actions_log]
+    assert "adb_fallback" in actions
+    assert actions[-1] == "page_source"
+
+
+def test_screenshot_falls_back_to_adb_on_api_error(monkeypatch):
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("api unavailable")
+
+    monkeypatch.setattr(worker, "_api_post", fail)
+    monkeypatch.setattr(worker, "_adb_screenshot", lambda: b"\x89PNG\r\n\x1a\nadb")
+
+    assert worker.screenshot("fallback") == b"\x89PNG\r\n\x1a\nadb"
+    assert any(a["details"]["operation"] == "screenshot" for a in worker.actions_log if a["action"] == "adb_fallback")
+
+
+def test_tap_falls_back_to_adb_on_api_error(monkeypatch):
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+    shell_calls = []
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("api unavailable")
+
+    monkeypatch.setattr(worker, "_api_post", fail)
+    monkeypatch.setattr(worker, "_adb_shell", lambda command, **kwargs: shell_calls.append(command) or "")
+
+    worker.tap(10, 20)
+
+    assert shell_calls == ["input tap 10 20"]
+    assert any(a["action"] == "tap" for a in worker.actions_log)
+
+
+def test_preflight_ui_tree_reports_node_count(monkeypatch):
+    worker = MobilerunWorker("DEV")
+    worker._connected = True
+    monkeypatch.setattr(
+        worker,
+        "_adb_shell",
+        lambda command, **kwargs: "topResumedActivity=ActivityRecord{ com.instagram.android/.MainActivity }",
+    )
+    monkeypatch.setattr(
+        worker,
+        "page_source",
+        lambda: '<hierarchy><node text="A" /><node text="B" /></hierarchy>',
+    )
+
+    result = worker.preflight_ui_tree()
+
+    assert result["ui_tree_available"] is True
+    assert result["ui_tree_count"] == 2
+    assert "com.instagram.android" in result["activity"]
