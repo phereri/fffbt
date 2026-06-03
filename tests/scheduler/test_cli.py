@@ -185,6 +185,29 @@ class TestDispatcher:
         assert "v.google_drive_file_id IS NULL" in sql
         assert "v.local_video_path IS NOT NULL" in sql
 
+    def test_targeted_create_job_sql_excludes_validation_account_by_default(self):
+        """Without --account-id, the targeted path must skip is_validation rows."""
+        sql = _targeted_create_job_sql("100.110.232.89:5555")
+        assert "is_validation" in sql
+        # Sanity-check: the guard sits inside the eligible_account CTE so the
+        # generic targeted path (no account pinned) ignores placeholders.
+        assert "COALESCE(a.is_validation, false) = false" in sql
+
+    def test_targeted_create_job_sql_allows_pinned_validation_account(self):
+        """With --account-id, the guard must opt back in to validation accounts."""
+        account_id = "00000000-0000-0000-0000-000000000abc"
+        sql = _targeted_create_job_sql(
+            "100.110.232.89:5555", account_id=account_id
+        )
+        assert account_id in sql
+        # The guard is gated on r.account_id IS NOT NULL, so a pinned ID skips it.
+        assert "r.account_id IS NOT NULL" in sql
+
+    def test_cleanup_job_is_registered(self):
+        from scheduler.cli import COMMANDS
+        assert "cleanup-job" in COMMANDS
+        assert "seed-validation-video" in COMMANDS
+
     def test_run_launcher_rejects_management_api(self):
         env = {k: v for k, v in __import__("os").environ.items()
                if k != "SUPABASE_DB_URL"}

@@ -259,6 +259,26 @@ assert_eq "daily limit boundary: 19 posts → eligible" \
 RESULT=$("${PSQL[@]}" -At -c "SELECT count(*) FROM automation.find_eligible_account();")
 assert_eq "no eligible accounts returns empty" "0" "$RESULT"
 
+# ---- Test 10: validation/placeholder accounts are excluded from the
+#               generic eligibility query, even if otherwise eligible.
+# Insert a fresh active account with is_validation = true and a complete
+# environment. Without the validation guard, it would be the only eligible
+# account; with the guard, the query returns nothing.
+"${PSQL[@]}" -At <<'SQL' >/dev/null
+DO $$
+DECLARE
+    id_validation uuid := 'a0000000-0000-0000-0000-0000000000aa';
+    id_env_v      uuid := 'e0000000-0000-0000-0000-0000000000aa';
+BEGIN
+    INSERT INTO automation.accounts (id, username, password, status, is_validation)
+        VALUES (id_validation, 'validation_only_acct', 'pw', 'active', true);
+    PERFORM automation._test_create_env(id_validation, id_env_v);
+END;
+$$;
+SQL
+RESULT=$("${PSQL[@]}" -At -c "SELECT count(*) FROM automation.find_eligible_account();")
+assert_eq "validation-only accounts excluded from generic eligibility" "0" "$RESULT"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 if [[ $FAIL -gt 0 ]]; then

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from src.worker.session.types import Mode, StepContext, StepName, StepStatus
+from src.worker.session.types import Artifact, Mode, StepContext, StepName, StepStatus
 from src.worker.steps.mobile_ui_automation import (
     MobileUIAutomationStep,
     _bottom_right_next,
@@ -817,6 +818,92 @@ class TestFinalOkDidNotRegister:
         assert result.status == StepStatus.NEEDS_REVIEW
         assert result.code == "final_ok_did_not_register"
         assert result.code != "share_did_not_register"
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_logged_out_hard_stop_persists_screenshot_and_ui_dump(
+        self, MockWorker, tmp_path
+    ):
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        ui_source = json.dumps([{"text": "Log in to Instagram"}])
+        w = _mock_worker()
+        w.open_app.return_value = {"status": "failed", "error": "app not loaded"}
+        # detection read + capture-helper read (after screenshot)
+        w.page_source.side_effect = [ui_source, ui_source]
+        w.screenshot.return_value = png_bytes
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep(artifacts_dir=str(tmp_path))
+        result = run(
+            step.run(_ctx(), device_serial="DEV001", caption_text="cap")
+        )
+
+        assert result.status == StepStatus.FAILED
+        assert result.code == "logged_out"
+
+        artifacts_dir = tmp_path / "mobile_ui" / "j1"
+        pngs = list(artifacts_dir.glob("hard_stop_logged_out_*.png"))
+        ui_dumps = list(artifacts_dir.glob("hard_stop_logged_out_*.ui.json"))
+        assert len(pngs) == 1 and pngs[0].read_bytes() == png_bytes
+        assert len(ui_dumps) == 1
+        assert "Log in to Instagram" in ui_dumps[0].read_text()
+
+        kinds = {a.artifact_type for a in result.artifacts}
+        labels = {a.label for a in result.artifacts}
+        assert "screenshot" in kinds and "ui_dump" in kinds
+        assert {"hard_stop_logged_out"} == labels
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_action_blocked_hard_stop_persists_artifacts(
+        self, MockWorker, tmp_path
+    ):
+        png_bytes = b"\x89PNGblocked"
+        ui_source = json.dumps(
+            [{"text": "Action blocked. We restrict certain activity."}]
+        )
+        w = _mock_worker()
+        w.page_source.side_effect = [ui_source, ui_source]
+        w.screenshot.return_value = png_bytes
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep(artifacts_dir=str(tmp_path))
+        result = run(
+            step.run(_ctx(), device_serial="DEV001", caption_text="cap")
+        )
+
+        assert result.code == "action_blocked"
+        artifacts_dir = tmp_path / "mobile_ui" / "j1"
+        assert list(artifacts_dir.glob("hard_stop_action_blocked_*.png"))
+        assert list(artifacts_dir.glob("hard_stop_action_blocked_*.ui.json"))
+        assert any(
+            a.artifact_type == "screenshot" for a in result.artifacts
+        )
+
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_hard_stop_artifact_capture_failure_does_not_break_result(
+        self, MockWorker, tmp_path
+    ):
+        ui_source = json.dumps([{"text": "Log in to Instagram"}])
+        w = _mock_worker()
+        w.open_app.return_value = {"status": "failed"}
+        w.page_source.side_effect = [ui_source, ui_source]
+        # screenshot raises -> helper swallows; result must still be the
+        # hard-stop fail.
+        w.screenshot.side_effect = RuntimeError("driver disconnected")
+        MockWorker.return_value = w
+
+        step = MobileUIAutomationStep(artifacts_dir=str(tmp_path))
+        result = run(
+            step.run(_ctx(), device_serial="DEV001", caption_text="cap")
+        )
+
+        assert result.status == StepStatus.FAILED
+        assert result.code == "logged_out"
+        # UI dump still written even when the screenshot failed.
+        artifacts_dir = tmp_path / "mobile_ui" / "j1"
+        assert list(artifacts_dir.glob("hard_stop_logged_out_*.ui.json"))
+        assert not list(artifacts_dir.glob("hard_stop_logged_out_*.png"))
+        assert any(a.artifact_type == "ui_dump" for a in result.artifacts)
+        assert not any(a.artifact_type == "screenshot" for a in result.artifacts)
 
     @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
     @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")

@@ -1,9 +1,9 @@
 # MVP rollout runbook
 
-- Status: draft (MVP)
+- Status: draft (MVP, pre-account-login)
 - Owner: Architect / Tech Lead
 - Audience: a single human operator
-- Last updated: 2026-06-03
+- Last updated: 2026-06-03 (post-PR #61)
 
 This runbook drives the staged rollout of the Instagram Trial Reels MVP
 from one controlled validation job to two concurrent devices. Each phase
@@ -20,7 +20,12 @@ attempt to scale.
 
 ## 0. Phase ladder
 
-1. One controlled validation job (one device, one local validation video).
+0. **Pre-account-login stage** (you are here when no Instagram account is
+   logged in on the available phone). Verify the controlled-stop path:
+   the proof job must hit `logged_out` and produce a screenshot + UI
+   dump + a `job_events` row for review. No retries, no posting.
+1. One controlled validation job (one device, one local validation video,
+   one Instagram account a human just logged in).
 2. `run-launcher --max-parallel 1 --max-jobs 1` — one job through the full
    launcher loop end-to-end.
 3. `run-launcher --max-parallel 2 --max-jobs 2` — two devices in parallel.
@@ -32,6 +37,106 @@ and no manual `cleanup-job` needed, before moving to the next.
 
 ---
 
+## 0a. Pre-account-login stage
+
+The VPS is currently in a controlled state: MobileRun TCP works, the
+phone is reachable via ADB, but no Instagram account is logged in. The
+goal of this stage is **not** to publish anything — it is to confirm
+the system safely hard-stops on `logged_out` and persists the evidence
+needed to debug it later.
+
+What is guaranteed at this stage:
+
+- The launcher's generic queue **will not** accidentally pick up
+  validation/placeholder accounts (`accounts.is_validation = true`)
+  even if they were seeded via `seed_validation_accounts.py`. The guard
+  is in `automation.find_eligible_account()`; targeted `create-job
+  --account-id <uuid>` still works for those accounts.
+- The launcher's generic queue **will not** pick up validation videos
+  (`videos.category = 'validation'` or `download_method =
+  'local_validation'`). Only `create-job --device-serial --video-id` can.
+- The proof_of_posting flow detects `logged_out` and stops with a
+  `needs_review` outcome rather than retrying or escalating. The
+  job's `device_id` and reserved `video_id` are released by the
+  pipeline cleanup step.
+- Every hard stop (`logged_out`, `action_blocked`, `login_challenge`,
+  `account_suspended`, `unexpected_destructive_dialog`) writes a
+  screenshot **and** a UI tree dump under
+  `$ARTIFACTS_DIR/mobile_ui/<job_id>/` with timestamped names like
+  `hard_stop_logged_out_20260603T091200Z.png` and `.ui.json`. The same
+  artifact references land in `automation.job_events.payload.artifacts`
+  for the failing step.
+
+### 0a.1 What "controlled stop" looks like
+
+1. `fffbt create-job --device-serial <serial> --video-id <validation-video-uuid> --account-id <validation-account-uuid>` — the only path that legitimately uses a validation account during this stage.
+2. `fffbt run-job <job_id> --mode proof_of_posting`.
+3. Expected outcome:
+   - `step_done` event for `mobile_ui_automation` with status
+     `needs_review` and code `logged_out`.
+   - `job_events.payload.artifacts` contains a screenshot and a UI
+     dump entry.
+   - Job transitions to `needs_review`, not `failed` or `done`.
+   - Device returns to `online`; the validation video may rebound to
+     `new` if the per-error retry policy is `retryable`, otherwise it
+     stays `reserved` (terminal codes do not roll back automatically).
+
+If any of those expected outcomes is missing, **stop**. Either the
+migration `20260603140000_account_validation_flag_and_device_unique.sql`
+is not applied, the worker's `ARTIFACTS_DIR` is not writable, or the
+device's actual screen does not match the hard-stop patterns in
+`src/worker/steps/mobile_ui_automation.py::_HARD_STOP_PATTERNS` — open
+an incident in `docs/reports/` before continuing.
+
+### 0a.2 What to do once an account is manually logged in
+
+1. **Open Instagram on the phone by hand** and complete the login + any
+   2FA + any "Save your login info" prompt. The session must be left in
+   a state where opening the app lands on the feed without further
+   prompts.
+2. **Verify a fresh proof job no longer hard-stops on logged_out**:
+
+   ```bash
+   PYTHONPATH=src python -m scheduler.cli create-job \
+       --device-serial <serial> \
+       --video-id <validation-video-uuid> \
+       --account-id <validation-account-uuid>
+   PYTHONPATH=src python -m scheduler.cli run-job <job_id> \
+       --mode proof_of_posting --log-level info
+   ```
+
+   Expected: the step proceeds past `_open_instagram`, navigates to the
+   share screen, fills the caption, and either reaches the final OK
+   (success path) or fails with a specific non-`logged_out` code that
+   you can then triage.
+3. **Do not** convert the placeholder validation account into a real
+   posting account. Once you have a logged-in phone, register the real
+   account via the normal account-management flow (out of scope for this
+   runbook) and clear the `is_validation` flag only on that real row.
+4. **Do not** raise `--max-parallel` past 1 until phase 1 has passed
+   twice in a row with the real account.
+
+### 0a.3 How to rerun proof_of_posting after a logged-out incident
+
+If a previous run left the job in `needs_review`:
+
+```bash
+PYTHONPATH=src python -m scheduler.cli cleanup-job <job_id>
+# re-seed targeted job for the same device + video + account:
+PYTHONPATH=src python -m scheduler.cli create-job \
+    --device-serial <serial> \
+    --video-id <validation-video-uuid> \
+    --account-id <validation-account-uuid>
+PYTHONPATH=src python -m scheduler.cli run-job <new_job_id> \
+    --mode proof_of_posting --log-level info
+```
+
+The previous run's artifacts are kept under
+`$ARTIFACTS_DIR/mobile_ui/<old_job_id>/` for as long as the operator
+chooses to keep them — `cleanup-job` does **not** delete them.
+
+---
+
 ## 1. Prerequisite checklist
 
 Tick every item before phase 1. If any item is missing or unclear,
@@ -40,7 +145,11 @@ Tick every item before phase 1. If any item is missing or unclear,
 - [ ] `SUPABASE_DB_URL` is set and points at the MVP database (not the
       legacy `fffbt` schema).
 - [ ] All migrations applied: latest is
-      `supabase/migrations/20260603130000_reserve_next_video_skip_validation.sql`.
+      `supabase/migrations/20260603140000_account_validation_flag_and_device_unique.sql`.
+- [ ] `accounts.is_validation` column exists; seeded placeholder rows
+      already carry `is_validation = true` (verify with
+      `SELECT username, is_validation FROM automation.accounts WHERE
+       username LIKE 'validation_%';`).
 - [ ] At least one online physical device is registered (`fffbt status`
       shows `devices: online: N>=1`).
 - [ ] At least one validation account exists with an active
