@@ -54,12 +54,16 @@ WITH existing_account AS (
     WHERE username = {_sql_literal(username)} AND platform = 'instagram'
 ),
 created_account AS (
-    INSERT INTO automation.accounts (username, password, platform, status, created_at, updated_at)
+    INSERT INTO automation.accounts (
+        username, password, platform, status,
+        is_validation, created_at, updated_at
+    )
     SELECT
         {_sql_literal(username)},
         'VALIDATION_ALREADY_LOGGED_IN_NO_REAL_PASSWORD',
         'instagram',
         'active',
+        true,
         now() - interval '{int(updated_offset_seconds)} seconds',
         now() - interval '{int(updated_offset_seconds)} seconds'
     WHERE NOT EXISTS (SELECT 1 FROM existing_account)
@@ -74,9 +78,10 @@ account_row AS (
 status_update AS (
     UPDATE automation.accounts
        SET status = 'active',
+           is_validation = true,
            password = 'VALIDATION_ALREADY_LOGGED_IN_NO_REAL_PASSWORD'
      WHERE id = (SELECT id FROM account_row)
-       AND status <> 'active'
+       AND (status <> 'active' OR COALESCE(is_validation, false) = false)
     RETURNING id
 ),
 existing_env AS (

@@ -205,6 +205,13 @@ eligible_account AS (
     CROSS JOIN requested r
     WHERE a.status = 'active'
       AND (r.account_id IS NULL OR a.id = r.account_id)
+      -- Allow validation/placeholder accounts only when the caller
+      -- explicitly pinned one with --account-id. Without that opt-in,
+      -- the targeted path behaves like the generic queue.
+      AND (
+          r.account_id IS NOT NULL
+          OR COALESCE(a.is_validation, false) = false
+      )
       AND NOT EXISTS (
           SELECT 1 FROM automation.jobs j
           WHERE j.account_id = a.id

@@ -10,12 +10,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any
 
 from src.worker.session.mobilerun_adapter import MobilerunRouteMissingError, MobilerunWorker
 from src.worker.session.types import (
+    Artifact,
     StepContext,
     StepName,
     StepResult,
@@ -248,8 +252,16 @@ class MobileUIAutomationStep:
 
     name = StepName.MOBILE_UI_AUTOMATION
 
-    def __init__(self, *, genfarmer_url: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        genfarmer_url: str | None = None,
+        artifacts_dir: str | None = None,
+    ) -> None:
         self._genfarmer_url = genfarmer_url
+        self._artifacts_dir = artifacts_dir
+        self._job_id: str | None = None
+        self._captured_artifacts: list[Artifact] = []
 
     async def run(
         self,
@@ -270,6 +282,12 @@ class MobileUIAutomationStep:
         if not caption:
             return self._fail("INFRA", "no caption_text provided")
 
+        self._job_id = ctx.job_id
+        self._captured_artifacts = []
+        ctx_settings_dir = ctx.settings.get("artifacts_dir")
+        if ctx_settings_dir and not self._artifacts_dir:
+            self._artifacts_dir = ctx_settings_dir
+
         worker = MobilerunWorker(
             device_serial=serial,
             genfarmer_url=gf_url,
@@ -289,11 +307,13 @@ class MobileUIAutomationStep:
                     "MobileRun UI control used disallowed ADB fallback",
                 )
             self._attach_driver_details(result, worker)
+            self._attach_captured_artifacts(result)
             return result
         except Exception as e:
-            await self._screenshot(worker, "on_error")
+            await self._capture_hard_stop_artifacts(worker, "on_error")
             result = self._fail("UNKNOWN", f"unhandled: {e}")
             self._attach_driver_details(result, worker)
+            self._attach_captured_artifacts(result)
             return result
         finally:
             try:
@@ -313,6 +333,7 @@ class MobileUIAutomationStep:
             ui = await self._read_ui(worker)
             stop = _detect_hard_stop(ui)
             if stop:
+                await self._capture_hard_stop_artifacts(worker, f"hard_stop_{stop[0]}")
                 return self._fail(stop[0], f"hard stop: {stop[1]}")
             return self._fail(
                 "INFRA",
@@ -325,6 +346,7 @@ class MobileUIAutomationStep:
         ui = await self._read_ui(worker)
         stop = _detect_hard_stop(ui)
         if stop:
+            await self._capture_hard_stop_artifacts(worker, f"hard_stop_{stop[0]}")
             return self._fail(stop[0], f"hard stop after launch: {stop[1]}")
 
         # --- Navigate to Share screen ---
@@ -335,6 +357,7 @@ class MobileUIAutomationStep:
             ui = await self._read_ui(worker)
             stop = _detect_hard_stop(ui)
             if stop:
+                await self._capture_hard_stop_artifacts(worker, f"hard_stop_{stop[0]}")
                 return self._fail(stop[0], f"hard stop: {stop[1]}")
             err = (
                 result.get("error")
@@ -359,6 +382,7 @@ class MobileUIAutomationStep:
         ui = await self._read_ui(worker)
         stop = _detect_hard_stop(ui)
         if stop:
+            await self._capture_hard_stop_artifacts(worker, f"hard_stop_{stop[0]}")
             return self._fail(stop[0], f"hard stop on Share screen: {stop[1]}")
 
         # --- Fill caption (local tools) ---
@@ -386,6 +410,7 @@ class MobileUIAutomationStep:
             ui = await self._read_ui(worker)
             stop = _detect_hard_stop(ui)
             if stop:
+                await self._capture_hard_stop_artifacts(worker, f"hard_stop_{stop[0]}")
                 return self._fail(stop[0], f"hard stop during share: {stop[1]}")
             code = (
                 "final_ok_did_not_register"
@@ -903,6 +928,71 @@ class MobileUIAutomationStep:
             await asyncio.to_thread(worker.screenshot, label)
         except Exception:
             pass
+
+    def _resolve_artifacts_dir(self) -> Path | None:
+        """Return the per-job artifacts directory, creating it on demand."""
+        base = self._artifacts_dir or os.environ.get("ARTIFACTS_DIR", "./.artifacts")
+        job_id = self._job_id or "no_job"
+        try:
+            target = Path(base) / "mobile_ui" / job_id
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+        except OSError:
+            return None
+
+    async def _capture_hard_stop_artifacts(
+        self, worker: MobilerunWorker, label: str
+    ) -> None:
+        """Persist a screenshot + UI dump to ARTIFACTS_DIR for the current job.
+
+        Hard stops like logged_out / action_blocked / login_challenge /
+        account_suspended produce StepResult with code only — to debug them,
+        we need the screen state the moment the hard stop fired. Failures
+        here are swallowed: artifact capture must never raise during the
+        already-failing path.
+        """
+        directory = self._resolve_artifacts_dir()
+        if directory is None:
+            await self._screenshot(worker, label)
+            return
+
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        base_name = f"{label}_{stamp}"
+        png_path = directory / f"{base_name}.png"
+        ui_path = directory / f"{base_name}.ui.json"
+
+        try:
+            raw = await asyncio.to_thread(worker.screenshot, label)
+            if raw:
+                png_path.write_bytes(raw)
+                self._captured_artifacts.append(
+                    Artifact(
+                        artifact_id=str(png_path),
+                        artifact_type="screenshot",
+                        label=label,
+                    )
+                )
+        except Exception:
+            pass
+
+        try:
+            source = await asyncio.to_thread(worker.page_source)
+            if source:
+                ui_path.write_text(source, encoding="utf-8")
+                self._captured_artifacts.append(
+                    Artifact(
+                        artifact_id=str(ui_path),
+                        artifact_type="ui_dump",
+                        label=label,
+                    )
+                )
+        except Exception:
+            pass
+
+    def _attach_captured_artifacts(self, result: StepResult) -> None:
+        if not self._captured_artifacts:
+            return
+        result.artifacts = list(result.artifacts) + list(self._captured_artifacts)
 
     def _attach_driver_details(self, result: StepResult, worker: MobilerunWorker) -> None:
         actions = worker.actions_log
