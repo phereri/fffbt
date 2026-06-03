@@ -59,8 +59,17 @@ class MobilerunWorker(MobileWorker):
     # --- lifecycle ---
 
     def connect(self) -> None:
-        data = self._api_get("/backend/auth/me")
-        self._user_id = data.get("id") or data.get("userId")
+        try:
+            data = self._api_get("/backend/auth/me")
+            self._user_id = data.get("id") or data.get("userId")
+        except HTTPError as exc:
+            if not self._use_tcp or exc.code not in {401, 403}:
+                raise
+            self._user_id = None
+            self._log_action(
+                "genfarmer_auth_unavailable",
+                {"error": str(exc)[:200], "direct_mobilerun_tcp": True},
+            )
         self._connected = True
         self._log_action("connect", {"user_id": self._user_id})
 

@@ -40,7 +40,12 @@ def _check_serial(serial: str, *, genfarmer_url: str) -> dict[str, Any]:
         "activityName": None,
         "error": None,
     }
-    worker = MobilerunWorker(device_serial=serial, genfarmer_url=genfarmer_url)
+    worker = MobilerunWorker(
+        device_serial=serial,
+        genfarmer_url=genfarmer_url,
+        adb_fallback=False,
+        use_tcp=True,
+    )
     try:
         worker.connect()
         preflight = worker.preflight_ui_tree()

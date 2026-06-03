@@ -69,6 +69,33 @@ def test_connect_failure_raises(mock_server):
         worker.connect()
 
 
+def test_connect_tolerates_genfarmer_auth_failure_for_tcp(mock_server):
+    url, handler = mock_server
+    handler.responses[("GET", "/backend/auth/me")] = (
+        401,
+        {"success": False, "message": "Unauthorized"},
+    )
+
+    worker = MobilerunWorker("DEV", genfarmer_url=url, use_tcp=True)
+    worker.connect()
+
+    assert worker.is_connected
+    assert any(a["action"] == "genfarmer_auth_unavailable" for a in worker.actions_log)
+
+
+def test_connect_auth_failure_raises_without_tcp(mock_server):
+    url, handler = mock_server
+    handler.responses[("GET", "/backend/auth/me")] = (
+        401,
+        {"success": False, "message": "Unauthorized"},
+    )
+
+    worker = MobilerunWorker("DEV", genfarmer_url=url, use_tcp=False)
+
+    with pytest.raises(Exception):
+        worker.connect()
+
+
 def test_disconnect(mock_server):
     url, handler = mock_server
     handler.responses[("GET", "/backend/auth/me")] = {"id": "u1"}
