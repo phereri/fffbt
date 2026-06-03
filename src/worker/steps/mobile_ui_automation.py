@@ -387,9 +387,12 @@ class MobileUIAutomationStep:
             stop = _detect_hard_stop(ui)
             if stop:
                 return self._fail(stop[0], f"hard stop during share: {stop[1]}")
-            return self._needs_review(
-                "share_did_not_register", f"share failed: {share_result.message}"
+            code = (
+                "final_ok_did_not_register"
+                if "final_ok_did_not_register" in share_result.message
+                else "share_did_not_register"
             )
+            return self._needs_review(code, f"share failed: {share_result.message}")
 
         await self._screenshot(worker, "post_result")
 
@@ -606,7 +609,34 @@ class MobileUIAutomationStep:
         return ToolResult.ok(f"typed {len(caption)} chars via MobileRun TCP")
 
     async def _tap_share_and_confirm(self, worker: MobilerunWorker) -> ToolResult:
+        """Publish the Trial Reel.
+
+        On the Trial Reel "New reel" final screen, the publish action is the
+        top-right OK button — there may be no separate bottom Share button.
+        Detect that screen and tap OK via MobileRun TCP, preferring the
+        accessible OK node and falling back to dynamic top-right bounds.
+
+        For legacy Reels share screens (no "New reel" title + Trial banner),
+        keep dismissing the caption editor via OK then tapping share_button.
+        """
+        ui = await self._read_ui(worker)
+
+        if self._on_new_reel_screen(ui):
+            if self._keyboard_or_suggestions_active(ui):
+                await self._dismiss_keyboard_safely(worker)
+                ui = await self._read_ui(worker)
+                if not self._on_new_reel_screen(ui):
+                    await self._screenshot(worker, "final_ok_left_new_reel")
+                    return ToolResult.fail(
+                        "final_ok_did_not_register: New reel screen left during "
+                        "keyboard dismiss; cannot confirm publish target"
+                    )
+            return await self._tap_final_ok(worker, ui)
+
         await self._dismiss_caption_keyboard(worker)
+        return await self._tap_share_button_loop(worker)
+
+    async def _tap_share_button_loop(self, worker: MobilerunWorker) -> ToolResult:
         deadline = asyncio.get_running_loop().time() + 22.0
         while asyncio.get_running_loop().time() < deadline:
             ui = await self._read_ui(worker)
@@ -620,13 +650,94 @@ class MobileUIAutomationStep:
             await asyncio.sleep(1.0)
         return ToolResult.fail("share did not register before timeout")
 
-    async def _dismiss_caption_keyboard(self, worker: MobilerunWorker) -> None:
-        """Close Instagram caption edit mode before tapping Share.
+    _FINAL_OK_CONFIRM_TIMEOUT_S: float = 18.0
 
-        On the Trial Reel share screen, MobileRun text input leaves the caption
-        field focused and Instagram shows a top-right OK button. The bottom
-        Share button is visible in the tree but can fail to register while the
-        keyboard/hashtag suggestions are still active.
+    async def _tap_final_ok(
+        self, worker: MobilerunWorker, ui: list[dict[str, Any]]
+    ) -> ToolResult:
+        """Tap the top-right OK on the New reel screen and confirm transition."""
+        ok_coords = self._final_ok_center(ui)
+        method = "accessible_node"
+        if ok_coords is None:
+            ok_coords = self._top_right_fallback_coords(ui)
+            method = "top_right_fallback"
+        if ok_coords is None:
+            await self._screenshot(worker, "final_ok_not_found")
+            await self._read_ui(worker)  # dump UI tree to actions log
+            return ToolResult.fail(
+                "final_ok_did_not_register: OK button not found and screen "
+                "size could not be inferred"
+            )
+
+        await asyncio.to_thread(worker.tap, ok_coords[0], ok_coords[1])
+        await asyncio.sleep(1.8)
+
+        max_polls = max(1, int(self._FINAL_OK_CONFIRM_TIMEOUT_S))
+        deadline = asyncio.get_running_loop().time() + self._FINAL_OK_CONFIRM_TIMEOUT_S
+        polls = 0
+        while polls < max_polls and asyncio.get_running_loop().time() < deadline:
+            polls += 1
+            after = await self._read_ui(worker)
+            if not after:
+                break  # exhausted UI source; treat as no-transition
+            if not self._on_new_reel_screen(after) or self._post_publish_screen(after):
+                return ToolResult.ok(
+                    f"Trial Reel published via {method} OK at {ok_coords}"
+                )
+            await asyncio.sleep(1.0)
+
+        await self._screenshot(worker, "final_ok_did_not_register")
+        await self._read_ui(worker)  # dump UI tree to actions log
+        return ToolResult.fail(
+            "final_ok_did_not_register: New reel screen still present after "
+            f"OK tap at {ok_coords} via {method}"
+        )
+
+    async def _dismiss_keyboard_safely(self, worker: MobilerunWorker) -> None:
+        """Hide IME / clear caption focus without tapping the publish OK.
+
+        Order: (1) worker.hide_ime() if exposed by the MobileRun driver,
+        (2) tap the Trial Reel banner / non-input area to clear focus,
+        (3) ADB keyevent BACK only if it keeps us on the New reel screen.
+        """
+        hide_ime = getattr(worker, "hide_ime", None)
+        if callable(hide_ime):
+            try:
+                await asyncio.to_thread(hide_ime)
+                await asyncio.sleep(0.6)
+                ui = await self._read_ui(worker)
+                if not self._keyboard_or_suggestions_active(ui):
+                    return
+            except Exception:
+                pass
+
+        ui = await self._read_ui(worker)
+        banner = _text_center(
+            ui, "non-followers", "non followers", "trial reel and will"
+        )
+        if banner is not None:
+            await asyncio.to_thread(worker.tap, banner[0], banner[1])
+            await asyncio.sleep(0.6)
+            after = await self._read_ui(worker)
+            if (
+                not self._keyboard_or_suggestions_active(after)
+                and self._on_new_reel_screen(after)
+            ):
+                return
+
+        try:
+            from src.worker.tools._adb import shell as adb_shell
+
+            await adb_shell(worker.device_serial, "input keyevent 4", timeout=10)
+            await asyncio.sleep(0.6)
+        except Exception:
+            return
+
+    async def _dismiss_caption_keyboard(self, worker: MobilerunWorker) -> None:
+        """Legacy dismiss: close caption edit mode on the non-Trial share screen.
+
+        On the legacy Reels share screen, OK only confirms the caption edit and
+        the user still needs to tap the bottom Share button to publish.
         """
         for _ in range(2):
             ui = await self._read_ui(worker)
@@ -640,6 +751,112 @@ class MobileUIAutomationStep:
                 return
             await asyncio.to_thread(worker.tap, ok[0], ok[1])
             await asyncio.sleep(1.2)
+
+    def _on_new_reel_screen(self, ui_nodes: list[dict[str, Any]]) -> bool:
+        """True iff UI is the Trial Reel "New reel" final share screen."""
+        has_title = False
+        has_banner = False
+        has_caption_input = False
+        for node in ui_nodes:
+            text = node_text(node).strip().lower()
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if text == "new reel" or "new reel" in text:
+                has_title = True
+            if (
+                "trial reel" in text
+                or "non-followers" in text
+                or "non followers" in text
+            ):
+                has_banner = True
+            if rid.endswith("caption_input_text_view"):
+                has_caption_input = True
+        return has_caption_input and (has_title or has_banner)
+
+    def _keyboard_or_suggestions_active(
+        self, ui_nodes: list[dict[str, Any]]
+    ) -> bool:
+        if _has_resource(ui_nodes, "caption_add_on_recyclerview"):
+            return True
+        for node in ui_nodes:
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if rid.endswith("caption_input_text_view") and bool(node.get("isFocused")):
+                return True
+        return False
+
+    def _post_publish_screen(self, ui_nodes: list[dict[str, Any]]) -> bool:
+        text_blob = " ".join(
+            str(n.get("text") or n.get("contentDescription") or "")
+            for n in ui_nodes
+        ).lower()
+        markers = (
+            "posting",
+            "uploading",
+            "your trial reel",
+            "trial reels",
+            "trial_thumbnail_image",
+            "your reel",
+            "home",
+            "for you",
+        )
+        return any(marker in text_blob for marker in markers)
+
+    def _final_ok_center(
+        self, ui_nodes: list[dict[str, Any]]
+    ) -> tuple[int, int] | None:
+        """Find the New reel top-right OK button in the accessibility tree.
+
+        Accepts a node whose visible text is exactly "OK" OR whose resource-id
+        ends with action_bar_button_text, provided its bounds sit in the
+        top-right region of the screen.
+        """
+        size = self._screen_size(ui_nodes)
+        width = size[0] if size else 1080
+        height = size[1] if size else 1920
+        right_threshold = int(width * 0.6)
+        top_limit = int(height * 0.20)
+        candidates: list[tuple[int, int, int, int]] = []
+        for node in ui_nodes:
+            text = node_text(node).strip().lower()
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if text != "ok" and not rid.endswith("action_bar_button_text"):
+                continue
+            bounds = _node_bounds(node)
+            if not bounds:
+                continue
+            x1, y1, x2, y2 = bounds
+            if x2 < right_threshold or y1 > top_limit:
+                continue
+            candidates.append(bounds)
+        if not candidates:
+            return None
+        x1, y1, x2, y2 = max(candidates, key=lambda b: (b[2], -b[1]))
+        return (x1 + x2) // 2, (y1 + y2) // 2
+
+    def _screen_size(
+        self, ui_nodes: list[dict[str, Any]]
+    ) -> tuple[int, int] | None:
+        max_x = 0
+        max_y = 0
+        for node in ui_nodes:
+            bounds = _node_bounds(node)
+            if not bounds:
+                continue
+            if bounds[2] > max_x:
+                max_x = bounds[2]
+            if bounds[3] > max_y:
+                max_y = bounds[3]
+        if max_x <= 0 or max_y <= 0:
+            return None
+        return max_x, max_y
+
+    def _top_right_fallback_coords(
+        self, ui_nodes: list[dict[str, Any]]
+    ) -> tuple[int, int] | None:
+        size = self._screen_size(ui_nodes)
+        if size is None:
+            return None
+        w, h = size
+        return int(w * 0.925), int(h * 0.07)
 
     def _share_button_center(self, ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
         candidates: list[tuple[int, int, int, int]] = []

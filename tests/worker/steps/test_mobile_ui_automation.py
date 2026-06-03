@@ -509,7 +509,8 @@ class TestShareFlow:
             ]
         )
         posted = json.dumps([{"text": "Home"}])
-        worker.page_source.side_effect = [focused, share, share, posted]
+        # Legacy path adds one upfront read for new-reel-screen detection.
+        worker.page_source.side_effect = [focused, focused, share, share, posted]
 
         result = run(step._tap_share_and_confirm(worker))
 
@@ -587,3 +588,256 @@ class TestStepResultContract:
         assert result.status == StepStatus.FAILED
         assert result.code is not None
         assert isinstance(result.message, str)
+
+
+# ---------------------------------------------------------------------------
+# Final OK / New reel publish handling
+# ---------------------------------------------------------------------------
+
+
+_TRIAL_BANNER_TEXT = (
+    "This is a trial reel and will only be shown to non-followers at first."
+)
+
+
+def _new_reel_node(text: str, bounds: str) -> dict:
+    return {"text": text, "bounds": bounds}
+
+
+def _final_new_reel_screen_with_ok(*, focused: bool = False) -> str:
+    caption_node: dict = {
+        "text": "match preview tonight",
+        "resourceId": "com.instagram.android:id/caption_input_text_view",
+        "className": "android.widget.AutoCompleteTextView",
+        "bounds": "[42,496][1038,711]",
+    }
+    if focused:
+        caption_node["isFocused"] = True
+    nodes = [
+        _new_reel_node("New reel", "[120,80][420,170]"),
+        _new_reel_node(_TRIAL_BANNER_TEXT, "[42,260][1038,400]"),
+        caption_node,
+        {
+            "text": "OK",
+            "resourceId": "com.instagram.android:id/action_bar_button_text",
+            "bounds": "[939,83][1059,210]",
+            "isEnabled": True,
+        },
+        # An invisible root node big enough to anchor screen size at 1080x1920.
+        {"bounds": "[0,0][1080,1920]"},
+    ]
+    if focused:
+        nodes.append(
+            {
+                "resourceId": "com.instagram.android:id/caption_add_on_recyclerview",
+                "bounds": "[0,711][1080,862]",
+            }
+        )
+    return json.dumps(nodes)
+
+
+def _final_new_reel_screen_without_ok() -> str:
+    nodes = [
+        _new_reel_node("New reel", "[120,80][420,170]"),
+        _new_reel_node(_TRIAL_BANNER_TEXT, "[42,260][1038,400]"),
+        {
+            "text": "match preview tonight",
+            "resourceId": "com.instagram.android:id/caption_input_text_view",
+            "className": "android.widget.AutoCompleteTextView",
+            "bounds": "[42,496][1038,711]",
+        },
+        # Root node to anchor screen size.
+        {"bounds": "[0,0][1080,1920]"},
+    ]
+    return json.dumps(nodes)
+
+
+def _post_publish_screen() -> str:
+    return json.dumps([{"text": "For you"}, {"text": "Home"}])
+
+
+class TestFinalOkDetection:
+    def test_on_new_reel_screen_true_with_title_caption_and_banner(self):
+        step = MobileUIAutomationStep()
+        ui = _parse_page_source(_final_new_reel_screen_with_ok())
+        assert step._on_new_reel_screen(ui) is True
+
+    def test_on_new_reel_screen_false_for_legacy_share_screen(self):
+        step = MobileUIAutomationStep()
+        ui = _parse_page_source(
+            json.dumps(
+                [
+                    {
+                        "resourceId": "com.instagram.android:id/caption_input_text_view",
+                        "bounds": "[42,496][1038,711]",
+                    },
+                    {
+                        "resourceId": "com.instagram.android:id/share_button",
+                        "bounds": "[561,1625][1038,1741]",
+                    },
+                ]
+            )
+        )
+        assert step._on_new_reel_screen(ui) is False
+
+    def test_final_ok_center_uses_accessible_node_when_exposed(self):
+        step = MobileUIAutomationStep()
+        ui = _parse_page_source(_final_new_reel_screen_with_ok())
+        assert step._final_ok_center(ui) == (999, 146)
+
+    def test_final_ok_center_none_when_no_top_right_ok(self):
+        step = MobileUIAutomationStep()
+        ui = _parse_page_source(_final_new_reel_screen_without_ok())
+        assert step._final_ok_center(ui) is None
+
+    def test_top_right_fallback_coords_uses_inferred_screen_size(self):
+        step = MobileUIAutomationStep()
+        ui = _parse_page_source(_final_new_reel_screen_without_ok())
+        coords = step._top_right_fallback_coords(ui)
+        assert coords is not None
+        x, y = coords
+        # x ~ width * 0.925, y ~ height * 0.07 on a 1080x1920 device.
+        assert 0.88 * 1080 <= x <= 0.97 * 1080
+        assert 0.04 * 1920 <= y <= 0.10 * 1920
+
+
+def _stable_worker():
+    """MobilerunWorker mock without an auto-mocked hide_ime attribute."""
+    w = _mock_worker()
+    w.taps = []
+    w.tap = lambda x, y: w.taps.append((x, y))
+    w.hide_ime = None  # disable the hide_ime branch in _dismiss_keyboard_safely
+    return w
+
+
+class TestFinalOkTapsPublish:
+    def test_caption_focused_keyboard_open_publishes_via_ok(self):
+        """New reel screen with keyboard + OK visible -> safe dismiss + tap OK."""
+        step = MobileUIAutomationStep()
+        worker = _stable_worker()
+        focused = _final_new_reel_screen_with_ok(focused=True)
+        cleared = _final_new_reel_screen_with_ok(focused=False)
+        # Reads: outer detection, dismiss banner-branch read, dismiss after-tap
+        # read, outer re-read after dismiss, _tap_final_ok poll.
+        worker.page_source.side_effect = [
+            focused,
+            focused,
+            cleared,
+            cleared,
+            _post_publish_screen(),
+        ]
+
+        result = run(step._tap_share_and_confirm(worker))
+
+        assert result.success, result.message
+        # OK must be tapped at the accessible-node coords.
+        assert (999, 146) in worker.taps
+        # OK is the last tap; banner dismiss (if any) precedes it.
+        assert worker.taps[-1] == (999, 146)
+
+    def test_ok_exposed_in_tree_uses_accessible_node(self):
+        step = MobileUIAutomationStep()
+        worker = _stable_worker()
+        stable = _final_new_reel_screen_with_ok(focused=False)
+        worker.page_source.side_effect = [stable, _post_publish_screen()]
+
+        result = run(step._tap_share_and_confirm(worker))
+
+        assert result.success, result.message
+        assert worker.taps == [(999, 146)]
+        assert "accessible_node" in result.message
+
+    def test_ok_not_exposed_uses_top_right_fallback(self):
+        step = MobileUIAutomationStep()
+        worker = _stable_worker()
+        no_ok = _final_new_reel_screen_without_ok()
+        worker.page_source.side_effect = [no_ok, _post_publish_screen()]
+
+        result = run(step._tap_share_and_confirm(worker))
+
+        assert result.success, result.message
+        assert "top_right_fallback" in result.message
+        x, y = worker.taps[0]
+        assert 0.88 * 1080 <= x <= 0.97 * 1080
+        assert 0.04 * 1920 <= y <= 0.10 * 1920
+
+    def test_no_raw_adb_tap_for_final_ok(self):
+        """The publish OK must go through worker.tap (MobileRun TCP)."""
+        step = MobileUIAutomationStep()
+        worker = _stable_worker()
+        stable = _final_new_reel_screen_with_ok(focused=False)
+        worker.page_source.side_effect = [stable, _post_publish_screen()]
+
+        with patch("src.worker.tools._adb.shell") as adb_shell:
+            run(step._tap_share_and_confirm(worker))
+
+        adb_shell.assert_not_called()
+        assert worker.taps == [(999, 146)]
+
+
+class TestFinalOkDidNotRegister:
+    def test_returns_final_ok_did_not_register_when_screen_unchanged(self):
+        step = MobileUIAutomationStep()
+        worker = _stable_worker()
+        # Use a stable (no-keyboard) screen so we only tap OK and poll.
+        stable = _final_new_reel_screen_with_ok(focused=False)
+        # First call: detection. Subsequent calls: polling (always stable).
+        worker.page_source.side_effect = [stable] * 50
+
+        async def _fast_sleep(_s: float) -> None:
+            return None
+
+        with patch("asyncio.sleep", new=_fast_sleep):
+            result = run(step._tap_share_and_confirm(worker))
+
+        assert not result.success
+        assert "final_ok_did_not_register" in result.message
+        assert worker.taps == [(999, 146)]
+
+    @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
+    @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_execute_emits_final_ok_did_not_register_not_share_code(
+        self, MockWorker, mock_type_caption, mock_verify, mock_share
+    ):
+        w = _mock_worker()
+        w.run_goal.return_value = {"status": "success"}
+        w.page_source.return_value = json.dumps([{"text": "Share screen"}])
+        MockWorker.return_value = w
+        mock_type_caption.return_value = ToolResult.ok("typed")
+        mock_verify.return_value = ToolResult.ok("verified")
+        mock_share.return_value = ToolResult.fail(
+            "final_ok_did_not_register: New reel screen still present after OK tap"
+        )
+
+        step = MobileUIAutomationStep()
+        result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
+
+        assert result.status == StepStatus.NEEDS_REVIEW
+        assert result.code == "final_ok_did_not_register"
+        assert result.code != "share_did_not_register"
+
+    @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")
+    @patch("src.worker.steps.mobile_ui_automation.verify_caption_text")
+    @patch.object(MobileUIAutomationStep, "_type_caption")
+    @patch("src.worker.steps.mobile_ui_automation.MobilerunWorker")
+    def test_execute_still_returns_share_code_for_legacy_share_button_fail(
+        self, MockWorker, mock_type_caption, mock_verify, mock_share
+    ):
+        w = _mock_worker()
+        w.run_goal.return_value = {"status": "success"}
+        w.page_source.return_value = json.dumps([{"text": "Share screen"}])
+        MockWorker.return_value = w
+        mock_type_caption.return_value = ToolResult.ok("typed")
+        mock_verify.return_value = ToolResult.ok("verified")
+        # Legacy fail does not start with final_ok_did_not_register.
+        mock_share.return_value = ToolResult.fail(
+            "share did not register before timeout"
+        )
+
+        step = MobileUIAutomationStep()
+        result = run(step.run(_ctx(), device_serial="DEV001", caption_text="cap"))
+
+        assert result.status == StepStatus.NEEDS_REVIEW
+        assert result.code == "share_did_not_register"
