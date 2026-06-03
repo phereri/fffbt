@@ -5,13 +5,15 @@ Usage:
     python -m scheduler.cli <command> [options]
 
 Commands:
-    discover-devices   Reconcile physical_devices with live ADB / heartbeat state
-    reconnect-devices  Reconnect offline devices via adb connect
-    sync-drive         Ingest new videos from Google Drive
-    create-job         Create one publishing job (reserve video + account + device)
-    run-launcher       Start the async job launcher loop
-    run-job            Run a single job through the worker pipeline
-    status             Show current jobs, devices, and videos summary
+    discover-devices      Reconcile physical_devices with live ADB / heartbeat state
+    reconnect-devices     Reconnect offline devices via adb connect
+    sync-drive            Ingest new videos from Google Drive
+    seed-validation-video Seed a local MP4 as one validation video row
+    create-job            Create one publishing job (reserve video + account + device)
+    cleanup-job           Safely cleanup a stuck job and release its device/video
+    run-launcher          Start the async job launcher loop
+    run-job               Run a single job through the worker pipeline
+    status                Show current jobs, devices, and videos summary
 
 Each command accepts --help for detailed usage.
 Connection: --db-url / SUPABASE_DB_URL, or --via-management-api with
@@ -412,7 +414,31 @@ def cmd_run_launcher(argv: list[str]) -> int:
     parser.add_argument(
         "--log-level", default=os.environ.get("LOG_LEVEL", "info")
     )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help=(
+            "Override the max number of concurrently running jobs. "
+            "When omitted, uses automation.global_settings.max_parallel_jobs."
+        ),
+    )
+    parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help=(
+            "Stop the launcher after N jobs have reached a terminal state "
+            "(done / failed / timed_out). Existing in-flight jobs drain first."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.max_parallel is not None and args.max_parallel < 1:
+        print("error: --max-parallel must be >= 1.", file=sys.stderr)
+        return 2
+    if args.max_jobs is not None and args.max_jobs < 1:
+        print("error: --max-jobs must be >= 1.", file=sys.stderr)
+        return 2
     config = _resolve_connection(args)
     db_url = _require_db_url(config)
 
@@ -430,8 +456,130 @@ def cmd_run_launcher(argv: list[str]) -> int:
 
     from scheduler.launcher import JobLauncher
 
-    launcher = JobLauncher(db_url)
+    launcher = JobLauncher(
+        db_url,
+        max_parallel_override=args.max_parallel,
+        max_jobs=args.max_jobs,
+    )
     asyncio.run(launcher.run())
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# seed-validation-video / cleanup-job
+# ---------------------------------------------------------------------------
+
+
+def cmd_seed_validation_video(argv: list[str]) -> int:
+    """Forward to scripts/seed_validation_video.py."""
+    return _forward_to_script(
+        "seed_validation_video", "fffbt seed-validation-video", argv
+    )
+
+
+_CLEANUP_JOB_SQL = """
+WITH target AS (
+    SELECT id, device_id, video_id, status
+    FROM automation.jobs
+    WHERE id = %s::uuid
+    FOR UPDATE
+),
+device_release AS (
+    UPDATE automation.physical_devices pd
+       SET status = 'online',
+           current_job_id = NULL
+      FROM target t
+     WHERE pd.current_job_id = t.id
+    RETURNING pd.id AS device_id
+),
+device_event AS (
+    INSERT INTO automation.device_events (device_id, event_type, payload)
+    SELECT dr.device_id, 'job_released',
+           jsonb_build_object('job_id', t.id, 'reason', 'manual_cleanup')
+      FROM device_release dr
+      CROSS JOIN target t
+    RETURNING id
+),
+video_release AS (
+    UPDATE automation.videos v
+       SET status = 'new'
+      FROM target t
+     WHERE v.id = t.video_id
+       AND v.status = 'reserved'
+    RETURNING v.id
+),
+job_update AS (
+    UPDATE automation.jobs j
+       SET status = 'needs_review',
+           error_code = COALESCE(j.error_code, 'manual_cleanup'),
+           error_message = COALESCE(
+               j.error_message,
+               'Job manually cleaned up via fffbt cleanup-job'
+           ),
+           updated_at = now()
+      FROM target t
+     WHERE j.id = t.id
+       AND j.status NOT IN ('done', 'failed', 'cancelled', 'needs_review')
+    RETURNING j.id, j.status
+),
+job_event AS (
+    INSERT INTO automation.job_events (job_id, event_type, from_status, to_status, payload)
+    SELECT t.id, 'manual_cleanup', t.status, 'needs_review',
+           jsonb_build_object('reason', 'manual_cleanup')
+      FROM target t
+      JOIN job_update ju ON ju.id = t.id
+    RETURNING id
+)
+SELECT
+    t.id::text AS job_id,
+    t.status AS prior_status,
+    EXISTS (SELECT 1 FROM job_update) AS job_updated,
+    EXISTS (SELECT 1 FROM device_release) AS device_released,
+    EXISTS (SELECT 1 FROM video_release) AS video_released
+FROM target t;
+"""
+
+
+def cmd_cleanup_job(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fffbt cleanup-job",
+        description=(
+            "Safely cleanup one stuck job: release its device + reserved "
+            "video and transition the job to needs_review."
+        ),
+    )
+    parser.add_argument("job_id", help="UUID of the stuck job.")
+    _add_connection_args(parser)
+    parser.add_argument(
+        "--json", action="store_true", help="Print result as JSON."
+    )
+    args = parser.parse_args(argv)
+    job_id = _validate_uuid(args.job_id, "job_id")
+    if job_id is None:
+        return 2
+    config = _resolve_connection(args)
+    db_url = _require_db_url(config)
+
+    import psycopg
+
+    with psycopg.connect(db_url, autocommit=True) as conn:
+        cur = conn.execute(_CLEANUP_JOB_SQL, (job_id,))
+        row = cur.fetchone()
+        if row is None:
+            print(f"error: job {job_id} not found.", file=sys.stderr)
+            return 1
+        cols = [desc.name for desc in cur.description]
+        result = dict(zip(cols, row))
+
+    if args.json:
+        print(json.dumps(result, default=str, indent=2))
+    else:
+        print(
+            f"job {result['job_id']}: prior_status={result['prior_status']} "
+            f"job_updated={result['job_updated']} "
+            f"device_released={result['device_released']} "
+            f"video_released={result['video_released']}"
+        )
     return 0
 
 
@@ -632,7 +780,9 @@ COMMANDS = {
     "discover-devices": cmd_discover_devices,
     "reconnect-devices": cmd_reconnect_devices,
     "sync-drive": cmd_sync_drive,
+    "seed-validation-video": cmd_seed_validation_video,
     "create-job": cmd_create_job,
+    "cleanup-job": cmd_cleanup_job,
     "run-launcher": cmd_run_launcher,
     "run-job": cmd_run_job,
     "status": cmd_status,

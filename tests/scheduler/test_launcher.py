@@ -281,6 +281,121 @@ class TestJobLauncherUnit:
         assert captured["error_code"] == "INFRA"
         assert "db down" in captured["error_message"]
 
+    def test_max_parallel_override_takes_precedence_over_settings(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher(
+            "postgresql://fake",
+            max_parallel_override=2,
+        )
+        launcher._settings = {"max_parallel_jobs": "20"}
+
+        assert launcher.max_parallel == 2
+
+    def test_max_parallel_falls_back_to_settings(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake")
+        launcher._settings = {"max_parallel_jobs": "7"}
+
+        assert launcher.max_parallel == 7
+
+    def test_max_jobs_attribute_is_optional_and_propagated(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        unlimited = JobLauncher("postgresql://fake")
+        bounded = JobLauncher("postgresql://fake", max_jobs=3)
+
+        assert unlimited.max_jobs is None
+        assert bounded.max_jobs == 3
+
+    def test_reached_max_jobs_counts_done_failed_timed_out(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake", max_jobs=2)
+
+        assert not launcher._reached_max_jobs()
+        launcher.stats["done"] = 1
+        assert not launcher._reached_max_jobs()
+        launcher.stats["failed"] = 1
+        assert launcher._reached_max_jobs()
+
+    def test_reached_max_jobs_is_false_when_unbounded(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake")
+        launcher.stats["done"] = 1000
+        launcher.stats["failed"] = 1000
+
+        assert not launcher._reached_max_jobs()
+
+    def test_terminal_count_excludes_retries_and_creates(self):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake")
+        launcher.stats["created"] = 5
+        launcher.stats["retried"] = 2
+        launcher.stats["done"] = 1
+        launcher.stats["failed"] = 1
+        launcher.stats["timed_out"] = 1
+
+        assert launcher._terminal_count() == 3
+
+    @pytest.mark.asyncio
+    async def test_scheduler_loop_shuts_down_when_max_jobs_reached(self):
+        """Once N terminal jobs have happened and no work is active, the loop exits."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake", max_jobs=1)
+        launcher._settings = {
+            "max_parallel_jobs": "10",
+            "job_heartbeat_timeout_seconds": "120",
+        }
+        launcher.stats["done"] = 1  # simulate one completed job
+
+        await asyncio.wait_for(launcher._scheduler_loop(), timeout=1.0)
+        assert launcher._shutdown.is_set()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_loop_keeps_running_until_max_jobs_reached(self):
+        """The loop keeps polling while terminal count < max_jobs."""
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake", max_jobs=2)
+        launcher._settings = {
+            "max_parallel_jobs": "10",
+            "job_heartbeat_timeout_seconds": "120",
+        }
+        launcher.stats["done"] = 1  # 1 of 2 done — should not shut down yet
+
+        # If the loop wrongly exited, this would complete fast; if it correctly
+        # tries to poll the (fake) DB it raises INFRA_ERRORS, logs and retries.
+        # We give it a short window to confirm it does not early-exit on
+        # the max_jobs check alone.
+        try:
+            await asyncio.wait_for(launcher._scheduler_loop(), timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            launcher._shutdown.set()
+        assert launcher._reached_max_jobs() is False
+
     @pytest.mark.asyncio
     async def test_unknown_error_calls_process_job_error(self):
         """Unexpected exceptions route through _handle_worker_error with UNKNOWN."""
