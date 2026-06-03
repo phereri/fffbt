@@ -430,6 +430,92 @@ class TestShareFlow:
         assert result.status == StepStatus.NEEDS_REVIEW
         assert result.code == "share_did_not_register"
 
+    def test_dismiss_caption_keyboard_taps_top_right_ok_before_share(self):
+        step = MobileUIAutomationStep()
+        worker = _mock_worker()
+        worker.taps = []
+        worker.tap = lambda x, y: worker.taps.append((x, y))
+        focused = json.dumps(
+            [
+                {
+                    "text": "OK",
+                    "resourceId": "com.instagram.android:id/action_bar_button_text",
+                    "boundsInScreen": {
+                        "left": 939,
+                        "top": 83,
+                        "right": 1059,
+                        "bottom": 210,
+                    },
+                    "isEnabled": True,
+                },
+                {
+                    "text": "caption",
+                    "resourceId": "com.instagram.android:id/caption_input_text_view",
+                    "bounds": "[42,496][1038,711]",
+                    "isFocused": True,
+                },
+                {
+                    "resourceId": "com.instagram.android:id/caption_add_on_recyclerview",
+                    "bounds": "[0,711][1080,862]",
+                },
+            ]
+        )
+        dismissed = json.dumps(
+            [
+                {
+                    "resourceId": "com.instagram.android:id/share_button",
+                    "contentDescription": "Share",
+                    "bounds": "[561,1625][1038,1741]",
+                }
+            ]
+        )
+        worker.page_source.side_effect = [focused, dismissed]
+
+        run(step._dismiss_caption_keyboard(worker))
+
+        assert worker.taps == [(999, 146)]
+
+    def test_share_taps_ok_then_share_when_caption_keyboard_open(self):
+        step = MobileUIAutomationStep()
+        worker = _mock_worker()
+        worker.taps = []
+        worker.tap = lambda x, y: worker.taps.append((x, y))
+        focused = json.dumps(
+            [
+                {
+                    "text": "OK",
+                    "resourceId": "com.instagram.android:id/action_bar_button_text",
+                    "boundsInScreen": {
+                        "left": 939,
+                        "top": 83,
+                        "right": 1059,
+                        "bottom": 210,
+                    },
+                },
+                {
+                    "resourceId": "com.instagram.android:id/caption_input_text_view",
+                    "bounds": "[42,496][1038,711]",
+                    "isFocused": True,
+                },
+            ]
+        )
+        share = json.dumps(
+            [
+                {
+                    "resourceId": "com.instagram.android:id/share_button",
+                    "contentDescription": "Share",
+                    "bounds": "[561,1625][1038,1741]",
+                }
+            ]
+        )
+        posted = json.dumps([{"text": "Home"}])
+        worker.page_source.side_effect = [focused, share, share, posted]
+
+        result = run(step._tap_share_and_confirm(worker))
+
+        assert result.success
+        assert worker.taps == [(999, 146), (799, 1683)]
+
 
 class TestHappyPath:
     @patch.object(MobileUIAutomationStep, "_tap_share_and_confirm")

@@ -606,6 +606,7 @@ class MobileUIAutomationStep:
         return ToolResult.ok(f"typed {len(caption)} chars via MobileRun TCP")
 
     async def _tap_share_and_confirm(self, worker: MobilerunWorker) -> ToolResult:
+        await self._dismiss_caption_keyboard(worker)
         deadline = asyncio.get_running_loop().time() + 22.0
         while asyncio.get_running_loop().time() < deadline:
             ui = await self._read_ui(worker)
@@ -618,6 +619,27 @@ class MobileUIAutomationStep:
                     return ToolResult.ok("share confirmed: share button disappeared")
             await asyncio.sleep(1.0)
         return ToolResult.fail("share did not register before timeout")
+
+    async def _dismiss_caption_keyboard(self, worker: MobilerunWorker) -> None:
+        """Close Instagram caption edit mode before tapping Share.
+
+        On the Trial Reel share screen, MobileRun text input leaves the caption
+        field focused and Instagram shows a top-right OK button. The bottom
+        Share button is visible in the tree but can fail to register while the
+        keyboard/hashtag suggestions are still active.
+        """
+        for _ in range(2):
+            ui = await self._read_ui(worker)
+            ok = self._action_bar_ok_center(ui)
+            if ok is None:
+                return
+            if not (
+                self._caption_field_focused(ui)
+                or _has_resource(ui, "caption_add_on_recyclerview")
+            ):
+                return
+            await asyncio.to_thread(worker.tap, ok[0], ok[1])
+            await asyncio.sleep(1.2)
 
     def _share_button_center(self, ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
         candidates: list[tuple[int, int, int, int]] = []
@@ -632,6 +654,32 @@ class MobileUIAutomationStep:
             return None
         x1, y1, x2, y2 = max(candidates, key=lambda b: b[3])
         return (x1 + x2) // 2, (y1 + y2) // 2
+
+    def _action_bar_ok_center(self, ui_nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
+        candidates: list[tuple[int, int, int, int]] = []
+        for node in ui_nodes:
+            text = node_text(node).strip().lower()
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if text != "ok" and not rid.endswith("action_bar_button_text"):
+                continue
+            bounds = _node_bounds(node)
+            if not bounds:
+                continue
+            x1, y1, x2, y2 = bounds
+            if x1 < 800 or y2 > 260:
+                continue
+            candidates.append(bounds)
+        if not candidates:
+            return None
+        x1, y1, x2, y2 = max(candidates, key=lambda b: b[2])
+        return (x1 + x2) // 2, (y1 + y2) // 2
+
+    def _caption_field_focused(self, ui_nodes: list[dict[str, Any]]) -> bool:
+        for node in ui_nodes:
+            rid = str(node.get("resourceId") or node.get("resource-id") or "")
+            if rid.endswith("caption_input_text_view") and bool(node.get("isFocused")):
+                return True
+        return False
 
     async def _screenshot(self, worker: MobilerunWorker, label: str) -> None:
         try:
