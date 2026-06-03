@@ -166,12 +166,22 @@ async def _reserve_device_for_job(
 
 
 class JobLauncher:
-    def __init__(self, db_url: str) -> None:
+    def __init__(
+        self,
+        db_url: str,
+        *,
+        max_parallel_override: int | None = None,
+        max_jobs: int | None = None,
+    ) -> None:
         self.db_url = db_url
         self._semaphore: asyncio.Semaphore | None = None
         self._active: dict[str, asyncio.Task] = {}
         self._shutdown = asyncio.Event()
         self._settings: dict[str, str] = {}
+        self._max_parallel_override = (
+            int(max_parallel_override) if max_parallel_override is not None else None
+        )
+        self._max_jobs = int(max_jobs) if max_jobs is not None else None
         self.stats = {
             "created": 0,
             "done": 0,
@@ -182,7 +192,25 @@ class JobLauncher:
 
     @property
     def max_parallel(self) -> int:
+        if self._max_parallel_override is not None:
+            return max(1, self._max_parallel_override)
         return int(self._settings.get("max_parallel_jobs", "20"))
+
+    @property
+    def max_jobs(self) -> int | None:
+        return self._max_jobs
+
+    def _terminal_count(self) -> int:
+        """Number of jobs whose lifecycle has ended this run.
+
+        Counts done / failed / timed_out. Re-queued jobs are intentionally not
+        counted: a retry that later succeeds increments `done`, and a retry
+        that exhausts attempts increments `failed`.
+        """
+        return self.stats["done"] + self.stats["failed"] + self.stats["timed_out"]
+
+    def _reached_max_jobs(self) -> bool:
+        return self._max_jobs is not None and self._terminal_count() >= self._max_jobs
 
     @property
     def job_timeout(self) -> int:
@@ -296,12 +324,24 @@ class JobLauncher:
     async def _scheduler_loop(self) -> None:
         """Main loop: pick up re-queued jobs, create new jobs, dispatch workers."""
         while not self._shutdown.is_set():
+            if self._reached_max_jobs() and not self._active:
+                _jsonl(
+                    "max_jobs_reached",
+                    max_jobs=self._max_jobs,
+                    terminal=self._terminal_count(),
+                )
+                self._shutdown.set()
+                break
+
             try:
                 async with await psycopg.AsyncConnection.connect(
                     self.db_url, autocommit=True
                 ) as conn:
                     active = await _count_active_jobs(conn)
                     capacity = self.max_parallel - active
+                    if self._max_jobs is not None:
+                        outstanding = self._max_jobs - self._terminal_count()
+                        capacity = min(capacity, max(0, outstanding - len(self._active)))
                     if capacity <= 0:
                         _jsonl("at_capacity", active=active, max=self.max_parallel)
                     else:
