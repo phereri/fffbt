@@ -1,4 +1,10 @@
-"""Tests for the mobile_ui_automation step."""
+"""Tests for the mobile_ui_automation step.
+
+The default ``MOBILE_UI_EXECUTOR`` is ``mobilerun_agent``. This file exercises
+the legacy deterministic executor, so every ``_ctx()`` here opts back into it
+via ``settings["mobile_ui_executor"] = "deterministic"``. The agent-path
+dispatch tests live in ``test_mobile_ui_executor_selection.py``.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,8 @@ import asyncio
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.worker.session.types import Artifact, Mode, StepContext, StepName, StepStatus
 from src.worker.steps.mobile_ui_automation import (
@@ -20,6 +28,12 @@ from src.worker.steps.mobile_ui_automation import (
 from src.worker.tools._types import ToolResult
 
 
+@pytest.fixture(autouse=True)
+def _force_deterministic_executor(monkeypatch):
+    """Pin every test in this file to the legacy deterministic executor."""
+    monkeypatch.setenv("MOBILE_UI_EXECUTOR", "deterministic")
+
+
 def _ctx(**overrides) -> StepContext:
     defaults = dict(
         job_id="j1",
@@ -28,8 +42,10 @@ def _ctx(**overrides) -> StepContext:
         account_environment_id="ae1",
         device_id="d1",
         mode=Mode.MVP,
-        settings={},
+        settings={"mobile_ui_executor": "deterministic"},
     )
+    if "settings" in overrides:
+        defaults["settings"] = {**defaults["settings"], **overrides.pop("settings")}
     defaults.update(overrides)
     return StepContext(**defaults)
 

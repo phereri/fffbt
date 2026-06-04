@@ -169,6 +169,17 @@ Tick every item before phase 1. If any item is missing or unclear,
       If any, `fffbt cleanup-job <uuid>` for each before continuing.
 - [ ] You have read `docs/ops/mobilerun-setup.md` and the safety section
       of `docs/ops/runtime-smoke-test-runbook.md`.
+- [ ] `MOBILE_UI_EXECUTOR` is unset OR set to `mobilerun_agent` (the
+      default). The primary proof_of_posting executor is the MobileRun AI
+      agent driven by `config/mobilerun/app_cards/instagram.md`, not the
+      hardcoded TCP coordinate path. If `mobilerun` is not installable on
+      this host, set `MOBILE_UI_EXECUTOR=deterministic` *intentionally*
+      and record that in the rollout report — the deterministic path is a
+      fallback, not the supported MVP target.
+- [ ] If the agent path is in use, `mobilerun` is importable from the
+      worker venv (`python -c "from mobilerun import MobileAgent"` exits
+      0) and the trajectories directory (`MOBILERUN_TRAJECTORIES_DIR`,
+      default `trajectories/`) is writable.
 
 ---
 
@@ -398,16 +409,29 @@ for `status`, `create-job`, `seed-validation-video`.
 
 ## 11. Remaining blockers before scaling to 2 devices
 
-- **GenFarmer REST validation.** Only `/backend/auth/me` and
-  `/automation/apps` have been validated end-to-end against the
-  deployed GenFarmer build. `/automation/run` falls back to the
-  MobileRun TCP coord path. Confirm `mobilerun_tcp_trial_reels_path`
-  appears in the navigation success payload on every phase-7/8 run.
-- **Per-device coordinate drift.** The OK button position uses
-  `width * 0.925` / `height * 0.07` of the inferred UI size. On a phone
-  with a different ratio or system bar, the fallback coords may miss.
-  Real-device check on every new SKU is mandatory before adding it to
-  the rotation.
+- **MobileRun agent path real-device validation.** The agent executor
+  (`MOBILE_UI_EXECUTOR=mobilerun_agent`, default) is wired but has not
+  yet been run end-to-end against a logged-in Instagram account from
+  this repo. Phase 1 must explicitly capture the agent's trajectory
+  files (under `MOBILERUN_TRAJECTORIES_DIR`) and the
+  `details.mobile_driver.executor` field in the worker output; both
+  must show `mobilerun_agent`. If the agent path is unavailable on the
+  host (e.g. `mobilerun` package not installed), record that explicitly
+  in the rollout report and fall back to `MOBILE_UI_EXECUTOR=deterministic`
+  for the run — that is a known degradation, not the supported MVP target.
+- **GenFarmer REST validation (deterministic fallback only).** Only
+  `/backend/auth/me` and `/automation/apps` have been validated end-to-end
+  against the deployed GenFarmer build. `/automation/run` falls back to
+  the MobileRun TCP coord path. This blocker only applies when
+  `MOBILE_UI_EXECUTOR=deterministic` — the agent executor builds its
+  own `MobileAgent` and does not depend on GenFarmer's automation routes.
+- **Per-device coordinate drift (deterministic fallback only).** The
+  legacy executor's OK button position uses `width * 0.925` / `height *
+  0.07` of the inferred UI size. On a phone with a different ratio or
+  system bar, the fallback coords may miss. Real-device check on every
+  new SKU is mandatory before adding it to the rotation. The agent
+  executor does not depend on these coordinates — the AppCard names the
+  resource id and the agent computes taps from the live UI tree.
 - **No Change Device / GPS / proxy yet.** The current MVP assumes the
   device is already in the intended state. Do not enable these features
   in production until phase 4 planning is complete.
