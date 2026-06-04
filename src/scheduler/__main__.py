@@ -1,40 +1,19 @@
-"""Entry point: python -m scheduler"""
+"""Entry point: python -m scheduler
+
+Thin wrapper that delegates to ``scheduler.cli run-launcher`` so there is a
+single launcher code path with the same safe default (real proof_of_posting
+steps) and the same flags (--max-jobs, --max-parallel, --stub).
+"""
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import os
 import sys
-
-_STUB_WARNING = (
-    "WARNING: Worker steps are STUBS — jobs run through the full pipeline "
-    "but steps return OK immediately without performing real device "
-    "automation or posting. Do NOT run against the production queue until "
-    "real step implementations are plugged in."
-)
 
 
 def main() -> int:
-    db_url = os.environ.get("SUPABASE_DB_URL")
-    if not db_url:
-        print("error: SUPABASE_DB_URL is not set.", file=sys.stderr)
-        return 2
+    from scheduler.cli import cmd_run_launcher
 
-    level = os.environ.get("LOG_LEVEL", "info").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(levelname)s: %(message)s",
-    )
-
-    log = logging.getLogger("scheduler")
-    log.warning(_STUB_WARNING)
-
-    from scheduler.launcher import JobLauncher
-
-    launcher = JobLauncher(db_url)
-    asyncio.run(launcher.run())
-    return 0
+    return cmd_run_launcher(sys.argv[1:])
 
 
 if __name__ == "__main__":

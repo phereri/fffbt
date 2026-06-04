@@ -4,8 +4,12 @@ Creates publishing jobs via automation.create_publishing_job() and dispatches
 each to an async worker task, bounded by asyncio.Semaphore. Each worker runs
 the generic job pipeline (see pipeline.py), which executes steps in order:
 environment_apply, video_preparation, mobile_ui_automation, verification,
-and cleanup. Step implementations are currently stubs that return OK
-immediately — real device automation will be plugged in via follow-up issues.
+and cleanup.
+
+By default the launcher runs the REAL proof_of_posting steps (MobileRun agent
+executor; see steps_factory). No-op stub steps are only used when a stub
+factory is injected explicitly (``run-launcher --stub``), so the launcher can
+never silently consume real videos/accounts/devices without posting.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import logging
 import signal
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 
@@ -172,8 +176,14 @@ class JobLauncher:
         *,
         max_parallel_override: int | None = None,
         max_jobs: int | None = None,
+        steps_factory: "Callable[[], list] | None" = None,
     ) -> None:
         self.db_url = db_url
+        # Factory producing a fresh ordered step list per job. Defaults to the
+        # real proof_of_posting steps (resolved lazily in _run_worker so the
+        # launcher stays importable without worker deps). A stub factory is
+        # only ever injected via `run-launcher --stub`.
+        self._steps_factory = steps_factory
         self._semaphore: asyncio.Semaphore | None = None
         self._active: dict[str, asyncio.Task] = {}
         self._shutdown = asyncio.Event()
@@ -225,14 +235,21 @@ class JobLauncher:
         return 5.0
 
     async def _run_worker(self, job: dict[str, Any]) -> None:
-        """Run a single job through the worker pipeline."""
-        from scheduler.pipeline import run_job_pipeline
+        """Run a single job through the worker pipeline.
 
+        Builds a fresh step list per job from the configured factory. With no
+        factory injected this is ``proof_of_posting_steps()`` — real device
+        automation via the MobileRun agent executor — never stubs.
+        """
+        from scheduler.pipeline import proof_of_posting_steps, run_job_pipeline
+
+        factory = self._steps_factory or proof_of_posting_steps
         await run_job_pipeline(
             db_url=self.db_url,
             job=job,
             settings=self._settings,
             shutdown=self._shutdown,
+            steps=factory(),
         )
 
     async def _handle_worker_error(

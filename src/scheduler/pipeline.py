@@ -4,8 +4,11 @@ Executes a single automation.jobs record through an ordered sequence of
 WorkerStep implementations. Each step returns a StepResult; the pipeline
 owns all job state transitions, heartbeat emission, and error routing.
 
-Steps are pluggable — pass custom implementations to run_job_pipeline()
-or use the default stubs.
+Steps are pluggable: callers MUST pass an explicit step list to
+run_job_pipeline(). Use proof_of_posting_steps() for real device automation,
+or stub_steps() for tests that exercise pipeline mechanics without a device.
+There is no implicit default — omitting steps raises, so a real run can never
+silently fall back to no-op stubs.
 """
 
 from __future__ import annotations
@@ -84,32 +87,37 @@ class WorkerStep(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Stub step implementations
+# Stub step implementations — TEST-ONLY.
+#
+# These return OK without touching a device. They are named ``Stub*`` and
+# returned only by ``stub_steps()`` so they can never be confused with the
+# real ``RealMobileUIAutomationStep`` etc. or selected by accident. Production
+# entry points (launcher, run-job) use ``proof_of_posting_steps()``.
 # ---------------------------------------------------------------------------
 
 
-class EnvironmentApplyStep:
+class StubEnvironmentApplyStep:
     name = "environment_apply"
 
     async def run(self, ctx: StepContext) -> StepResult:
         return StepResult(step=self.name, status="ok", message="stub: environment applied")
 
 
-class VideoPreparationStep:
+class StubVideoPreparationStep:
     name = "video_preparation"
 
     async def run(self, ctx: StepContext) -> StepResult:
         return StepResult(step=self.name, status="ok", message="stub: video prepared")
 
 
-class MobileUIAutomationStep:
+class StubMobileUIAutomationStep:
     name = "mobile_ui_automation"
 
     async def run(self, ctx: StepContext) -> StepResult:
         return StepResult(step=self.name, status="ok", message="stub: mobile automation completed")
 
 
-class VerificationStep:
+class StubVerificationStep:
     name = "verification"
 
     async def run(self, ctx: StepContext) -> StepResult:
@@ -123,13 +131,17 @@ class CleanupStep:
         return StepResult(step=self.name, status="ok", message="cleanup completed")
 
 
-def default_steps() -> list:
-    """Return the default ordered pipeline steps (stubs)."""
+def stub_steps() -> list:
+    """Return no-op stub steps. TEST-ONLY — never use against a real queue.
+
+    These return OK without performing any device automation or posting.
+    Production callers must use ``proof_of_posting_steps()``.
+    """
     return [
-        EnvironmentApplyStep(),
-        VideoPreparationStep(),
-        MobileUIAutomationStep(),
-        VerificationStep(),
+        StubEnvironmentApplyStep(),
+        StubVideoPreparationStep(),
+        StubMobileUIAutomationStep(),
+        StubVerificationStep(),
     ]
 
 
@@ -510,9 +522,14 @@ async def run_job_pipeline(
     job: dict[str, Any],
     settings: dict[str, str],
     shutdown: asyncio.Event,
-    steps: list | None = None,
+    steps: list,
 ) -> None:
     """Execute a job through the full worker pipeline.
+
+    ``steps`` is required and must be non-empty — pass
+    ``proof_of_posting_steps()`` for real runs or ``stub_steps()`` for tests.
+    There is intentionally no implicit default: a real run can never silently
+    fall back to no-op stubs.
 
     Runs the ordered step sequence, always runs cleanup, then routes
     the outcome through process_job_error() or transitions to done.
@@ -520,8 +537,15 @@ async def run_job_pipeline(
     Infrastructure-level exceptions (DB failures, etc.) propagate
     to the caller for handling by the launcher's dispatch logic.
     """
+    if not steps:
+        raise ValueError(
+            "run_job_pipeline requires an explicit non-empty steps list: "
+            "proof_of_posting_steps() for real device automation, or "
+            "stub_steps() for tests. Refusing to run with no steps — there is "
+            "no implicit stub fallback."
+        )
     job_id = str(job["id"])
-    pipeline_steps = steps if steps is not None else default_steps()
+    pipeline_steps = steps
     _jsonl("pipeline_start", job_id=job_id)
 
     async with await psycopg.AsyncConnection.connect(
