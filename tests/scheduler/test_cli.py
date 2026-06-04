@@ -357,7 +357,9 @@ class TestRunJobAsync:
         assert mock_pipeline.await_args.kwargs["steps"] is proof_steps
 
     @pytest.mark.asyncio
-    async def test_default_mode_uses_default_pipeline_steps(self):
+    async def test_run_job_never_uses_stub_steps_even_without_mode(self):
+        # run-job is real-only: even when mode is unset it must use the real
+        # proof_of_posting steps and never pass stub/None steps to the pipeline.
         mock_conn = AsyncMock()
         mock_cursor = AsyncMock()
         mock_cursor.fetchall = AsyncMock(return_value=[])
@@ -365,13 +367,17 @@ class TestRunJobAsync:
         mock_cm = AsyncMock()
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
+        proof_steps = [object()]
 
         with (
             patch(
                 "psycopg.AsyncConnection.connect",
                 new=AsyncMock(return_value=mock_cm),
             ),
-            patch("scheduler.pipeline.proof_of_posting_steps") as mock_factory,
+            patch(
+                "scheduler.pipeline.proof_of_posting_steps",
+                return_value=proof_steps,
+            ) as mock_factory,
             patch(
                 "scheduler.pipeline.run_job_pipeline",
                 new_callable=AsyncMock,
@@ -383,8 +389,44 @@ class TestRunJobAsync:
                 None,
             )
 
-        mock_factory.assert_not_called()
-        assert mock_pipeline.await_args.kwargs["steps"] is None
+        mock_factory.assert_called_once_with()
+        assert mock_pipeline.await_args.kwargs["steps"] is proof_steps
+
+
+class TestRunLauncherStepSelection:
+    """run-launcher must default to real steps; stubs are opt-in only."""
+
+    def test_default_passes_real_steps_factory(self):
+        from scheduler.cli import cmd_run_launcher
+
+        with (
+            patch("scheduler.launcher.JobLauncher") as mock_launcher,
+            patch("scheduler.cli.asyncio.run"),
+        ):
+            rc = cmd_run_launcher(
+                ["--db-url", "postgresql://example.invalid/postgres", "--max-jobs", "1"]
+            )
+
+        assert rc == 0
+        # steps_factory=None → JobLauncher resolves the REAL proof_of_posting
+        # steps internally (never stubs).
+        assert mock_launcher.call_args.kwargs["steps_factory"] is None
+
+    def test_stub_flag_is_opt_in_only(self):
+        from scheduler.cli import cmd_run_launcher
+        from scheduler.pipeline import stub_steps
+
+        with (
+            patch("scheduler.launcher.JobLauncher") as mock_launcher,
+            patch("scheduler.cli.asyncio.run"),
+        ):
+            rc = cmd_run_launcher(
+                ["--db-url", "postgresql://example.invalid/postgres",
+                 "--stub", "--max-jobs", "1"]
+            )
+
+        assert rc == 0
+        assert mock_launcher.call_args.kwargs["steps_factory"] is stub_steps
 
 
 # ---------------------------------------------------------------------------

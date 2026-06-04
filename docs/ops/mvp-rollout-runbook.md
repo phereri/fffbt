@@ -248,10 +248,10 @@ PYTHONPATH=src python -m scheduler.cli run-job <job_id> \
     --mode proof_of_posting --log-level info
 ```
 
-`--mode proof_of_posting` forces the real worker steps (video
-preparation → MobileRun-driven UI → two-level verification). Without
-this flag, `run-job` uses the stub steps and will not exercise the
-device.
+`run-job` always uses the real worker steps (video preparation →
+MobileRun-driven UI → two-level verification) and never runs no-op
+stubs, with or without `--mode`. Pass `--mode proof_of_posting`
+explicitly for clarity; there is no accidental stub path.
 
 Expected terminal output: `done`. The job should publish, then transition
 to verification, and Level 2 should confirm the reel is visible on the
@@ -323,6 +323,10 @@ PYTHONPATH=src python -m scheduler.cli run-launcher \
     --max-parallel 1 --max-jobs 1 --log-level info
 ```
 
+- The launcher runs the **real** proof_of_posting steps by default
+  (MobileRun agent executor) — the same code path `run-job` uses. It does
+  **not** run stubs. (The `--stub` flag exists for tests only and must
+  never be passed against the production queue.)
 - The launcher picks **one** job from the generic queue (validation
   videos are excluded), dispatches it, drains, then exits.
 - `--max-jobs 1` is the hard stop: once 1 job reaches a terminal state
@@ -402,7 +406,7 @@ for `status`, `create-job`, `seed-validation-video`.
 | `create-job [--device-serial S] [--account-id U] [--video-id U] [--json]` | Generic mode creates a job from the queue. With `--device-serial`, pins to one device; with `--video-id`, also pins one validation video. |
 | `cleanup-job <uuid> [--json]` | Safely cleanup a stuck job: release the device, release the reserved video (if any), transition the job to `needs_review`, audit-log the cleanup. |
 | `run-job <uuid> --mode proof_of_posting` | Run one job end-to-end through the real worker pipeline. |
-| `run-launcher [--max-parallel N] [--max-jobs M]` | Run the launcher loop. `--max-parallel` overrides `automation.global_settings.max_parallel_jobs`. `--max-jobs` stops after M terminal jobs and drains. |
+| `run-launcher [--max-parallel N] [--max-jobs M] [--stub]` | Run the launcher loop using the real proof_of_posting steps (MobileRun agent) by default — never stubs. `--max-parallel` overrides `automation.global_settings.max_parallel_jobs`. `--max-jobs` stops after M terminal jobs and drains. `--stub` (test-only) runs no-op steps; never use against the production queue. |
 | `discover-devices` / `reconnect-devices` / `sync-drive` | Maintenance forwards to the matching script. |
 
 ---

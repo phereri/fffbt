@@ -34,16 +34,16 @@ from src.worker.steps import (
 )
 from scheduler.pipeline import (
     CleanupStep,
-    EnvironmentApplyStep,
-    MobileUIAutomationStep,
     ProofOfPostingEnvironmentStep,
     ProofOfPostingWorkerStep,
     StepContext,
     StepResult,
-    VerificationStep,
-    VideoPreparationStep,
+    StubEnvironmentApplyStep,
+    StubMobileUIAutomationStep,
+    StubVerificationStep,
+    StubVideoPreparationStep,
     _execute_step,
-    default_steps,
+    stub_steps,
     proof_of_posting_steps,
     run_job_pipeline,
     _prepare_caption,
@@ -220,10 +220,10 @@ class TestStubs:
     async def test_all_stubs_return_ok(self):
         ctx = _make_ctx()
         for step_cls in [
-            EnvironmentApplyStep,
-            VideoPreparationStep,
-            MobileUIAutomationStep,
-            VerificationStep,
+            StubEnvironmentApplyStep,
+            StubVideoPreparationStep,
+            StubMobileUIAutomationStep,
+            StubVerificationStep,
             CleanupStep,
         ]:
             step = step_cls()
@@ -231,8 +231,8 @@ class TestStubs:
             assert result.status == "ok"
             assert result.step == step.name
 
-    def test_default_steps_order(self):
-        steps = default_steps()
+    def test_stub_steps_order(self):
+        steps = stub_steps()
         assert len(steps) == 4
         names = [s.name for s in steps]
         assert names == [
@@ -241,6 +241,8 @@ class TestStubs:
             "mobile_ui_automation",
             "verification",
         ]
+        # All stub steps are unmistakably named Stub*.
+        assert all(type(s).__name__.startswith("Stub") for s in steps)
 
 
 class TestProofOfPostingSteps:
@@ -259,8 +261,8 @@ class TestProofOfPostingSteps:
         assert isinstance(steps[2].implementation, RealMobileUIAutomationStep)
         assert isinstance(steps[3].implementation, RealVerificationStep)
         assert not any(
-            isinstance(s, (EnvironmentApplyStep, VideoPreparationStep,
-                           MobileUIAutomationStep, VerificationStep))
+            isinstance(s, (StubEnvironmentApplyStep, StubVideoPreparationStep,
+                           StubMobileUIAutomationStep, StubVerificationStep))
             for s in steps
         )
 
@@ -386,6 +388,33 @@ class TestExecuteStep:
 # ---------------------------------------------------------------------------
 # Pipeline orchestration tests (mocked DB)
 # ---------------------------------------------------------------------------
+
+
+class TestRequiresExplicitSteps:
+    """run_job_pipeline refuses to run without an explicit step list, so no
+    caller can silently fall back to no-op stubs."""
+
+    @pytest.mark.asyncio
+    async def test_none_steps_raises_before_db(self):
+        with pytest.raises(ValueError, match="explicit non-empty steps"):
+            await run_job_pipeline(
+                db_url="postgresql://should-not-connect",
+                job={"id": str(uuid.uuid4())},
+                settings={},
+                shutdown=asyncio.Event(),
+                steps=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_steps_raises_before_db(self):
+        with pytest.raises(ValueError, match="explicit non-empty steps"):
+            await run_job_pipeline(
+                db_url="postgresql://should-not-connect",
+                job={"id": str(uuid.uuid4())},
+                settings={},
+                shutdown=asyncio.Event(),
+                steps=[],
+            )
 
 
 class TestPipelineOrchestration:
@@ -776,6 +805,7 @@ class TestPipelineIntegration:
             job=job,
             settings={"job_heartbeat_timeout_seconds": "120"},
             shutdown=asyncio.Event(),
+            steps=stub_steps(),
         )
 
         async with await psycopg.AsyncConnection.connect(

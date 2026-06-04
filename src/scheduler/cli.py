@@ -439,6 +439,16 @@ def cmd_run_launcher(argv: list[str]) -> int:
             "(done / failed / timed_out). Existing in-flight jobs drain first."
         ),
     )
+    parser.add_argument(
+        "--stub",
+        action="store_true",
+        help=(
+            "DANGER / TEST-ONLY: run no-op stub steps that return OK without "
+            "posting. Must be passed explicitly; the default runs the real "
+            "proof_of_posting steps (MobileRun agent). Never use against the "
+            "production queue."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.max_parallel is not None and args.max_parallel < 1:
         print("error: --max-parallel must be >= 1.", file=sys.stderr)
@@ -455,18 +465,31 @@ def cmd_run_launcher(argv: list[str]) -> int:
         format="%(levelname)s: %(message)s",
     )
     log = logging.getLogger("scheduler")
-    log.warning(
-        "Worker steps are STUBS — jobs run through the full pipeline "
-        "but steps return OK immediately without performing real device "
-        "automation or posting."
-    )
 
     from scheduler.launcher import JobLauncher
+
+    steps_factory = None
+    if args.stub:
+        from scheduler.pipeline import stub_steps
+
+        steps_factory = stub_steps
+        log.warning(
+            "--stub: running NO-OP STUB steps. Jobs run through the full "
+            "pipeline but perform NO device automation or posting. Real "
+            "videos/accounts/devices will be consumed and marked done WITHOUT "
+            "posting. Never use this against the production queue."
+        )
+    else:
+        log.info(
+            "running real proof_of_posting steps (MobileRun agent executor; "
+            "MOBILE_UI_EXECUTOR controls the UI driver)"
+        )
 
     launcher = JobLauncher(
         db_url,
         max_parallel_override=args.max_parallel,
         max_jobs=args.max_jobs,
+        steps_factory=steps_factory,
     )
     asyncio.run(launcher.run())
     return 0
@@ -608,7 +631,10 @@ async def _run_job(db_url: str, job_id: str, mode: str | None) -> None:
 
     from scheduler.pipeline import proof_of_posting_steps, run_job_pipeline
 
-    steps = proof_of_posting_steps() if mode == "proof_of_posting" else None
+    # run-job is real-only: it always uses the real proof_of_posting steps and
+    # never stubs, regardless of how (or whether) --mode was supplied. Stub
+    # pipelines are reachable only from tests via stub_steps().
+    steps = proof_of_posting_steps()
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -105,7 +105,7 @@ validation.
 |---|---|---|
 | Supabase `automation` schema | `supabase/migrations/*.sql` | Videos, jobs, accounts, environments, physical_devices, job_events, error_catalog, helper functions (`create_publishing_job`, `reserve_next_video`, `find_eligible_account`, `process_job_error`, `transition_job_status`). |
 | Scheduler CLI | `src/scheduler/cli.py` | Operator entry point: status, create-job, run-job, run-launcher, cleanup-job, seed-validation-video, discover-devices, sync-drive. |
-| Job launcher | `src/scheduler/launcher.py` | Async loop that dispatches many jobs through the pipeline. Supports `--max-parallel` override and `--max-jobs` stop-after-N. |
+| Job launcher | `src/scheduler/launcher.py` | Async loop that dispatches many jobs through the pipeline using the real proof_of_posting steps (MobileRun agent) by default. Supports `--max-parallel` override, `--max-jobs` stop-after-N, and an opt-in `--stub` test mode. |
 | Pipeline | `src/scheduler/pipeline.py` | Glue between launcher and worker steps. Owns state transitions, heartbeats, error routing. |
 | Worker steps | `src/worker/steps/{video_preparation,mobile_ui_automation,verification}.py` | The actual posting flow. `mobile_ui_automation` dispatches to the agent runner by default. |
 | MobileRun agent runner | `src/worker/agent_runner/{mobilerun_agent_runner,goal,result}.py` | Builds + runs a MobileRun `MobileAgent` for one device with the Instagram AppCard; maps `failure_reason` to error codes. |
@@ -335,8 +335,9 @@ Notes:
     --mode proof_of_posting --json
 ```
 
-`--mode proof_of_posting` forces the real worker steps (no stubs). Without
-it `run-job` runs the stub pipeline.
+`run-job` always uses the real worker steps (video preparation + MobileRun
+agent) — it never runs no-op stubs, with or without `--mode`. There is no
+accidental stub path.
 
 ---
 
@@ -354,8 +355,8 @@ Commands that need a persistent direct connection are flagged below.
 | `seed-validation-video <path>` | Idempotently seed a local MP4 as a validation video. | Anytime during validation. | Point it at a moving / temp path. |
 | `create-job [--device-serial S] [--video-id V] [--account-id A] [--json]` | Create one job. Without `--device-serial` it calls `create_publishing_job()` (generic). With it, the targeted SQL pins one device + (optional) video + (optional) account. | Targeted validation. | Use generic creation when validating — it will pick from the production queue. |
 | `cleanup-job <uuid> [--json]` | Release a stuck job's device + reserved video, transition the job to `needs_review`, audit-log a `manual_cleanup` event. (Direct DB only.) | After a worker crash leaves a job pinned with no heartbeat. | Use it as a substitute for actual error handling — first try to understand why it's stuck. |
-| `run-job <uuid> --mode proof_of_posting [--log-level info]` | Run one job end-to-end through the real worker pipeline. (Direct DB only.) | Stage 0a / 1 / 2 of the runbook. | Use without `--mode proof_of_posting` — that runs the stub pipeline and does not post. |
-| `run-launcher [--max-parallel N] [--max-jobs M]` | Run the launcher loop, dispatching N jobs in parallel, stopping after M terminal jobs. (Direct DB only.) | Stages 3+ of the runbook, after stages 0a–2 have passed twice without manual cleanup. | Start it before validation has passed. Run unbounded (no `--max-jobs`) for testing. |
+| `run-job <uuid> --mode proof_of_posting [--log-level info]` | Run one job end-to-end through the real worker pipeline. (Direct DB only.) | Stage 0a / 1 / 2 of the runbook. | — (run-job always uses real steps; it cannot run stubs.) |
+| `run-launcher [--max-parallel N] [--max-jobs M] [--stub]` | Run the launcher loop, dispatching N jobs in parallel, stopping after M terminal jobs. **Defaults to the real proof_of_posting steps (MobileRun agent)** — never stubs. (Direct DB only.) | Stages 3+ of the runbook, after stages 0a–2 have passed twice without manual cleanup. | Start it before validation has passed. Run unbounded (no `--max-jobs`). Pass `--stub` against the production queue (test-only — consumes resources and marks jobs done without posting). |
 
 ---
 

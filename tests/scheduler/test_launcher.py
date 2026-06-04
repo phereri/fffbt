@@ -427,6 +427,73 @@ class TestJobLauncherUnit:
         assert captured["error_code"] == "UNKNOWN"
 
 
+class TestLauncherStepSelection:
+    """The launcher must run REAL proof_of_posting steps by default and only
+    use no-op stubs when a stub factory is injected explicitly."""
+
+    def _launcher(self, **kw):
+        import sys
+        sys.path.insert(0, f"{REPO_ROOT}/src")
+        from scheduler.launcher import JobLauncher
+
+        launcher = JobLauncher("postgresql://fake", **kw)
+        launcher._settings = {}
+        launcher._shutdown = asyncio.Event()
+        return launcher
+
+    @pytest.mark.asyncio
+    async def test_default_uses_real_proof_of_posting_steps(self):
+        launcher = self._launcher()
+        sentinel = [object()]
+        with (
+            patch("scheduler.pipeline.proof_of_posting_steps", return_value=sentinel) as mock_real,
+            patch("scheduler.pipeline.run_job_pipeline", new_callable=AsyncMock) as mock_pipeline,
+        ):
+            await launcher._run_worker({"id": "job-1"})
+
+        mock_real.assert_called_once_with()
+        assert mock_pipeline.await_args.kwargs["steps"] is sentinel
+
+    @pytest.mark.asyncio
+    async def test_default_steps_contain_no_stub_mobile_ui(self):
+        from scheduler.pipeline import ProofOfPostingWorkerStep, StubMobileUIAutomationStep
+        from src.worker.steps import MobileUIAutomationStep as RealMobileUIAutomationStep
+
+        launcher = self._launcher()
+        with patch("scheduler.pipeline.run_job_pipeline", new_callable=AsyncMock) as mock_pipeline:
+            await launcher._run_worker({"id": "job-1"})
+
+        steps = mock_pipeline.await_args.kwargs["steps"]
+        assert not any(isinstance(s, StubMobileUIAutomationStep) for s in steps)
+        mobile = [s for s in steps if getattr(s, "name", None) == "mobile_ui_automation"]
+        assert mobile and isinstance(mobile[0], ProofOfPostingWorkerStep)
+        assert isinstance(mobile[0].implementation, RealMobileUIAutomationStep)
+
+    @pytest.mark.asyncio
+    async def test_injected_stub_factory_is_used(self):
+        from scheduler.pipeline import StubMobileUIAutomationStep, stub_steps
+
+        launcher = self._launcher(steps_factory=stub_steps)
+        with patch("scheduler.pipeline.run_job_pipeline", new_callable=AsyncMock) as mock_pipeline:
+            await launcher._run_worker({"id": "job-1"})
+
+        steps = mock_pipeline.await_args.kwargs["steps"]
+        assert any(isinstance(s, StubMobileUIAutomationStep) for s in steps)
+
+    @pytest.mark.asyncio
+    async def test_fresh_steps_built_per_job(self):
+        # Each job gets its own step instances (no shared mutable state across
+        # concurrent jobs).
+        launcher = self._launcher()
+        seen = []
+        with patch("scheduler.pipeline.run_job_pipeline", new_callable=AsyncMock) as mock_pipeline:
+            await launcher._run_worker({"id": "job-1"})
+            seen.append(mock_pipeline.await_args.kwargs["steps"])
+            await launcher._run_worker({"id": "job-2"})
+            seen.append(mock_pipeline.await_args.kwargs["steps"])
+        assert seen[0] is not seen[1]
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (real Postgres — require Docker)
 # ---------------------------------------------------------------------------
