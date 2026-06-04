@@ -24,6 +24,7 @@ from src.worker.steps.mobile_ui_automation import (
     EXECUTOR_DETERMINISTIC,
     EXECUTOR_MOBILERUN_AGENT,
     MobileUIAutomationStep,
+    _normalize_hashtags,
 )
 
 
@@ -261,6 +262,53 @@ class TestAgentExecutorPath:
         # The agent path never constructs a MobilerunWorker, so by
         # construction no ADB fallback can be recorded.
         assert result.details["mobile_driver"]["adb_fallback_used"] is False
+
+
+class TestHashtagsHandoff:
+    """Hashtags must reach the agent as a list[str], never per-character."""
+
+    def test_normalize_hashtags_passthrough_list(self):
+        assert _normalize_hashtags(["#football", "#fifa"]) == ["#football", "#fifa"]
+
+    def test_normalize_hashtags_splits_string_into_whole_tags(self):
+        # The legacy bug: a joined string was passed to list(), exploding it
+        # into single characters. It must split on whitespace/commas instead.
+        assert _normalize_hashtags("#football #fifa") == ["#football", "#fifa"]
+        assert _normalize_hashtags("#football, #fifa") == ["#football", "#fifa"]
+
+    def test_normalize_hashtags_empty(self):
+        assert _normalize_hashtags(None) == []
+        assert _normalize_hashtags("") == []
+        assert _normalize_hashtags([]) == []
+
+    def test_string_hashtags_setting_reaches_runner_as_list(self, monkeypatch):
+        monkeypatch.delenv("MOBILE_UI_EXECUTOR", raising=False)
+        captured: dict = {}
+        step = MobileUIAutomationStep(
+            agent_runner_factory=_stub_factory(captured, _ok_result()),
+        )
+        # Simulate a stale/legacy joined-string value in settings.
+        ctx = _ctx(settings={"hashtags": "#football #fifa #worldcup"})
+        asyncio.run(step.run(ctx))
+        assert captured["kwargs"]["hashtags"] == ["#football", "#fifa", "#worldcup"]
+
+    def test_caption_base_preferred_over_full_caption_for_agent(self, monkeypatch):
+        monkeypatch.delenv("MOBILE_UI_EXECUTOR", raising=False)
+        captured: dict = {}
+        step = MobileUIAutomationStep(
+            agent_runner_factory=_stub_factory(captured, _ok_result()),
+        )
+        ctx = _ctx(
+            settings={
+                "caption_text": "Body text\n\n#football #fifa",
+                "caption_base": "Body text",
+                "hashtags": ["#football", "#fifa"],
+            }
+        )
+        asyncio.run(step.run(ctx))
+        # Agent receives the body only; the goal builder appends the tags once.
+        assert captured["kwargs"]["caption"] == "Body text"
+        assert captured["kwargs"]["hashtags"] == ["#football", "#fifa"]
 
 
 # ---------------------------------------------------------------------------

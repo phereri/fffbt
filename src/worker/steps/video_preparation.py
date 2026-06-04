@@ -88,6 +88,14 @@ class VideoPreparationStep:
             if not verified:
                 return self._fail("device_offline", f"file not found on device after push: {remote_path}", retryable=True)
 
+            # 6. Hand off to the downstream mobile-UI step: the video is already
+            # on the device, so the agent must NOT re-prepare/re-push it. The
+            # agent goal switches to its skip-prep branch when
+            # ``host_video_in_gallery`` (the gallery filename) is set.
+            ctx.settings["host_video_in_gallery"] = push_source.name
+            ctx.settings["device_video_path"] = remote_path
+            ctx.settings["device_video_filename"] = push_source.name
+
             return StepResult(
                 step=StepName.VIDEO_PREPARATION,
                 status=StepStatus.OK,
