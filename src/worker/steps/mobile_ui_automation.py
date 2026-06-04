@@ -15,8 +15,13 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from src.worker.agent_runner import (
+    AgentRunnerResult,
+    MobileRunAgentRunner,
+    ResultCategory,
+)
 from src.worker.session.mobilerun_adapter import MobilerunRouteMissingError, MobilerunWorker
 from src.worker.session.types import (
     Artifact,
@@ -29,6 +34,11 @@ from src.worker.tools._ui import walk_plain_ui
 from src.worker.tools._ui import node_text, parse_bounds
 from src.worker.tools._types import ToolResult
 from src.worker.tools.instagram import verify_caption_text
+
+EXECUTOR_MOBILERUN_AGENT = "mobilerun_agent"
+EXECUTOR_DETERMINISTIC = "deterministic"
+_DEFAULT_EXECUTOR = EXECUTOR_MOBILERUN_AGENT
+_VALID_EXECUTORS = (EXECUTOR_MOBILERUN_AGENT, EXECUTOR_DETERMINISTIC)
 
 logger = logging.getLogger(__name__)
 
@@ -246,8 +256,16 @@ def _text_center(
 class MobileUIAutomationStep:
     """Drive Instagram app to publish a Trial Reel.
 
-    Phase 1: run_goal() to open Instagram and navigate to Share screen.
-    Phase 2: local tools for caption paste, verification, and share.
+    Two executors are supported:
+
+    * ``mobilerun_agent`` (default) — primary path. Builds a Mobilerun
+      ``MobileAgent`` for the device and lets the agent + Instagram AppCard
+      drive the publish flow. UI control goes through Mobilerun TCP tools
+      end-to-end; no raw ADB UI actions are issued from this step.
+    * ``deterministic`` (legacy fallback) — the original hardcoded
+      ``run_goal()`` + per-coordinate TCP path. Kept behind
+      ``MOBILE_UI_EXECUTOR=deterministic`` (or ``ctx.settings["mobile_ui_executor"]``)
+      until the agent path is validated on real devices.
     """
 
     name = StepName.MOBILE_UI_AUTOMATION
@@ -257,11 +275,13 @@ class MobileUIAutomationStep:
         *,
         genfarmer_url: str | None = None,
         artifacts_dir: str | None = None,
+        agent_runner_factory: "Callable[..., MobileRunAgentRunner] | None" = None,
     ) -> None:
         self._genfarmer_url = genfarmer_url
         self._artifacts_dir = artifacts_dir
         self._job_id: str | None = None
         self._captured_artifacts: list[Artifact] = []
+        self._agent_runner_factory = agent_runner_factory or MobileRunAgentRunner
 
     async def run(
         self,
@@ -272,10 +292,6 @@ class MobileUIAutomationStep:
     ) -> StepResult:
         serial = device_serial or ctx.settings.get("device_serial")
         caption = caption_text or ctx.settings.get("caption_text", "")
-        gf_url = (
-            self._genfarmer_url
-            or ctx.settings.get("genfarmer_url", "http://127.0.0.1:55554")
-        )
 
         if not serial:
             return self._fail("INFRA", "no device_serial provided")
@@ -288,6 +304,37 @@ class MobileUIAutomationStep:
         if ctx_settings_dir and not self._artifacts_dir:
             self._artifacts_dir = ctx_settings_dir
 
+        executor = self._select_executor(ctx)
+        if executor not in _VALID_EXECUTORS:
+            return self._fail(
+                "INFRA",
+                f"unknown MOBILE_UI_EXECUTOR={executor!r}; "
+                f"expected one of {_VALID_EXECUTORS}",
+            )
+        if executor == EXECUTOR_MOBILERUN_AGENT:
+            return await self._run_agent_executor(ctx, serial, caption)
+        return await self._run_deterministic_executor(ctx, serial, caption)
+
+    @staticmethod
+    def _select_executor(ctx: StepContext) -> str:
+        ctx_value = ctx.settings.get("mobile_ui_executor")
+        if ctx_value:
+            return str(ctx_value).strip().lower()
+        env_value = os.environ.get("MOBILE_UI_EXECUTOR", "").strip().lower()
+        if env_value:
+            return env_value
+        return _DEFAULT_EXECUTOR
+
+    async def _run_deterministic_executor(
+        self,
+        ctx: StepContext,
+        serial: str,
+        caption: str,
+    ) -> StepResult:
+        gf_url = (
+            self._genfarmer_url
+            or ctx.settings.get("genfarmer_url", "http://127.0.0.1:55554")
+        )
         worker = MobilerunWorker(
             device_serial=serial,
             genfarmer_url=gf_url,
@@ -306,13 +353,13 @@ class MobileUIAutomationStep:
                     "unknown_screen",
                     "MobileRun UI control used disallowed ADB fallback",
                 )
-            self._attach_driver_details(result, worker)
+            self._attach_driver_details(result, worker, executor=EXECUTOR_DETERMINISTIC)
             self._attach_captured_artifacts(result)
             return result
         except Exception as e:
             await self._capture_hard_stop_artifacts(worker, "on_error")
             result = self._fail("UNKNOWN", f"unhandled: {e}")
-            self._attach_driver_details(result, worker)
+            self._attach_driver_details(result, worker, executor=EXECUTOR_DETERMINISTIC)
             self._attach_captured_artifacts(result)
             return result
         finally:
@@ -320,6 +367,99 @@ class MobileUIAutomationStep:
                 await asyncio.to_thread(worker.disconnect)
             except Exception:
                 pass
+
+    async def _run_agent_executor(
+        self,
+        ctx: StepContext,
+        serial: str,
+        caption: str,
+    ) -> StepResult:
+        runner_kwargs = dict(
+            device_serial=serial,
+            job_id=ctx.job_id,
+            caption=caption,
+            hashtags=list(ctx.settings.get("hashtags") or []),
+            expected_username=ctx.settings.get("expected_username")
+            or ctx.settings.get("account_username"),
+            video_id=ctx.video_id,
+            local_video_path=ctx.settings.get("local_video_path"),
+            host_video_in_gallery=ctx.settings.get("host_video_in_gallery"),
+            mode="proof_of_posting",
+            config_path=ctx.settings.get("mobilerun_config_path"),
+            app_cards_dir=ctx.settings.get("mobilerun_app_cards_dir"),
+            trajectories_dir=ctx.settings.get("mobilerun_trajectories_dir"),
+            model_overrides=ctx.settings.get("mobilerun_overrides") or {},
+            timeout_seconds=int(ctx.settings.get("mobilerun_timeout_seconds") or 1500),
+        )
+        try:
+            runner = self._agent_runner_factory(**runner_kwargs)
+        except Exception as exc:
+            return self._fail("INFRA", f"agent runner construction failed: {exc}")
+
+        try:
+            agent_result = await runner.run()
+        except Exception as exc:
+            return self._fail("UNKNOWN", f"agent runner raised: {exc}")
+
+        return self._agent_result_to_step(agent_result)
+
+    def _agent_result_to_step(self, agent_result: AgentRunnerResult) -> StepResult:
+        artifacts = [
+            Artifact(
+                artifact_id=path,
+                artifact_type="mobilerun_trajectory",
+                label="trajectory",
+            )
+            for path in agent_result.trajectory_paths
+        ]
+        details: dict[str, Any] = {
+            "mobile_driver": {
+                "primary": "mobilerun_agent",
+                "executor": EXECUTOR_MOBILERUN_AGENT,
+                "use_tcp": True,
+                "adb_fallback_used": False,
+                "agent_status": agent_result.agent_status,
+                "failure_reason": agent_result.failure_reason,
+            }
+        }
+        if agent_result.category is ResultCategory.OK:
+            result = StepResult(
+                step=StepName.MOBILE_UI_AUTOMATION,
+                status=StepStatus.OK,
+                message=agent_result.message,
+                artifacts=artifacts,
+                details=details,
+            )
+            return result
+        if agent_result.category is ResultCategory.HARD_STOP:
+            result = StepResult(
+                step=StepName.MOBILE_UI_AUTOMATION,
+                status=StepStatus.FAILED,
+                code=agent_result.error_code,
+                message=agent_result.message,
+                retryable=False,
+                artifacts=artifacts,
+                details=details,
+            )
+            return result
+        if agent_result.category is ResultCategory.INFRA:
+            return StepResult(
+                step=StepName.MOBILE_UI_AUTOMATION,
+                status=StepStatus.FAILED,
+                code=agent_result.error_code or "INFRA",
+                message=agent_result.message,
+                retryable=True,
+                artifacts=artifacts,
+                details=details,
+            )
+        return StepResult(
+            step=StepName.MOBILE_UI_AUTOMATION,
+            status=StepStatus.NEEDS_REVIEW,
+            code=agent_result.error_code or "unknown_screen",
+            message=agent_result.message,
+            artifacts=artifacts,
+            details=details,
+        )
 
     async def _execute(
         self,
@@ -994,11 +1134,18 @@ class MobileUIAutomationStep:
             return
         result.artifacts = list(result.artifacts) + list(self._captured_artifacts)
 
-    def _attach_driver_details(self, result: StepResult, worker: MobilerunWorker) -> None:
+    def _attach_driver_details(
+        self,
+        result: StepResult,
+        worker: MobilerunWorker,
+        *,
+        executor: str = EXECUTOR_DETERMINISTIC,
+    ) -> None:
         actions = worker.actions_log
         details = dict(result.details or {})
         details["mobile_driver"] = {
             "primary": "mobilerun_tcp",
+            "executor": executor,
             "use_tcp": True,
             "adb_fallback_used": any(a.get("action") == "adb_fallback" for a in actions),
             "actions": actions,

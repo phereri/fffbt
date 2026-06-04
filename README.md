@@ -36,9 +36,12 @@ This README is the operator + developer cheatsheet. Deeper docs live under
 3. **The worker prepares the video** — `VideoPreparationStep` validates the
    `.mp4`, transcodes for Android if needed, pushes it to `/sdcard/DCIM/Camera`,
    and triggers MediaScanner.
-4. **MobileRun controls Instagram** — `MobileUIAutomationStep` opens Instagram,
-   navigates Profile → Professional dashboard → Trial Reels → create, fills the
-   caption + hashtags, dismisses the keyboard, and taps the final OK to publish.
+4. **MobileRun AI agent controls Instagram** — `MobileUIAutomationStep`
+   delegates to a MobileRun `MobileAgent` driven by the Instagram AppCard
+   (`config/mobilerun/app_cards/instagram.md`). The agent reaches the Trial
+   Reel composer via Path A/B/C, pastes the caption through the Mobilerun
+   Keyboard, verifies it, and publishes. The legacy hardcoded TCP-coordinate
+   path is retained behind `MOBILE_UI_EXECUTOR=deterministic` (see section 7).
 5. **Verification confirms the post** — `VerificationStep` does two-level
    verification: immediate (publish screen gone) and delayed (trial reel
    visible in the trials list).
@@ -104,8 +107,9 @@ validation.
 | Scheduler CLI | `src/scheduler/cli.py` | Operator entry point: status, create-job, run-job, run-launcher, cleanup-job, seed-validation-video, discover-devices, sync-drive. |
 | Job launcher | `src/scheduler/launcher.py` | Async loop that dispatches many jobs through the pipeline. Supports `--max-parallel` override and `--max-jobs` stop-after-N. |
 | Pipeline | `src/scheduler/pipeline.py` | Glue between launcher and worker steps. Owns state transitions, heartbeats, error routing. |
-| Worker steps | `src/worker/steps/{video_preparation,mobile_ui_automation,verification}.py` | The actual posting flow. |
-| MobileWorker session | `src/worker/session/{interface,types,mobilerun_adapter}.py` | `MobileWorker` abstract base + `MobilerunWorker` implementation that talks to MobileRun TCP / GenFarmer. |
+| Worker steps | `src/worker/steps/{video_preparation,mobile_ui_automation,verification}.py` | The actual posting flow. `mobile_ui_automation` dispatches to the agent runner by default. |
+| MobileRun agent runner | `src/worker/agent_runner/{mobilerun_agent_runner,goal,result}.py` | Builds + runs a MobileRun `MobileAgent` for one device with the Instagram AppCard; maps `failure_reason` to error codes. |
+| MobileWorker session | `src/worker/session/{interface,types,mobilerun_adapter}.py` | `MobileWorker` abstract base + `MobilerunWorker` implementation that talks to MobileRun TCP / GenFarmer (used by the legacy deterministic executor). |
 | Worker tools | `src/worker/tools/{_adb,_ui,instagram,video,device}.py` | Lower-level primitives: ADB shell/push/tap, UI parsing, Instagram-specific helpers, video prep. |
 | MobileRun config | `config/mobilerun/{config.yaml,app_cards/,platform_defaults.yaml,shopaikey_models.yaml}` | What MobileRun is told about Instagram and the LLM router. |
 | Validation videos | `automation.videos` with `category='validation'` + `download_method='local_validation'` | Excluded from the generic queue (see migration `20260603130000`). |
@@ -237,10 +241,26 @@ expected to skip them when the prerequisites are missing.
 **Instagram UI control must go through MobileRun TCP.** The runtime safety
 contract is:
 
+- The **primary executor is the MobileRun AI agent**, not hardcoded Python
+  navigation. `MobileUIAutomationStep` reads `MOBILE_UI_EXECUTOR`
+  (default `mobilerun_agent`) and dispatches to
+  `src/worker/agent_runner/mobilerun_agent_runner.py`. The runner builds a
+  `MobileAgent` from `config/mobilerun/config.yaml`, hands it the goal
+  template from `src/worker/agent_runner/goal.py`, and lets the agent +
+  Instagram AppCard drive Trial Reel publishing end-to-end.
+- The legacy hardcoded TCP-coordinate path is preserved as a **fallback**
+  behind `MOBILE_UI_EXECUTOR=deterministic` (or
+  `ctx.settings["mobile_ui_executor"]`). Use it only when the agent path is
+  unavailable (e.g. `mobilerun` package missing on the host) or for
+  side-by-side A/B testing on a single device. Unknown values for the env
+  var return `INFRA` immediately — no silent fallback.
 - Normal `proof_of_posting` UI actions (tap, swipe, type) **must not** use raw
-  ADB. `MobileUIAutomationStep` constructs `MobilerunWorker(adb_fallback=False,
-  use_tcp=True)`; if any step logs an `adb_fallback` action the result is
-  forced to `needs_review` (`code='unknown_screen'`).
+  ADB. The deterministic legacy executor constructs
+  `MobilerunWorker(adb_fallback=False, use_tcp=True)`; if any step logs an
+  `adb_fallback` action the result is forced to `needs_review`
+  (`code='unknown_screen'`). The agent path never instantiates
+  `MobilerunWorker` at all — by construction no raw ADB UI calls leave the
+  step.
 - ADB is allowed only for:
   - device connection (`adb connect`, `adb devices`)
   - app lifecycle (`am force-stop`, `am start`, `monkey -p ...`)
