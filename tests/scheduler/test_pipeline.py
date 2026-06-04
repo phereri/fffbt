@@ -286,7 +286,12 @@ class TestCaptionAssembly:
         caption = ctx.settings["caption_text"]
         assert "football" in caption.lower() or "fifa" in caption.lower()
         assert 3 <= len(hashtags) <= 7
-        assert ctx.settings["hashtags"] == " ".join(hashtags)
+        # hashtags must be stored as a real list[str], not a joined string —
+        # a joined string gets re-split per-character by the agent runner.
+        assert ctx.settings["hashtags"] == list(hashtags)
+        assert isinstance(ctx.settings["hashtags"], list)
+        # caption_base is the body without tags; the full caption starts with it.
+        assert caption.startswith(ctx.settings["caption_base"])
         update_call = conn.execute.await_args_list[0]
         assert "UPDATE automation.jobs SET caption" in update_call.args[0]
         assert update_call.args[1][0] == caption

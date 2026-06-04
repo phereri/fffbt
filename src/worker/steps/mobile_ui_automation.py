@@ -156,6 +156,23 @@ def _parse_activity_dump(source: str) -> list[dict[str, Any]]:
     return nodes
 
 
+def _normalize_hashtags(value: Any) -> list[str]:
+    """Coerce a ``hashtags`` setting into a list of complete tags.
+
+    Accepts a ``list``/``tuple`` of tags (preferred) or a whitespace/comma
+    separated string (legacy). A string is split on separators, never into
+    individual characters — guarding against ``list("a b")`` producing
+    ``['a', ' ', 'b']``.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [tok for tok in re.split(r"[\s,]+", value.strip()) if tok]
+    if isinstance(value, (list, tuple)):
+        return [str(tok) for tok in value if str(tok).strip()]
+    return []
+
+
 def _detect_hard_stop(ui_nodes: list[dict[str, Any]]) -> tuple[str, str] | None:
     all_text = " ".join(
         str(n.get("text") or n.get("contentDescription") or "")
@@ -374,11 +391,15 @@ class MobileUIAutomationStep:
         serial: str,
         caption: str,
     ) -> StepResult:
+        # The agent goal renders ``caption_base`` + ``hashtags`` (appended once).
+        # ``caption`` (== caption_text) already folds the tags in for the
+        # deterministic path, so prefer the body to avoid duplicating them.
+        agent_caption = ctx.settings.get("caption_base") or caption
         runner_kwargs = dict(
             device_serial=serial,
             job_id=ctx.job_id,
-            caption=caption,
-            hashtags=list(ctx.settings.get("hashtags") or []),
+            caption=agent_caption,
+            hashtags=_normalize_hashtags(ctx.settings.get("hashtags")),
             expected_username=ctx.settings.get("expected_username")
             or ctx.settings.get("account_username"),
             video_id=ctx.video_id,

@@ -125,6 +125,25 @@ class TestBuildGoal:
         assert "push_video_to_gallery" in goal
         assert "/path/video.mp4" in goal
 
+    def test_hashtags_rendered_intact_and_once(self):
+        # Body caption (no tags) + a hashtags list → tags appended exactly once,
+        # as whole tags (regression guard against per-character explosion).
+        goal = build_trial_reel_goal(
+            device_serial="serial",
+            caption="Match day energy",
+            hashtags=["#football", "fifa"],
+            expected_username=None,
+            video_id=None,
+            host_video_in_gallery="x.mp4",
+        )
+        assert "#football" in goal
+        assert "#fifa" in goal
+        # Each tag appears exactly once in the rendered caption block.
+        assert goal.count("#football") == 1
+        assert goal.count("#fifa") == 1
+        # No per-character artifacts like "#f #o #o ...".
+        assert "#f #o" not in goal
+
     def test_skip_prep_when_host_pushed(self):
         goal = build_trial_reel_goal(
             device_serial="serial",
@@ -136,6 +155,11 @@ class TestBuildGoal:
         )
         assert "skipped — host already pushed" in goal
         assert "Do NOT call ``prepare_video_for_android``" in goal
+        assert "x.mp4" in goal
+        # The prepare/push instruction from the local-video branch must NOT
+        # appear — the host already pushed the file.
+        assert "Run ``prepare_video_for_android`` with source_path" not in goal
+        assert "Run ``push_video_to_gallery`` with that same prepared path" not in goal
 
 
 # ---------------------------------------------------------------------------

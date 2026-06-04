@@ -332,7 +332,13 @@ async def _prepare_caption(
         hashtag_count=hashtag_count,
     )
     ctx.settings["caption_text"] = full_caption
-    ctx.settings["hashtags"] = " ".join(hashtags)
+    # Store the caption body (no hashtags) and the hashtags as a real list.
+    # The deterministic executor types ``caption_text`` (body + tags) directly;
+    # the agent executor renders ``caption_base`` + ``hashtags`` so the tags are
+    # appended exactly once. Keeping ``hashtags`` a list[str] is mandatory — a
+    # joined string was being re-split per-character downstream.
+    ctx.settings["caption_base"] = base_caption
+    ctx.settings["hashtags"] = list(hashtags)
 
     await conn.execute(
         "UPDATE automation.jobs SET caption = %s, hashtags = %s WHERE id = %s",

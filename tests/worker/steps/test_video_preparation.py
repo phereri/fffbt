@@ -117,6 +117,69 @@ class TestHappyPath:
         assert "clip_h264_yuv420p.mp4" in call_args[0][1]
 
 
+class TestHandoffToAgent:
+    """On success, the step records where the video landed so the agent skips
+    its own prepare/push (the host already did it)."""
+
+    @patch("src.worker.steps.video_preparation.adb_shell", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.push_video_to_gallery", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.prepare_video_for_android")
+    def test_success_populates_ctx_settings(self, mock_transcode, mock_push, mock_shell, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\x00" * 4096)
+
+        mock_transcode.return_value = ToolResult.ok("already android-friendly")
+        mock_push.return_value = ToolResult.ok("pushed and scanned /sdcard/DCIM/Camera/clip.mp4")
+        mock_shell.return_value = "/sdcard/DCIM/Camera/clip.mp4"
+
+        ctx = _ctx()
+        step = VideoPreparationStep()
+        result = run(step.run(ctx, local_video_path=str(video), device_serial="serial1"))
+
+        assert result.status == StepStatus.OK
+        assert ctx.settings["host_video_in_gallery"] == "clip.mp4"
+        assert ctx.settings["device_video_path"] == "/sdcard/DCIM/Camera/clip.mp4"
+        assert ctx.settings["device_video_filename"] == "clip.mp4"
+
+    @patch("src.worker.steps.video_preparation.adb_shell", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.push_video_to_gallery", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.prepare_video_for_android")
+    def test_uses_transcoded_filename_for_handoff(self, mock_transcode, mock_push, mock_shell, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\x00" * 4096)
+        transcoded = tmp_path / "clip_h264_yuv420p.mp4"
+        transcoded.write_bytes(b"\x00" * 4096)
+
+        mock_transcode.return_value = ToolResult.ok(f"transcoded -> {transcoded}")
+        mock_push.return_value = ToolResult.ok("pushed")
+        mock_shell.return_value = f"/sdcard/DCIM/Camera/{transcoded.name}"
+
+        ctx = _ctx()
+        step = VideoPreparationStep()
+        result = run(step.run(ctx, local_video_path=str(video), device_serial="s"))
+
+        assert result.status == StepStatus.OK
+        assert ctx.settings["host_video_in_gallery"] == "clip_h264_yuv420p.mp4"
+
+    @patch("src.worker.steps.video_preparation.adb_shell", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.push_video_to_gallery", new_callable=AsyncMock)
+    @patch("src.worker.steps.video_preparation.prepare_video_for_android")
+    def test_failed_verify_does_not_populate_handoff(self, mock_transcode, mock_push, mock_shell, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\x00" * 4096)
+
+        mock_transcode.return_value = ToolResult.ok("already android-friendly")
+        mock_push.return_value = ToolResult.ok("pushed")
+        mock_shell.return_value = ""  # ls returns nothing → not verified
+
+        ctx = _ctx()
+        step = VideoPreparationStep()
+        result = run(step.run(ctx, local_video_path=str(video), device_serial="s"))
+
+        assert result.status == StepStatus.FAILED
+        assert "host_video_in_gallery" not in ctx.settings
+
+
 class TestPushRetry:
     @patch("src.worker.steps.video_preparation.adb_shell", new_callable=AsyncMock)
     @patch("src.worker.steps.video_preparation.push_video_to_gallery", new_callable=AsyncMock)
