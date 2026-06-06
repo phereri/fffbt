@@ -3,8 +3,23 @@
 - Status: research draft
 - Owner: Architect / Tech Lead
 - Issue: [FFF-58](mention://issue/c24ef4d0-45c7-4db3-938c-2d906735ee82)
-- Last updated: 2026-05-25
-- Source archive: `fffbt-mobilerun.zip` attached to FFF-58 (real `phereri/fffbt-mobilerun` snapshot, 2026-05-25)
+- Last updated: 2026-06-06
+- Source archives:
+  - `fffbt-mobilerun.zip` attached to FFF-58 (2026-05-25 snapshot — the
+    one this document was first written against).
+  - `fffbt-mobilerun (1)` (2026-06-06 snapshot) — adds:
+    `farm/{adb_app_launch,permissions_auto,posting_doctor,profile_reels_nav,proxy_fleet_mapping,proxyconnector,publish_kinds,runs_db,schedule_epoch,verify_profile_reels}.py`,
+    `farm/{batch_login_assignments,ig_login_human,login_batch_errors,post_recovery_regular,regular_publish_confirm}.py`,
+    and `docs/{AUTONOMOUS_POSTING_SERVICE.md,OPERATOR.md,genfarmer_change_device.md,SETUP_OTHER_PC.md,CURSOR_STOP_ALLOW_POPUPS.md}`.
+  - **Device-side practical lessons** from the newer snapshot's
+    `docs/OPERATOR.md` are ported to
+    [`device-operator-notes.md`](device-operator-notes.md) — read that
+    before designing the next environment-apply / verify step.
+  - The newer Instagram AppCard adds (a) a top-of-file "Proxy (farm)"
+    block forbidding ProxyConnector toggles mid-job, and (b) a "Regular
+    Reel (Trial OFF)" sibling-screen note. Both are merged into
+    `config/mobilerun/app_cards/instagram.md` already; the Regular Reel
+    flow remains **deferred** for FFFBT (Trial Reels only).
 
 This document inspects the **real, working** Mobilerun automation repo that
 already publishes Instagram Trial Reels in production, and maps each useful

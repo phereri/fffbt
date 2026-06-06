@@ -7,6 +7,12 @@ after scroll). Never tap raw coordinates.
 
 **End-to-end checklist:** `docs/instagram-appcard-reference.md`
 
+**Proxy (farm):** SOCKS/VPN on the phone is set **manually** by the operator
+before the worker starts. Do not toggle proxies or call ProxyConnector-style
+CONNECT/CHECK helpers during login / post / verify unless the task goal text
+explicitly asks for it. The host honors `FARM_SKIP_PROXY_CHECK=1`; see
+`docs/research/device-operator-notes.md` for the lessons-learned context.
+
 ## Global rules
 
 - Stealth on. Never chain rapid taps. Wait for `wait_for_stable_ui` between
@@ -101,6 +107,13 @@ Full spec: `docs/instagram-appcard-reference.md`.
 3. **Reel** in the menu.
 4. Gallery → newest pushed video → **Next** through editor.
 5. On Share/caption screen: turn **ON** the **Trial** toggle, then caption + share.
+
+**Regular Reel (Trial OFF) — deferred for FFFBT MVP.** The same Path C entry
+with the **Trial toggle OFF** publishes a normal Reel. The FFFBT MVP path
+publishes Trial Reels only; do **not** disable the Trial toggle and do
+**not** fall back to a regular Reel on `trial_reels_unavailable`. This note
+is here so the agent recognises the screen if it accidentally lands on it,
+not to enable the regular-Reel flow.
 
 ### After composer is open (all paths)
 
