@@ -15,6 +15,14 @@
     `docs/OPERATOR.md` are ported to
     [`device-operator-notes.md`](device-operator-notes.md) — read that
     before designing the next environment-apply / verify step.
+  - **Port-spec docs** for the two highest-value module ports are in:
+    - [`device-preflight-port-spec.md`](device-preflight-port-spec.md) —
+      Portal-tree health probe + bounded reboot policy (target: FFF-31
+      preflight + FFF-25 GPS apply order).
+    - [`trial-reel-verify-port-spec.md`](trial-reel-verify-port-spec.md) —
+      deterministic verifier (target: FFF-32 verification option A).
+    Both list forbidden imports, acceptance tests, and the exact set of
+    new files / error codes / migrations the port PR needs to land.
   - The newer Instagram AppCard adds (a) a top-of-file "Proxy (farm)"
     block forbidding ProxyConnector toggles mid-job, and (b) a "Regular
     Reel (Trial OFF)" sibling-screen note. Both are merged into
