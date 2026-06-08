@@ -119,13 +119,39 @@ Say "Restarting WSL to apply networking config"
 wsl.exe --shutdown
 
 # --- 3. Ensure the Ubuntu distro is installed ------------------------------
-$haveDistro = (wsl.exe -l -q) -match "^$([regex]::Escape($Distro))$"
-if (-not $haveDistro) {
+# `wsl -l -q` emits UTF-16 with embedded NUL bytes; normalize before matching.
+function Get-WslDistros {
+  $raw = & wsl.exe -l -q 2>$null
+  $raw | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ -ne "" }
+}
+
+$installed = Get-WslDistros
+$haveDistro = $installed -contains $Distro
+if ($haveDistro) {
+  Say "Distro '$Distro' already installed — skipping install"
+} else {
   Say "Installing distro: $Distro (no interactive user; we operate as root)"
   wsl.exe --install -d $Distro --no-launch
-  if ($LASTEXITCODE -ne 0) {
+  # Treat ALREADY_EXISTS as success (race / name variant already present).
+  $after = Get-WslDistros
+  if (($after -contains $Distro) -or ($after.Count -gt 0)) {
+    Say "Distro present after install step"
+    if (-not ($after -contains $Distro) -and $after.Count -gt 0) {
+      Warn "Exact name '$Distro' not found; available: $($after -join ', ')"
+      Warn "Re-run with -Distro <one-of-the-above> if the bootstrap targets the wrong distro."
+    }
+  } else {
     Die "Could not install $Distro. Try: wsl --list --online  then re-run with -Distro <name>."
   }
+}
+
+# Ensure the distro is initialized (a never-launched distro has no users yet;
+# running a trivial command as root forces first-boot setup).
+Say "Initializing $Distro (first-boot if needed)"
+wsl.exe -d $Distro -u root -- bash -lc "true" *> $null
+if ($LASTEXITCODE -ne 0) {
+  Warn "Could not run a command in $Distro as root. If this is a brand-new distro,"
+  Warn "launch it once interactively (wsl -d $Distro) to complete setup, then re-run."
 }
 
 # --- 4. Clone the repo + run the Linux bootstrap inside WSL -----------------
