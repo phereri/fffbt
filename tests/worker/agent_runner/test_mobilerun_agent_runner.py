@@ -246,6 +246,13 @@ class TestBuildRequest:
         with pytest.raises(ValueError):
             _runner(mode="production")
 
+    def test_tools_and_output_model_default_empty(self):
+        # The posting path must be unchanged: no custom tools, no output_model
+        # override unless the caller (registration runner) sets them.
+        request = _runner().build_request()
+        assert request.tools == ()
+        assert request.output_model is None
+
     def test_rejects_missing_device_serial(self):
         with pytest.raises(ValueError):
             _runner(device_serial="")

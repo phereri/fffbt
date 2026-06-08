@@ -118,6 +118,8 @@ class AgentFactoryRequest:
     config_path: str
     platform: str
     timeout_seconds: int
+    tools: tuple[Any, ...] = ()
+    output_model: Any | None = None
 
 
 class _AgentHandle:
@@ -368,14 +370,17 @@ def _default_agent_factory(request: AgentFactoryRequest) -> _AgentHandle:
             except Exception:
                 logger.debug("could not apply override %s", key)
 
-    post_result_model = _post_result_pydantic_model()
-    return MobileAgent(
+    post_result_model = request.output_model or _post_result_pydantic_model()
+    agent_kwargs: dict[str, Any] = dict(
         goal=request.goal,
         config=config,
         variables=request.variables,
         output_model=post_result_model,
         timeout=request.timeout_seconds,
     )
+    if request.tools:
+        agent_kwargs["tools"] = list(request.tools)
+    return MobileAgent(**agent_kwargs)
 
 
 def _post_result_pydantic_model() -> type:
