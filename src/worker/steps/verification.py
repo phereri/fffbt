@@ -35,19 +35,28 @@ _GOAL_VERIFY_IMMEDIATE = (
 )
 
 _GOAL_VERIFY_DASHBOARD = (
-    "Navigate to verify the Trial Reel is live. Trial Reels do NOT appear on "
+    "Verify the just-published Trial Reel is live. Trial Reels do NOT appear on "
     "the main profile grid — only in the Professional dashboard's Trial reels "
-    "list.\n"
+    "list. Navigate there and CONFIRM the reel before reporting anything.\n"
     "1. Go to the Profile tab.\n"
-    "2. Tap 'Professional dashboard' (may say 'Professional Tools' or "
-    "'Pro dashboard').\n"
-    "3. Inside the dashboard, tap the 'Trial reels' tile.\n"
-    "4. Pull down to refresh the list (swipe down from the top once) — a "
-    "just-posted Trial Reel often does not show until the list is refreshed.\n"
-    "5. Check that the most recent Trial Reel thumbnail is present at the top "
-    "of the list and appears freshly posted.\n"
-    "Report success=true if a fresh Trial Reel is visible at the top of the "
-    "Trial reels list."
+    "2. Tap the 'Professional dashboard' banner (may say 'Professional Tools' / "
+    "'Pro dashboard'); it opens a screen whose title is 'Professional dashboard'.\n"
+    "3. On the dashboard, the 'Trial reels' entry is a ROW near the BOTTOM of the "
+    "screen (content-desc/text 'Trial reels'). Scroll down if it is not visible, "
+    "then tap it. Resolve it by text/content-desc — do not guess coordinates and "
+    "do not idle on the dashboard.\n"
+    "4. On the Trial reels list, pull down to refresh once (swipe down from the "
+    "top) — a just-posted reel often does not appear until the list is refreshed.\n"
+    "5. Inspect the NEWEST tile (top-left) and confirm a freshly posted Trial "
+    "Reel is present at the top of the list.\n"
+    "Anti-stall: never issue repeated 'wait' actions. After at most ONE short "
+    "wait for a screen to settle, take a real tap toward the goal. If two "
+    "consecutive actions leave you on the same screen, tap the specific next "
+    "target ('Trial reels'), or press Back to the profile and retry — do not "
+    "loop on 'wait'.\n"
+    "Report success=true ONLY if you actually reached the Trial reels list and "
+    "can see a fresh Trial Reel at the top. If you could not reach or could not "
+    "confirm the list, report success=false — never assume success."
 )
 
 _GOAL_CAPTURE_URL = (
@@ -121,8 +130,10 @@ class VerificationStep:
             )
             await asyncio.sleep(delay)
 
-            # Level 2: dashboard verification
-            level2 = await self._verify_dashboard(worker)
+            # Level 2: dashboard verification (authoritative). Runs through the
+            # in-process MobileAgent (the working executor path), not
+            # worker.run_goal / GenFarmer /automation/run.
+            level2 = await self._verify_dashboard(serial, ctx)
             await self._screenshot(worker, "verification_result")
 
             post_url = await self._try_capture_url(worker)
@@ -169,15 +180,42 @@ class VerificationStep:
         except Exception:
             return False
 
-    async def _verify_dashboard(self, worker: MobilerunWorker) -> bool:
+    async def _verify_dashboard(self, serial: str, ctx: StepContext) -> bool:
+        # Authoritative Level-2 check. Drive the dashboard-verification goal
+        # through the in-process MobileAgent (the path the publish executor
+        # uses and that actually navigates the device). worker.run_goal hits the
+        # GenFarmer /automation/run endpoint, which returns ~immediately without
+        # driving the device, so it could never confirm a live reel.
+        from src.worker.agent_runner.mobilerun_agent_runner import (
+            run_agent_goal,
+            verification_result_model,
+        )
+
         try:
-            result = await asyncio.to_thread(
-                worker.run_goal, _GOAL_VERIFY_DASHBOARD, timeout_seconds=60
+            structured = await run_agent_goal(
+                device_serial=serial,
+                goal=_GOAL_VERIFY_DASHBOARD,
+                config_path=ctx.settings.get("mobilerun_config_path"),
+                app_cards_dir=ctx.settings.get("mobilerun_app_cards_dir"),
+                trajectories_dir=ctx.settings.get("mobilerun_trajectories_dir"),
+                output_model=verification_result_model(),
+                timeout_seconds=int(
+                    ctx.settings.get("verification_dashboard_timeout_seconds", "200")
+                ),
             )
-            status = str(result.get("status", "")).lower()
-            return status in ("success", "completed", "ok", "done")
-        except Exception:
+        except Exception as e:  # pragma: no cover - defensive
+            logger.info("level 2 dashboard agent run raised: %s", e)
             return False
+
+        if structured is None:
+            logger.info("level 2 dashboard verification: no structured output")
+            return False
+        if isinstance(structured, dict):
+            confirmed = bool(structured.get("success"))
+        else:
+            confirmed = bool(getattr(structured, "success", False))
+        logger.info("level 2 dashboard verification: confirmed=%s", confirmed)
+        return confirmed
 
     async def _try_capture_url(self, worker: MobilerunWorker) -> str | None:
         try:

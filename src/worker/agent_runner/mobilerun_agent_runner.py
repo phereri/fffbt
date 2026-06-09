@@ -417,6 +417,79 @@ def _default_agent_factory(request: AgentFactoryRequest) -> _AgentHandle:
     return MobileAgent(**agent_kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Generic in-process goal runner (used by the verification step)
+# ---------------------------------------------------------------------------
+
+
+def verification_result_model() -> type:
+    """Structured-output model for a dashboard verification agent run."""
+    from pydantic import BaseModel, Field
+
+    class VerificationResult(BaseModel):
+        success: bool = Field(
+            description=(
+                "True ONLY if a freshly posted Trial Reel was confirmed visible "
+                "at the top of the Trial reels list; False otherwise."
+            )
+        )
+        reason: str | None = Field(
+            default=None, description="Short note on what was observed."
+        )
+
+    return VerificationResult
+
+
+async def run_agent_goal(
+    *,
+    device_serial: str,
+    goal: str,
+    config_path: str | Path | None = None,
+    app_cards_dir: str | Path | None = None,
+    trajectories_dir: str | Path | None = None,
+    model_overrides: dict[str, Any] | None = None,
+    output_model: type | None = None,
+    timeout_seconds: int = 200,
+    agent_factory: AgentFactory | None = None,
+) -> Any:
+    """Run an arbitrary goal through the in-process ``MobileAgent`` — the same
+    path the proof_of_posting executor uses — and return the agent's structured
+    output object (or ``None``).
+
+    The verification step uses this instead of ``MobilerunWorker.run_goal`` (the
+    GenFarmer ``/automation/run`` endpoint), which returns without actually
+    driving the device. No custom tools are registered: dashboard navigation
+    only needs the stock primitives.
+    """
+    overrides: dict[str, Any] = {"use_tcp": True}
+    if app_cards_dir:
+        overrides["app_cards_dir"] = str(app_cards_dir)
+    overrides["trajectory_path"] = str(
+        trajectories_dir
+        or os.environ.get("MOBILERUN_TRAJECTORIES_DIR")
+        or "trajectories"
+    )
+    for key, value in (model_overrides or {}).items():
+        overrides[key] = value
+
+    request = AgentFactoryRequest(
+        goal=goal,
+        device_serial=device_serial,
+        variables={"device_serial": device_serial},
+        overrides=overrides,
+        config_path=str(
+            config_path or os.environ.get("MOBILERUN_CONFIG") or _DEFAULT_CONFIG_PATH
+        ),
+        platform=_DEFAULT_PLATFORM,
+        timeout_seconds=int(timeout_seconds),
+        output_model=output_model,
+    )
+    factory = agent_factory or _default_agent_factory
+    agent = factory(request)
+    raw = await _await_agent_run(agent)
+    return _attr(raw, "structured_output", None)
+
+
 def _post_result_pydantic_model() -> type:
     """Construct a Pydantic ``PostResult`` model — lazily, once per process."""
     from pydantic import BaseModel, Field
