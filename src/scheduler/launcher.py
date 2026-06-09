@@ -41,8 +41,21 @@ async def _load_settings(conn: psycopg.AsyncConnection) -> dict[str, str]:
     return {row[0]: row[1] for row in await cur.fetchall()}
 
 
-async def _create_publishing_job(conn: psycopg.AsyncConnection) -> dict[str, Any] | None:
-    cur = await conn.execute("SELECT * FROM automation.create_publishing_job()")
+_QUEUE_JOB_FN = {
+    "production": "automation.create_publishing_job()",
+    "validation": "automation.create_validation_publishing_job()",
+}
+
+
+async def _create_publishing_job(
+    conn: psycopg.AsyncConnection, queue: str = "production"
+) -> dict[str, Any] | None:
+    # Production (default) uses the generic queue (Drive videos, non-validation
+    # accounts). Validation is an explicit opt-in that selects ONLY validation/
+    # local_validation videos + is_validation accounts and never touches the
+    # production Drive queue.
+    fn = _QUEUE_JOB_FN.get(queue, _QUEUE_JOB_FN["production"])
+    cur = await conn.execute(f"SELECT * FROM {fn}")
     row = await cur.fetchone()
     if row is None:
         return None
@@ -177,8 +190,16 @@ class JobLauncher:
         max_parallel_override: int | None = None,
         max_jobs: int | None = None,
         steps_factory: "Callable[[], list] | None" = None,
+        queue: str = "production",
     ) -> None:
         self.db_url = db_url
+        if queue not in ("production", "validation"):
+            raise ValueError(
+                f"queue must be 'production' or 'validation', got {queue!r}"
+            )
+        # Which reservation queue this launcher draws from. 'production' (default)
+        # is the generic Drive queue; 'validation' is the isolated test queue.
+        self._queue = queue
         # Factory producing a fresh ordered step list per job. Defaults to the
         # real proof_of_posting steps (resolved lazily in _run_worker so the
         # launcher stays importable without worker deps). A stub factory is
@@ -378,17 +399,38 @@ class JobLauncher:
                             dispatched += 1
 
                         for _ in range(capacity - dispatched):
-                            job = await _create_publishing_job(conn)
+                            job = await _create_publishing_job(conn, self._queue)
                             if job is None:
                                 break
                             job_id = str(job["id"])
                             self.stats["created"] += 1
-                            _jsonl("job_created", job_id=job_id)
+                            _jsonl("job_created", job_id=job_id, queue=self._queue)
                             self._launch_job(job)
                             dispatched += 1
 
                         if dispatched == 0:
-                            _jsonl("no_resources")
+                            _jsonl("no_resources", queue=self._queue)
+                            # Validation mode is a controlled one-shot: if the
+                            # isolated validation queue yields nothing and nothing
+                            # is in flight, exit cleanly instead of polling
+                            # forever (production stays a long-lived daemon).
+                            if (
+                                self._queue == "validation"
+                                and not self._active
+                                and self.stats["created"] == 0
+                            ):
+                                _jsonl(
+                                    "validation_queue_empty",
+                                    message=(
+                                        "no eligible validation video/account/"
+                                        "device available; nothing to run"
+                                    ),
+                                )
+                                log.info(
+                                    "validation queue empty — nothing to run; "
+                                    "exiting cleanly"
+                                )
+                                self._shutdown.set()
             except INFRA_ERRORS as exc:
                 _jsonl("scheduler_loop_error", error=str(exc))
 
@@ -420,7 +462,13 @@ class JobLauncher:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._shutdown.set)
+            try:
+                loop.add_signal_handler(sig, self._shutdown.set)
+            except (NotImplementedError, RuntimeError):
+                # add_signal_handler is unavailable on the Windows Proactor loop
+                # (and outside the main thread); signal-based graceful shutdown
+                # is best-effort. Matches the guard in scheduler.cli._run_job.
+                pass
 
         _jsonl("launcher_start")
         log.info("connecting to database")
@@ -431,9 +479,10 @@ class JobLauncher:
             self._settings = await _load_settings(conn)
 
         self._semaphore = asyncio.Semaphore(self.max_parallel)
-        _jsonl("settings_loaded", max_parallel=self.max_parallel, job_timeout=self.job_timeout, heartbeat_timeout=self.heartbeat_timeout)
+        _jsonl("settings_loaded", queue=self._queue, max_parallel=self.max_parallel, job_timeout=self.job_timeout, heartbeat_timeout=self.heartbeat_timeout)
         log.info(
-            "max_parallel=%d job_timeout=%ds heartbeat_timeout=%ds",
+            "queue=%s max_parallel=%d job_timeout=%ds heartbeat_timeout=%ds",
+            self._queue,
             self.max_parallel,
             self.job_timeout,
             self.heartbeat_timeout,

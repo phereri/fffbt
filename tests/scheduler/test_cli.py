@@ -64,6 +64,28 @@ class TestDispatcher:
         assert result.returncode == 2
         assert "unknown command" in result.stderr
 
+    def test_run_launcher_help_documents_queue(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "run-launcher", "--help"],
+            capture_output=True,
+            text=True,
+            env={**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"},
+        )
+        assert result.returncode == 0
+        assert "--queue" in result.stdout
+        assert "validation" in result.stdout
+
+    def test_run_launcher_rejects_invalid_queue(self):
+        # argparse validates the choice before any DB connection.
+        result = subprocess.run(
+            [sys.executable, "-m", "scheduler.cli", "run-launcher", "--queue", "bogus"],
+            capture_output=True,
+            text=True,
+            env={**dict(__import__("os").environ), "PYTHONPATH": f"{REPO_ROOT}/src"},
+        )
+        assert result.returncode == 2
+        assert "invalid choice" in result.stderr or "validation" in result.stderr
+
     def test_create_job_missing_db_url(self):
         env = {k: v for k, v in __import__("os").environ.items() if k != "SUPABASE_DB_URL"}
         env["PYTHONPATH"] = f"{REPO_ROOT}/src"
