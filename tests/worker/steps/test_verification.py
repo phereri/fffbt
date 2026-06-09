@@ -5,8 +5,25 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from src.worker.session.types import Mode, StepContext, StepName, StepStatus
 from src.worker.steps.verification import VerificationStep
+
+_RUN_AGENT_GOAL = "src.worker.agent_runner.mobilerun_agent_runner.run_agent_goal"
+
+
+@pytest.fixture(autouse=True)
+def mock_run_agent_goal():
+    """Level 2 drives the dashboard goal through run_agent_goal (the in-process
+    MobileAgent), not worker.run_goal. Patch it; default to a confirmed result.
+    Tests needing Level 2 to fail request this fixture and set
+    ``.return_value.success = False``."""
+    with patch(_RUN_AGENT_GOAL, new_callable=AsyncMock) as m:
+        confirmed = MagicMock()
+        confirmed.success = True
+        m.return_value = confirmed
+        yield m
 
 
 def _ctx(**overrides) -> StepContext:
@@ -73,14 +90,15 @@ class TestLevel1Failure:
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
     def test_level1_failure_proceeds_to_level2(
-        self, MockWorker, mock_sleep
+        self, MockWorker, mock_sleep, mock_run_agent_goal
     ):
         # Level 1 is best-effort: a failed/inconclusive immediate check must NOT
         # short-circuit. The step still waits the delay and runs the
         # authoritative Level 2 dashboard verification (here Level 2 also fails).
         w = _mock_worker()
-        w.run_goal.return_value = {"status": "failed"}  # both levels fail
+        w.run_goal.return_value = {"status": "failed"}  # level 1 + url capture
         MockWorker.return_value = w
+        mock_run_agent_goal.return_value.success = False  # level 2 fails
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
@@ -91,12 +109,15 @@ class TestLevel1Failure:
 
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
-    def test_level1_exception_proceeds_to_level2(self, MockWorker, mock_sleep):
+    def test_level1_exception_proceeds_to_level2(
+        self, MockWorker, mock_sleep, mock_run_agent_goal
+    ):
         # A crash in the Level 1 check is swallowed; the step still proceeds to
         # the delayed Level 2 dashboard verification.
         w = _mock_worker()
         w.run_goal.side_effect = RuntimeError("agent crash")
         MockWorker.return_value = w
+        mock_run_agent_goal.return_value.success = False  # level 2 fails
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
@@ -111,11 +132,10 @@ class TestTwoLevelSuccess:
     def test_both_levels_pass_no_url(self, MockWorker, mock_sleep):
         w = _mock_worker()
         w.run_goal.side_effect = [
-            {"status": "success"},  # Level 1
-            {"status": "success"},  # Level 2
+            {"status": "success"},  # Level 1 (worker.run_goal)
             {"status": "success", "output": {"post_url": ""}},  # URL capture
         ]
-        MockWorker.return_value = w
+        MockWorker.return_value = w  # Level 2 confirmed via run_agent_goal fixture
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
@@ -128,14 +148,13 @@ class TestTwoLevelSuccess:
     def test_both_levels_pass_with_url(self, MockWorker, mock_sleep):
         w = _mock_worker()
         w.run_goal.side_effect = [
-            {"status": "success"},  # Level 1
-            {"status": "completed"},  # Level 2
+            {"status": "success"},  # Level 1 (worker.run_goal)
             {
                 "status": "success",
                 "output": {"post_url": "https://www.instagram.com/reel/ABC123/"},
-            },
+            },  # URL capture
         ]
-        MockWorker.return_value = w
+        MockWorker.return_value = w  # Level 2 confirmed via run_agent_goal fixture
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
@@ -148,14 +167,14 @@ class TestTwoLevelSuccess:
 class TestLevel2Failure:
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
-    def test_level1_pass_level2_fail(self, MockWorker, mock_sleep):
+    def test_level1_pass_level2_fail(self, MockWorker, mock_sleep, mock_run_agent_goal):
         w = _mock_worker()
         w.run_goal.side_effect = [
-            {"status": "success"},  # Level 1
-            {"status": "failed"},  # Level 2
+            {"status": "success"},  # Level 1 (worker.run_goal)
             {"status": "failed"},  # URL capture
         ]
         MockWorker.return_value = w
+        mock_run_agent_goal.return_value.success = False  # level 2 not confirmed
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
@@ -201,8 +220,7 @@ class TestUrlCapture:
     def test_url_capture_exception_does_not_fail(self, MockWorker, mock_sleep):
         w = _mock_worker()
         w.run_goal.side_effect = [
-            {"status": "success"},  # Level 1
-            {"status": "success"},  # Level 2
+            {"status": "success"},  # Level 1 (worker.run_goal)
             RuntimeError("timeout"),  # URL capture throws
         ]
         MockWorker.return_value = w
@@ -217,12 +235,11 @@ class TestUrlCapture:
     def test_url_without_instagram_domain_ignored(self, MockWorker, mock_sleep):
         w = _mock_worker()
         w.run_goal.side_effect = [
-            {"status": "success"},  # Level 1
-            {"status": "success"},  # Level 2
+            {"status": "success"},  # Level 1 (worker.run_goal)
             {
                 "status": "success",
                 "output": {"post_url": "https://example.com/not-ig"},
-            },
+            },  # URL capture
         ]
         MockWorker.return_value = w
 
@@ -285,3 +302,33 @@ class TestStepResultContract:
         assert result.step == StepName.VERIFICATION
         assert result.status == StepStatus.FAILED
         assert result.code is not None
+
+
+class TestDashboardGoalNavigation:
+    """The Level-2 dashboard goal must carry the navigation-reliability pattern
+    and stay strict (confirm-or-fail, never blind success)."""
+
+    def _goal(self) -> str:
+        from src.worker.steps.verification import _GOAL_VERIFY_DASHBOARD
+        return _GOAL_VERIFY_DASHBOARD
+
+    def test_navigates_dashboard_to_trial_reels_row(self):
+        g = self._goal().lower()
+        assert "professional dashboard" in g
+        assert "trial reels" in g
+        assert "bottom" in g          # the Trial reels row is near the bottom
+        assert "scroll" in g          # scroll if hidden
+        assert "refresh" in g         # pull to refresh
+        assert "newest" in g or "top-left" in g  # inspect newest tile
+
+    def test_has_anti_stall_guidance(self):
+        g = self._goal().lower()
+        assert "wait" in g and ("never" in g or "do not loop" in g or "not loop" in g)
+        assert "same screen" in g
+
+    def test_does_not_blind_success(self):
+        g = self._goal().lower()
+        # Must require actual confirmation and allow an explicit failure.
+        assert "success=false" in g
+        assert "never assume success" in g or "do not assume success" in g
+        assert "only if" in g

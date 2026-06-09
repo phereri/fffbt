@@ -55,6 +55,20 @@ What is guaranteed at this stage:
 - The launcher's generic queue **will not** pick up validation videos
   (`videos.category = 'validation'` or `download_method =
   'local_validation'`). Only `create-job --device-serial --video-id` can.
+- To exercise the **launcher loop itself** on validation videos (without
+  touching the production Drive queue), use the explicit opt-in
+  `run-launcher --queue validation` (migration
+  `20260608170000_validation_launcher_queue.sql`). It draws from the MIRROR
+  set — `category='validation' OR download_method='local_validation'` videos
+  and `is_validation=true` accounts — via
+  `automation.create_validation_publishing_job()`, tags `job_events.payload`
+  with `queue=validation`, and exits cleanly (`validation_queue_empty`) when
+  the validation queue is empty. Default `run-launcher` (no `--queue`) stays
+  production-only and unchanged. Example:
+  `run-launcher --queue validation --max-parallel 1 --max-jobs 1`.
+  NOTE: validation videos must have a `local_video_path` that exists on THIS
+  host — a row seeded on another machine (e.g. base `C:\Users\…\fffbt`) fails
+  `video_preparation` with INFRA until the path is corrected to `C:\fffbt\…`.
 - The proof_of_posting flow detects `logged_out` and stops with a
   `needs_review` outcome rather than retrying or escalating. The
   job's `device_id` and reserved `video_id` are released by the

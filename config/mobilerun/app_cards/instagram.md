@@ -90,8 +90,16 @@ Full spec: `docs/instagram-appcard-reference.md`.
 
 1. Profile tab.
 2. **Professional dashboard** (card on profile).
-3. **Trial Reels** tile (scroll dashboard if hidden).
-4. **Create** / **Try it** / **+** / **Get started**.
+3. **Trial reels** — a row near the **bottom** of the dashboard
+   (content-desc/text `Trial reels`; scroll down if hidden). Resolve it by
+   text/content-desc and tap it — do NOT idle on the dashboard.
+4. On the Trial reels list, tap **Create trial reel** (content-desc
+   `Create trial reel`, near the bottom) — or **Try it** / **+** / **Get
+   started** on first use.
+
+Anti-stall: never issue repeated `wait` actions. If a tap leaves you on the same
+screen (still profile/dashboard), tap the specific next label (`Trial reels`,
+then `Create trial reel`) or switch to Path C — do not loop on `wait`.
 
 ### Path B — fallback (if Path A cannot find Trial Reels)
 

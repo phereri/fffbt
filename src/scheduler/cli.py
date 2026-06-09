@@ -440,6 +440,19 @@ def cmd_run_launcher(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--queue",
+        choices=["production", "validation"],
+        default="production",
+        help=(
+            "Which reservation queue to draw from. 'production' (default) is the "
+            "generic Google-Drive queue (non-validation videos + non-validation "
+            "accounts) and is unchanged. 'validation' is an explicit opt-in that "
+            "selects ONLY validation/local_validation videos with is_validation "
+            "accounts and never touches the production Drive queue — use it to "
+            "exercise the launcher loop on seeded test videos."
+        ),
+    )
+    parser.add_argument(
         "--stub",
         action="store_true",
         help=(
@@ -485,13 +498,25 @@ def cmd_run_launcher(argv: list[str]) -> int:
             "MOBILE_UI_EXECUTOR controls the UI driver)"
         )
 
+    if args.queue == "validation":
+        log.info(
+            "queue=validation: drawing ONLY from the isolated validation/"
+            "local_validation queue; the production Drive queue is untouched"
+        )
+    else:
+        log.info("queue=production: generic Drive queue")
+
     launcher = JobLauncher(
         db_url,
         max_parallel_override=args.max_parallel,
         max_jobs=args.max_jobs,
         steps_factory=steps_factory,
+        queue=args.queue,
     )
-    asyncio.run(launcher.run())
+    # _run_async picks a Windows-compatible SelectorEventLoop (psycopg's async
+    # mode cannot use the Windows default ProactorEventLoop). Same wrapper the
+    # run-job path uses.
+    _run_async(launcher.run())
     return 0
 
 
