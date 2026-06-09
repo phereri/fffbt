@@ -22,7 +22,10 @@ import argparse
 import asyncio
 import datetime as dt
 import logging
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -31,10 +34,97 @@ from src.registration.goal import build_registration_goal
 from src.registration.output import append_account_row, row_from_parts
 from src.registration.result import RegistrationResult
 from src.registration.rotator import DeviceIdentityRotator, NoopRotator
-from src.registration.tools import RegistrationSession, build_registration_tools
+from src.registration.tools import RegistrationSession, build_custom_tools
 from src.worker.agent_runner.mobilerun_agent_runner import AgentFactoryRequest
 
 logger = logging.getLogger(__name__)
+
+
+def _file_operator_input(
+    artifacts_dir: str | Path, *, poll_seconds: float = 2.0, timeout_seconds: float = 1800.0
+) -> Callable[[str], str]:
+    """Operator I/O over files, so ``ask_operator`` works on a detached run.
+
+    ``input()`` raises EOF when the process has no attached TTY (e.g. launched
+    over ssh in the background). Instead, write the agent's question to
+    ``operator_request.txt`` in the run's artifacts dir and block until an
+    operator drops ``operator_answer.txt`` beside it (poll). On timeout, return a
+    sentinel telling the agent to use its best judgment.
+    """
+
+    adir = Path(artifacts_dir)
+    req = adir / "operator_request.txt"
+    ans = adir / "operator_answer.txt"
+
+    def _ask(prompt: str) -> str:
+        adir.mkdir(parents=True, exist_ok=True)
+        if ans.exists():  # clear any stale answer from a previous question
+            ans.unlink()
+        req.write_text(prompt, encoding="utf-8")
+        # Mirror to stdout/log too, so a human tailing the run sees the prompt.
+        print(prompt, flush=True)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if ans.exists():
+                answer = ans.read_text(encoding="utf-8").strip()
+                ans.unlink()
+                req.unlink(missing_ok=True)
+                return answer
+            time.sleep(poll_seconds)
+        req.unlink(missing_ok=True)
+        return (
+            "TIMEOUT: no operator answered within the wait window. Use your best "
+            "judgment; if you cannot safely proceed, set success=false with a "
+            "failure_reason describing exactly where you are stuck."
+        )
+
+    return _ask
+
+
+def _adb_capture(serial: str, artifacts_dir: str | Path) -> CaptureFn:
+    """Capture a screenshot + UI-tree dump on each ``ask_operator`` call.
+
+    Lets a human operator (or another agent) actually see the stuck screen. Best
+    effort: any adb failure is reported in the returned dict, never raised.
+    """
+
+    adb = os.environ.get("ADB_BIN") or os.environ.get("ADB_PATH") or "adb"
+    adir = Path(artifacts_dir)
+    counter = {"n": 0}
+
+    async def _capture(question: str) -> dict[str, Any]:
+        adir.mkdir(parents=True, exist_ok=True)
+        counter["n"] += 1
+        n = counter["n"]
+        out: dict[str, Any] = {}
+
+        def _run(args: list[str]) -> subprocess.CompletedProcess:
+            return subprocess.run([adb, "-s", serial, *args], capture_output=True, timeout=30)
+
+        try:
+            r = await asyncio.to_thread(_run, ["exec-out", "screencap", "-p"])
+            if r.returncode == 0 and r.stdout:
+                png = adir / f"ask_{n}_screen.png"
+                png.write_bytes(r.stdout)
+                out["screenshot"] = str(png)
+            else:
+                out["screenshot_error"] = (r.stderr or b"").decode(errors="replace")[:120]
+        except Exception as exc:  # noqa: BLE001
+            out["screenshot_error"] = str(exc)
+
+        try:
+            await asyncio.to_thread(_run, ["shell", "uiautomator", "dump", "/sdcard/wd.xml"])
+            r2 = await asyncio.to_thread(_run, ["shell", "cat", "/sdcard/wd.xml"])
+            if r2.returncode == 0 and r2.stdout:
+                xml = adir / f"ask_{n}_ui.xml"
+                xml.write_bytes(r2.stdout)
+                out["ui"] = str(xml)
+        except Exception as exc:  # noqa: BLE001
+            out["ui_error"] = str(exc)
+        return out
+
+    return _capture
+
 
 _DEFAULT_CSV = "accounts.csv"
 _DEFAULT_CONFIG = "config/mobilerun/config.yaml"
@@ -54,6 +144,9 @@ class RegistrationRunner:
         device_serial: str,
         csv_path: str = _DEFAULT_CSV,
         country: str = "any",
+        operator: str = "any",
+        max_price: float | None = None,
+        sms_timeout_seconds: float = 300.0,
         config_path: str = _DEFAULT_CONFIG,
         timeout_seconds: int = _DEFAULT_TIMEOUT,
         artifacts_dir: str = _DEFAULT_ARTIFACTS,
@@ -69,6 +162,9 @@ class RegistrationRunner:
         self._serial = device_serial
         self._csv_path = csv_path
         self._country = country
+        self._operator = operator
+        self._max_price = max_price
+        self._sms_timeout = float(sms_timeout_seconds)
         self._config_path = config_path
         self._timeout = int(timeout_seconds)
         self._artifacts_dir = artifacts_dir
@@ -109,9 +205,14 @@ class RegistrationRunner:
         session = RegistrationSession(
             client=self._five_sim_client,
             country=self._country,
+            operator=self._operator,
+            max_price=self._max_price,
+            code_timeout=self._sms_timeout,
             artifacts_dir=str(run_artifacts),
+            operator_input=_file_operator_input(run_artifacts),
+            capture_fn=_adb_capture(serial, run_artifacts),
         )
-        tools = build_registration_tools(session)
+        tools = build_custom_tools(session)
         goal = build_registration_goal(device_serial=serial, country=self._country)
 
         request = AgentFactoryRequest(
@@ -122,7 +223,7 @@ class RegistrationRunner:
             config_path=self._config_path,
             platform="instagram",
             timeout_seconds=self._timeout,
-            tools=tuple(tools),
+            tools=tools,
             output_model=_registration_output_model(),
         )
 
@@ -239,6 +340,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     reg = sub.add_parser("register", help="Register one Instagram account.")
     reg.add_argument("--device-serial", required=True, help="ADB serial (ip:port for TCP).")
     reg.add_argument("--country", default="any", help="5sim country (default: any).")
+    reg.add_argument("--operator", default="any", help="5sim operator priority list, e.g. 'virtual4,any' (default: any).")
+    reg.add_argument("--max-price", type=float, default=None,
+                     help="5sim per-number price cap (raises it; unlocks pricier high-delivery operators).")
+    reg.add_argument("--sms-timeout", type=float, default=300.0,
+                     help="Seconds to wait for the SMS code per number (default: 300).")
     reg.add_argument("--csv", default=_DEFAULT_CSV, help="Output CSV path.")
     reg.add_argument("--config", default=_DEFAULT_CONFIG, help="MobileRun config path.")
     reg.add_argument("--artifacts-dir", default=_DEFAULT_ARTIFACTS, help="Artifacts root.")
@@ -256,6 +362,9 @@ def main(argv: list[str] | None = None) -> int:
             device_serial=args.device_serial,
             csv_path=args.csv,
             country=args.country,
+            operator=args.operator,
+            max_price=args.max_price,
+            sms_timeout_seconds=args.sms_timeout,
             config_path=args.config,
             timeout_seconds=args.timeout,
             artifacts_dir=args.artifacts_dir,

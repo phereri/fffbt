@@ -118,7 +118,7 @@ class AgentFactoryRequest:
     config_path: str
     platform: str
     timeout_seconds: int
-    tools: tuple[Any, ...] = ()
+    tools: dict[str, Any] | tuple[Any, ...] = ()
     output_model: Any | None = None
 
 
@@ -379,7 +379,17 @@ def _default_agent_factory(request: AgentFactoryRequest) -> _AgentHandle:
         timeout=request.timeout_seconds,
     )
     if request.tools:
-        agent_kwargs["tools"] = list(request.tools)
+        # MobileRun expects custom tools as a dict:
+        #   {name: {"function": callable, "parameters": {...}, "description": str}}
+        # (see mobilerun.agent.tool_registry.register_from_dict). Accept either a
+        # ready-made dict or a list of callables (wrapped by name).
+        if isinstance(request.tools, dict):
+            agent_kwargs["custom_tools"] = request.tools
+        else:
+            agent_kwargs["custom_tools"] = {
+                getattr(fn, "__name__", f"tool_{i}"): {"function": fn}
+                for i, fn in enumerate(request.tools)
+            }
     return MobileAgent(**agent_kwargs)
 
 

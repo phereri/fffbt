@@ -124,10 +124,11 @@ class TestRunnerOrchestration:
         request = captured["request"]
         assert "Instagram" in request.goal
         assert "100.64.0.5:5555" in request.goal
-        # Custom tools wired in.
+        # Custom tools wired in (MobileRun custom_tools dict format).
         assert len(request.tools) == 3
-        names = {t.__name__ for t in request.tools}
-        assert names == {"buy_phone_number", "get_sms_code", "ask_operator"}
+        assert set(request.tools) == {"buy_phone_number", "get_sms_code", "ask_operator"}
+        # Each entry exposes a callable under "function".
+        assert all(callable(v["function"]) for v in request.tools.values())
 
     def test_failure_records_failed_status(self, tmp_path):
         event = _FakeResultEvent(_FakeStructured(success=False, failure_reason="signup_blocked"))

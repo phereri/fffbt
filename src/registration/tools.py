@@ -40,6 +40,7 @@ class RegistrationSession:
         country: str = "any",
         operator: str = "any",
         product: str = "instagram",
+        max_price: float | None = None,
         code_timeout: float = 180.0,
         artifacts_dir: str | Path | None = None,
         operator_input: OperatorInput | None = None,
@@ -48,6 +49,11 @@ class RegistrationSession:
         self._client = client or FiveSimClient()
         self._country = country
         self._operator = operator
+        # Operator may be a comma-separated priority list (e.g. "o2,three,virtual34").
+        # buy_phone_number tries them in order and takes the first that has stock,
+        # so we use the highest-delivery-rate operator that is actually buyable.
+        self._operators = [o.strip() for o in str(operator).split(",") if o.strip()] or ["any"]
+        self._max_price = max_price
         self._product = product
         self._code_timeout = code_timeout
         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir else None
@@ -73,25 +79,44 @@ class RegistrationSession:
     # -- tools --------------------------------------------------------------
 
     async def buy_phone_number(self, country: str | None = None) -> ToolResult:
-        """Buy an Instagram activation number; record it on the session."""
+        """Buy an Instagram activation number; record it on the session.
+
+        If an order is already active (e.g. Instagram rejected the previous number
+        as invalid, before any SMS), release it first so the agent can retry with
+        a fresh number — otherwise the single-active-order policy would deadlock.
+        """
         if self._order is not None:
+            await self._release("cancel")
+        target_country = country or self._country
+        errors: list[str] = []
+        order = None
+        used_operator = None
+        for op in self._operators:
+            try:
+                order = await self._client.buy_number(
+                    country=target_country,
+                    operator=op,
+                    product=self._product,
+                    max_price=self._max_price,
+                )
+            except FiveSimError as exc:
+                # Typically "no free phones" for that operator — fall through to
+                # the next one in the priority list.
+                errors.append(f"{op}: {exc}")
+                continue
+            used_operator = op
+            break
+        if order is None:
+            tried = ", ".join(self._operators)
             return ToolResult.fail(
-                f"an active order already exists (id={self._order.id}, "
-                f"phone={self._order.phone}); release it before buying another."
+                f"5sim buy failed for {target_country} (tried operators: {tried}). "
+                + " | ".join(errors)
             )
-        try:
-            order = await self._client.buy_number(
-                country=country or self._country,
-                operator=self._operator,
-                product=self._product,
-            )
-        except FiveSimError as exc:
-            return ToolResult.fail(f"5sim buy failed: {exc}")
         self._order = order
         return ToolResult.ok(
-            f"Bought phone {order.phone} (order_id={order.id}, country="
-            f"{country or self._country}). Use this number in the signup form, "
-            f"then call get_sms_code to read the verification code."
+            f"Bought phone {order.phone} (order_id={order.id}, "
+            f"country={target_country}, operator={used_operator}). Use this number "
+            f"in the signup form, then call get_sms_code to read the verification code."
         )
 
     async def get_sms_code(self) -> ToolResult:
@@ -170,10 +195,10 @@ class RegistrationSession:
 
 
 def build_registration_tools(session: RegistrationSession) -> list[Callable]:
-    """Return the agent-callable tools bound to ``session``.
+    """Return the agent-callable tools bound to ``session`` (list form).
 
-    The functions keep their stable ``__name__`` (``buy_phone_number`` etc.) so
-    MobileRun registers them under the names the goal references.
+    Kept for direct/unit use. The functions keep their stable ``__name__``
+    (``buy_phone_number`` etc.).
     """
 
     async def buy_phone_number(country: str = "any") -> ToolResult:
@@ -188,7 +213,81 @@ def build_registration_tools(session: RegistrationSession) -> list[Callable]:
     return [buy_phone_number, get_sms_code, ask_operator]
 
 
+def _as_tool_string(result: ToolResult) -> str:
+    """Coerce a ToolResult to the string MobileRun's registry expects.
+
+    MobileRun treats a returned string starting with ``Failed`` as success=False
+    (``tool_registry.execute``). ``ToolResult.fail`` already prefixes ``Failed:``.
+    """
+    if result.success:
+        return result.message
+    msg = result.message
+    return msg if msg.startswith("Failed") else f"Failed: {msg}"
+
+
+def build_custom_tools(session: RegistrationSession) -> dict:
+    """Return MobileRun ``custom_tools`` dict bound to ``session``.
+
+    Shape per ``mobilerun.agent.tool_registry.register_from_dict``:
+        {name: {"function": callable, "parameters": {...}, "description": str}}
+    Each function accepts a trailing ``ctx`` kwarg (MobileRun calls
+    ``fn(**args, ctx=ctx)``) and returns a plain string for the agent to read.
+    """
+
+    async def buy_phone_number(country: str = "any", ctx=None) -> str:
+        return _as_tool_string(await session.buy_phone_number(country=country))
+
+    async def get_sms_code(ctx=None) -> str:
+        return _as_tool_string(await session.get_sms_code())
+
+    async def ask_operator(question: str, ctx=None) -> str:
+        return _as_tool_string(await session.ask_operator(question))
+
+    return {
+        "buy_phone_number": {
+            "function": buy_phone_number,
+            "description": (
+                "Buy a real phone number for Instagram SMS verification. Call when "
+                "the signup flow asks for a phone number; enter the returned number."
+            ),
+            "parameters": {
+                "country": {
+                    "type": "string",
+                    "required": False,
+                    "default": "any",
+                    "description": "5sim country code, or 'any'.",
+                },
+            },
+        },
+        "get_sms_code": {
+            "function": get_sms_code,
+            "description": (
+                "Poll for the SMS verification code on the active phone number. "
+                "Blocks until the code arrives or times out. Call after Instagram "
+                "says it sent a code."
+            ),
+            "parameters": {},
+        },
+        "ask_operator": {
+            "function": ask_operator,
+            "description": (
+                "Ask the human operator for help on an unexpected screen. Blocks "
+                "until the operator answers. Use when stuck, on a captcha/challenge, "
+                "or any screen not covered by your instructions."
+            ),
+            "parameters": {
+                "question": {
+                    "type": "string",
+                    "required": True,
+                    "description": "Clear description of what you see + your question.",
+                },
+            },
+        },
+    }
+
+
 __all__ = [
     "RegistrationSession",
     "build_registration_tools",
+    "build_custom_tools",
 ]

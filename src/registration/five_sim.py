@@ -166,9 +166,17 @@ class FiveSimClient:
         country: str = _DEFAULT_COUNTRY,
         operator: str = _DEFAULT_OPERATOR,
         product: str = _DEFAULT_PRODUCT,
+        max_price: float | None = None,
     ) -> FiveSimOrder:
-        """Buy an activation number for ``product`` (default: instagram)."""
+        """Buy an activation number for ``product`` (default: instagram).
+
+        ``max_price`` raises 5sim's per-number price cap; without it the API
+        silently rejects pricier (often higher-delivery) operators with
+        "no free phones, max price".
+        """
         path = f"/user/buy/activation/{country}/{operator}/{product}"
+        if max_price is not None:
+            path += f"?maxPrice={max_price}"
         data = await self._get_json(path)
         return _parse_order(data)
 

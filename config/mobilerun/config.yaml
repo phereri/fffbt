@@ -9,7 +9,8 @@
 # - Stealth is on globally. Coordinate-based tools (click_at, click_area,
 #   long_press_at) stay disabled - Mobilerun's default.
 # - Trajectories are saved per action so we can audit / build CRM viewer.
-# - LLM profiles: default ShopAIKey Gemini (OpenAI /v1). Set FARM_USE_CLAUDE_TRAJECTORY=1
+# - LLM profiles: default Google AI Studio Gemini (OpenAI-compat endpoint). Set
+#   FARM_USE_CLAUDE_TRAJECTORY=1
 #   for Mobilerun manager/executor trajectories via Claude (Anthropic / ShopAIKey).
 #   Model IDs: config/mobilerun/shopaikey_models.yaml.
 #   Provider names follow Mobilerun (GoogleGenAI, Anthropic, OpenAI, ...).
@@ -53,7 +54,7 @@ llm_profiles:
     model: gemini-2.5-flash
     temperature: 0.2
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
   manager:
@@ -61,7 +62,7 @@ llm_profiles:
     model: gemini-2.5-flash
     temperature: 0.2
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
   executor:
@@ -69,7 +70,7 @@ llm_profiles:
     model: gemini-2.5-flash
     temperature: 0.1
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
   fast_agent:
@@ -77,7 +78,7 @@ llm_profiles:
     model: gemini-2.5-flash-lite
     temperature: 0.1
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
   vision:
@@ -85,7 +86,7 @@ llm_profiles:
     model: gemini-2.5-flash
     temperature: 0.2
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
   app_opener:
@@ -93,16 +94,19 @@ llm_profiles:
     model: gemini-2.5-flash-lite
     temperature: 0.0
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     provider_family: openai
 
+  # Native GoogleGenAI (not the OpenAI-compat shim): llama_index's structured_predict
+  # forces a function call that Gemini's OpenAI-compat endpoint rejects with
+  # "Function calling config is set without function_declarations". The native
+  # GoogleGenAI provider handles response schemas correctly. Reads GOOGLE_API_KEY
+  # (provider "GoogleGenAI" -> "google" key slot); no base_url.
   structured_output:
-    provider: OpenAILike
+    provider: GoogleGenAI
     model: gemini-2.5-flash
     temperature: 0.0
     api_key_source: env
-    base_url: https://api.shopaikey.com/v1
-    provider_family: openai
 
 # -----------------------------------------------------------------------------
 # Device defaults. Per-task overrides happen in the runner (serial = device IP).

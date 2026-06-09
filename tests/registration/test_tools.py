@@ -30,9 +30,14 @@ class _FakeClient:
         self._buy = FiveSimOrder(id=555, phone="+790111", status="PENDING", product="instagram")
         self._code = SmsCode(code="123456", sender="Instagram", text="code 123456")
         self.get_code_raises: Exception | None = None
+        self.no_stock_operators: set[str] = set()
 
-    async def buy_number(self, country="any", operator="any", product="instagram"):
+    async def buy_number(self, country="any", operator="any", product="instagram", max_price=None):
         self.bought.append((country, operator, product))
+        if operator in self.no_stock_operators:
+            from src.registration.five_sim import FiveSimError
+
+            raise FiveSimError("no free phones")
         return self._buy
 
     async def get_code(self, order_id, **kw):
@@ -79,12 +84,34 @@ class TestBuyPhoneNumber:
         asyncio.run(sess.buy_phone_number(country="england"))
         assert client.bought[0][0] == "england"
 
-    def test_second_buy_without_release_is_rejected(self):
-        sess, _ = _session()
-        asyncio.run(sess.buy_phone_number())
-        res = asyncio.run(sess.buy_phone_number())
+    def test_operator_fallback_skips_out_of_stock(self):
+        sess, client = _session(operator="o2,three,virtual34")
+        client.no_stock_operators = {"o2", "three"}
+        res = asyncio.run(sess.buy_phone_number(country="england"))
+        assert res.success
+        # tried o2 and three (no stock), then bought on virtual34
+        assert [op for _, op, _ in client.bought] == ["o2", "three", "virtual34"]
+        assert "operator=virtual34" in res.message
+        assert sess.active_order is not None
+
+    def test_buy_fails_when_all_operators_out_of_stock(self):
+        sess, client = _session(operator="o2,three")
+        client.no_stock_operators = {"o2", "three"}
+        res = asyncio.run(sess.buy_phone_number(country="england"))
         assert not res.success
-        assert "active order" in res.message.lower()
+        assert "tried operators: o2, three" in res.message
+        assert sess.active_order is None
+
+    def test_second_buy_releases_previous_order(self):
+        # Re-buying releases the stale order (e.g. IG rejected the number) and
+        # acquires a fresh one, instead of deadlocking on the active-order guard.
+        sess, client = _session()
+        asyncio.run(sess.buy_phone_number())
+        first_id = sess.active_order.id
+        res = asyncio.run(sess.buy_phone_number())
+        assert res.success
+        assert first_id in client.cancelled  # old order was released
+        assert sess.active_order is not None
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +216,37 @@ class TestBuildTools:
         tools = {t.__name__: t for t in build_registration_tools(sess)}
         asyncio.run(tools["buy_phone_number"]())
         assert client.bought
+
+
+class TestBuildCustomTools:
+    def test_mobilerun_dict_shape(self):
+        from src.registration.tools import build_custom_tools
+
+        sess, _ = _session()
+        spec = build_custom_tools(sess)
+        assert set(spec) == {"buy_phone_number", "get_sms_code", "ask_operator"}
+        for name, entry in spec.items():
+            assert callable(entry["function"])
+            assert isinstance(entry["description"], str) and entry["description"]
+            assert isinstance(entry["parameters"], dict)
+
+    def test_functions_accept_ctx_and_return_str(self):
+        from src.registration.tools import build_custom_tools
+
+        sess, client = _session()
+        spec = build_custom_tools(sess)
+        # MobileRun calls fn(**args, ctx=ctx); result must be a plain string.
+        out = asyncio.run(spec["buy_phone_number"]["function"](country="any", ctx=None))
+        assert isinstance(out, str)
+        assert "+790111" in out
+        assert client.bought
+
+    def test_failure_returns_failed_prefixed_string(self):
+        from src.registration.tools import build_custom_tools
+
+        sess, _ = _session()
+        spec = build_custom_tools(sess)
+        # get_sms_code with no active order -> failure -> "Failed:" prefix.
+        out = asyncio.run(spec["get_sms_code"]["function"](ctx=None))
+        assert isinstance(out, str)
+        assert out.startswith("Failed")

@@ -25,10 +25,34 @@ GOAL
     (18+ REQUIRED; pick an age roughly 18–45).
 - Remember every value you choose; you must report them in the final result.
 
+START
+- The device may be on the home screen or have Instagram already open. First,
+  open the Instagram app (package com.instagram.android). If a logged-in account
+  or a previous session is showing, look for "Create new account" / "Sign up" —
+  use the account-switcher or log out ONLY if needed to reach the signup screen;
+  prefer the "Create new account" entry point on the login screen.
+
 PHONE VERIFICATION (you own this via custom tools)
 - When the signup flow asks for a phone number, call the tool
   ``buy_phone_number(country="{country}")``. It returns a real phone number —
   enter that exact number in the form.
+- IMPORTANT — phone field entry: this signup screen has a SINGLE number field and
+  NO country selector. Enter the FULL international number EXACTLY as returned by
+  ``buy_phone_number`` — including the leading "+" and country code, e.g.
+  "+31XXXXXXXXX". Do NOT strip the "+" and do NOT remove the country code.
+- After typing, VERIFY the field actually shows the full number WITH the leading
+  "+". The on-device keyboard can silently drop the "+" character; if the field is
+  missing the "+", re-focus it and ensure the "+" is present before continuing.
+- RATE LIMIT (read the message carefully): if the screen says "Please wait a few
+  minutes before you try again" (or any wait / try-again-later message), that is
+  Instagram rate-limiting THIS DEVICE — it is NOT an invalid number. STOP
+  immediately, do NOT enter any more numbers on this device, and set success=false
+  with failure_reason="rate_limited". Do not confuse this with "invalid".
+- Only the message "Input Mobile number is invalid" means the number/format was
+  rejected. If you see that, do NOT blindly buy another number — STOP and call
+  ``ask_operator`` stating EXACTLY what the number field contains character by
+  character (especially whether the leading "+" is present) so the operator can
+  see the screenshot and decide.
 - When Instagram says it sent an SMS / asks for the confirmation code, call
   ``get_sms_code()``. It blocks until the code arrives (or times out). Enter the
   returned code in the verification field.
