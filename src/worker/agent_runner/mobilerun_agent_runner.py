@@ -118,6 +118,8 @@ class AgentFactoryRequest:
     config_path: str
     platform: str
     timeout_seconds: int
+    tools: dict[str, Any] | tuple[Any, ...] = ()
+    output_model: Any | None = None
 
 
 class _AgentHandle:
@@ -243,6 +245,29 @@ class MobileRunAgentRunner:
             ),
         }
 
+        # Register the FFFBT custom Instagram tools (hide_ime,
+        # tap_share_and_confirm, …) the goal + AppCard instruct the agent to
+        # use. Without these the agent only has generic primitives and the
+        # Mobilerun Keyboard swallows the Share tap (false share_did_not_register).
+        from src.worker.agent_runner.custom_tools import build_instagram_custom_tools
+
+        # Bind the SAME full caption (body + hashtags) the goal renders and the
+        # agent pastes, so verify_caption_text compares against the on-screen text
+        # rather than the body-only caption_base (which would false-fail).
+        _hashtag_str = " ".join(
+            f"#{h.lstrip('#')}" for h in self._hashtags if h.strip()
+        )
+        _caption_full = self._caption.rstrip()
+        if _hashtag_str:
+            _caption_full = f"{_caption_full}\n\n{_hashtag_str}"
+        _caption_full = _caption_full.strip()
+
+        custom_tools = build_instagram_custom_tools(
+            serial=self._device_serial,
+            video_id=self._video_id,
+            caption=_caption_full,
+        )
+
         return AgentFactoryRequest(
             goal=goal,
             device_serial=self._device_serial,
@@ -251,6 +276,7 @@ class MobileRunAgentRunner:
             config_path=self._config_path,
             platform=_DEFAULT_PLATFORM,
             timeout_seconds=self._timeout_seconds,
+            tools=custom_tools,
         )
 
     async def run(self) -> AgentRunnerResult:
@@ -368,14 +394,27 @@ def _default_agent_factory(request: AgentFactoryRequest) -> _AgentHandle:
             except Exception:
                 logger.debug("could not apply override %s", key)
 
-    post_result_model = _post_result_pydantic_model()
-    return MobileAgent(
+    post_result_model = request.output_model or _post_result_pydantic_model()
+    agent_kwargs: dict[str, Any] = dict(
         goal=request.goal,
         config=config,
         variables=request.variables,
         output_model=post_result_model,
         timeout=request.timeout_seconds,
     )
+    if request.tools:
+        # MobileRun expects custom tools as a dict:
+        #   {name: {"function": callable, "parameters": {...}, "description": str}}
+        # (see mobilerun.agent.tool_registry.register_from_dict). Accept either a
+        # ready-made dict or a list of callables (wrapped by name).
+        if isinstance(request.tools, dict):
+            agent_kwargs["custom_tools"] = request.tools
+        else:
+            agent_kwargs["custom_tools"] = {
+                getattr(fn, "__name__", f"tool_{i}"): {"function": fn}
+                for i, fn in enumerate(request.tools)
+            }
+    return MobileAgent(**agent_kwargs)
 
 
 def _post_result_pydantic_model() -> type:
@@ -386,7 +425,15 @@ def _post_result_pydantic_model() -> type:
         success: bool = Field(description="True iff the Trial Reel was published.")
         platform: str = Field(default="instagram")
         device_serial: str = Field(description="Device id used.")
-        account_username: str | None = Field(default=None)
+        account_username: str | None = Field(
+            default=None,
+            description=(
+                "Best-effort: the active IG username, ONLY if read verbatim "
+                "from the UI. Leave null if not certain — do not guess. "
+                "Informational; not used to gate success (the agent is known "
+                "to hallucinate this field)."
+            ),
+        )
         video_id: str | None = Field(default=None)
         caption: str | None = Field(default=None)
         post_url: str | None = Field(default=None)

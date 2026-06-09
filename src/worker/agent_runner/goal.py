@@ -76,24 +76,42 @@ ENTRY PATHS (try in order — see the Instagram AppCard for tactics)
 STEPS
 {prepare_push_steps}
 3. Instagram should already be open on the device. Confirm login state from the
-   current UI tree and read the active username. If logged out → stop with
-   failure_reason="logged_out".
+   current UI tree. If logged out → stop with failure_reason="logged_out".
+   For ``account_username``: report it ONLY if you can read the active username
+   verbatim from the UI (e.g. the profile/action-bar title). If you cannot read
+   it with certainty, leave it empty — do NOT guess or invent a username. It is
+   informational only and is not used to decide success.
 4. Reach the Trial Reel composer using Path A, then B, then C.
 5. Pick the most recent video in the gallery (the file we just pushed). If the
    clips timeline editor appears (filmstrip + "Try Edits" pill), tap the
    top-right Next arrow (drawer_next_button_layout) — NOT the top-left chevron.
    Tap Next through editor steps without entering "Edit cover".
 6. Caption + Share — Trial Reel hard layout, see AppCard:
-   - Click index 12 to focus the caption; resolve ``caption_input_text_view``
-     index on a fresh UI tree; paste the full caption via Mobilerun Keyboard.
-   - Run ``verify_caption_text(video_id={video_id!r})`` before Share.
-   - Run ``hide_ime`` even if it reports "already hidden".
+   - Tap the caption field (``caption_input_text_view``) to focus it, then use
+     ``type`` to enter the full caption text exactly (resolve the index on a
+     fresh UI tree). Do not paste via prompt.
+   - Run ``verify_caption_text`` before Share to confirm the caption landed
+     (the field must no longer show the "Write a caption…" placeholder). If it
+     reports the placeholder, re-focus the field and ``type`` again.
+   - Run ``hide_ime`` to dismiss the keyboard (best-effort). The Mobilerun
+     Keyboard covers the Share button; ``hide_ime`` clears it by tapping a
+     non-input area. If ``hide_ime`` reports it could not hide the IME, do NOT
+     stop — ``tap_share_and_confirm`` dismisses the keyboard itself.
    - Run ``tap_share_and_confirm`` exactly once. Never raw ``click`` for Share.
+     ALWAYS call ``tap_share_and_confirm`` to publish, even if ``hide_ime`` (or
+     ``system_button`` BACK) reported failure — it re-dismisses the keyboard
+     before tapping Share. Never conclude ``share_did_not_register`` without
+     having called ``tap_share_and_confirm`` and seen IT fail.
    - If ``verify_caption_text`` fails, retry the paste once (no ``via_prompt``);
      never Share without a passing verify.
-   - On the Trial Reel final "New reel" screen, the publish action is the
-     top-right OK. Use the AppCard's OK tap helper or
-     ``tap_by_resource_id``/``action_bar_button_text`` — never raw coordinates.
+   - ``tap_share_and_confirm`` IS the complete publish action: it taps the
+     bottom **Share** button on the Trial Reel "New reel" screen. On this build
+     there is NO separate top-right "OK"/checkmark — do NOT tap the top-right
+     after Share; that backs out of the composer and reverts the post (this is
+     the #1 cause of false ``share_did_not_register``).
+   - Success = ``tap_share_and_confirm`` reports the Share button gone / the
+     activity changed, and you land on the Trial reels list (``trials_list``) or
+     a post-processing screen. Treat that as published — stop and return.
 7. After publish succeeds, return PostResult(success=true) immediately. Leave
    ``post_url`` null; the scheduler verification step copies the link.
 8. Do NOT mark anything in the database; the host owns DB transitions.
