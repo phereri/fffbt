@@ -54,6 +54,82 @@ async def hide_ime(serial: str, *, timeout_s: float = 3.0) -> ToolResult:
     return ToolResult.fail(f"hide_ime: IME still shown after {timeout_s:.1f}s")
 
 
+# Banner / non-input rows on the Trial Reel "New reel" screen. Tapping one of
+# these clears caption focus, which dismisses the keyboard even when KEYCODE_BACK
+# does not (the Mobilerun custom keyboard ignores BACK).
+_DISMISS_BANNER_NEEDLES = (
+    "non-follower",
+    "non follower",
+    "trial reel and will",
+    "only be shown",
+)
+_DISMISS_ROW_NEEDLES = (
+    "add location",
+    "tag people",
+    "rename audio",
+    "add topics",
+)
+
+
+def _clear_focus_point(nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
+    """Centre of a non-editable element whose tap clears caption focus."""
+    for needles in (_DISMISS_BANNER_NEEDLES, _DISMISS_ROW_NEEDLES):
+        for n in nodes:
+            txt = node_text(n).lower()
+            if not txt or not any(k in txt for k in needles):
+                continue
+            cls = str(n.get("className") or n.get("class_name") or "").lower()
+            if "edit" in cls:  # never tap an editable field
+                continue
+            b = parse_bounds(n.get("bounds"))
+            if b:
+                return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+    return None
+
+
+async def dismiss_keyboard(
+    serial: str, read_ui: "ReadUi", *, timeout_s: float = 4.0
+) -> ToolResult:
+    """Robustly hide the on-screen IME, including the Mobilerun custom keyboard.
+
+    KEYCODE_BACK alone does NOT dismiss the Mobilerun Keyboard. The reliable
+    method is to clear caption focus by tapping a non-input area (the Trial Reel
+    banner / a settings row). Ladder: BACK -> clear-focus tap -> BACK.
+    """
+    if not await ime_input_shown(serial):
+        return ToolResult.ok("dismiss_keyboard: IME already hidden")
+
+    async def _hidden() -> bool:
+        return not await ime_input_shown(serial)
+
+    # 1. Clear caption focus by tapping a non-input area (handles the Mobilerun
+    #    keyboard, which ignores BACK). This is non-destructive — it never
+    #    navigates away from the New reel screen.
+    target = _clear_focus_point(await read_ui())
+    if target is not None:
+        try:
+            await input_tap(serial, target[0], target[1], hold_ms=60)
+        except Exception:
+            pass
+        await asyncio.sleep(0.6)
+        if await _hidden():
+            return ToolResult.ok("dismiss_keyboard: hidden via clear-focus tap")
+
+    # 2. KEYCODE_BACK as a fallback (works for stock keyboards). Only reached
+    #    while the IME is still shown, so BACK targets the IME, not navigation.
+    try:
+        await shell(serial, "input keyevent 4", timeout=10)
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    if await _hidden():
+        return ToolResult.ok("dismiss_keyboard: hidden via BACK")
+
+    return ToolResult.fail(
+        f"dismiss_keyboard: IME still shown after {timeout_s:.1f}s"
+    )
+
+
 # ---------------------------------------------------------------------------
 # tap_by_resource_id
 # ---------------------------------------------------------------------------
@@ -480,7 +556,7 @@ async def tap_share_and_confirm(
         hold_ms: int = 120,
         mode: str = "swipe",
     ) -> tuple[bool, str, tuple[int, int] | None]:
-        await hide_ime(serial)
+        await dismiss_keyboard(serial, read_ui)
         await asyncio.sleep(0.45)
         nodes = await read_ui()
         coords = _share_button_bounds(nodes)

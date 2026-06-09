@@ -72,23 +72,28 @@ class TestConnectFailure:
 class TestLevel1Failure:
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
-    def test_level1_fails_returns_needs_review_immediately(
+    def test_level1_failure_proceeds_to_level2(
         self, MockWorker, mock_sleep
     ):
+        # Level 1 is best-effort: a failed/inconclusive immediate check must NOT
+        # short-circuit. The step still waits the delay and runs the
+        # authoritative Level 2 dashboard verification (here Level 2 also fails).
         w = _mock_worker()
-        w.run_goal.return_value = {"status": "failed"}
+        w.run_goal.return_value = {"status": "failed"}  # both levels fail
         MockWorker.return_value = w
 
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
         assert result.status == StepStatus.NEEDS_REVIEW
         assert result.code == "verification_failed"
-        assert "level 1" in result.message
-        mock_sleep.assert_not_called()
+        assert "level 2" in result.message
+        mock_sleep.assert_called()  # the pre-dashboard delay happened
 
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
-    def test_level1_exception_returns_needs_review(self, MockWorker, mock_sleep):
+    def test_level1_exception_proceeds_to_level2(self, MockWorker, mock_sleep):
+        # A crash in the Level 1 check is swallowed; the step still proceeds to
+        # the delayed Level 2 dashboard verification.
         w = _mock_worker()
         w.run_goal.side_effect = RuntimeError("agent crash")
         MockWorker.return_value = w
@@ -96,8 +101,8 @@ class TestLevel1Failure:
         step = VerificationStep()
         result = run(step.run(_ctx(), device_serial="DEV001"))
         assert result.status == StepStatus.NEEDS_REVIEW
-        assert "level 1" in result.message
-        mock_sleep.assert_not_called()
+        assert "level 2" in result.message
+        mock_sleep.assert_called()
 
 
 class TestTwoLevelSuccess:
@@ -243,7 +248,9 @@ class TestScreenshots:
 
     @patch(_SLEEP, new_callable=AsyncMock)
     @patch("src.worker.steps.verification.MobilerunWorker")
-    def test_level1_fail_only_level1_screenshot(self, MockWorker, mock_sleep):
+    def test_level1_fail_still_runs_level2_screenshot(self, MockWorker, mock_sleep):
+        # Level 1 failure no longer short-circuits, so Level 2 runs and its
+        # verification_result screenshot is still taken.
         w = _mock_worker()
         w.run_goal.return_value = {"status": "failed"}
         MockWorker.return_value = w
@@ -253,7 +260,7 @@ class TestScreenshots:
 
         labels = [call.args[0] for call in w.screenshot.call_args_list]
         assert "level1_verification" in labels
-        assert "verification_result" not in labels
+        assert "verification_result" in labels
 
 
 class TestStepResultContract:

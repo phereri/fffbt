@@ -35,14 +35,19 @@ _GOAL_VERIFY_IMMEDIATE = (
 )
 
 _GOAL_VERIFY_DASHBOARD = (
-    "Navigate to verify the Trial Reel is live:\n"
+    "Navigate to verify the Trial Reel is live. Trial Reels do NOT appear on "
+    "the main profile grid — only in the Professional dashboard's Trial reels "
+    "list.\n"
     "1. Go to the Profile tab.\n"
     "2. Tap 'Professional dashboard' (may say 'Professional Tools' or "
     "'Pro dashboard').\n"
-    "3. Inside the dashboard, tap the 'Trial Reels' tile.\n"
-    "4. Check that the most recent Trial Reel thumbnail is present and "
-    "appears freshly posted (top of the list).\n"
-    "Report success=true if a fresh Trial Reel is visible in the list."
+    "3. Inside the dashboard, tap the 'Trial reels' tile.\n"
+    "4. Pull down to refresh the list (swipe down from the top once) — a "
+    "just-posted Trial Reel often does not show until the list is refreshed.\n"
+    "5. Check that the most recent Trial Reel thumbnail is present at the top "
+    "of the list and appears freshly posted.\n"
+    "Report success=true if a fresh Trial Reel is visible at the top of the "
+    "Trial reels list."
 )
 
 _GOAL_CAPTURE_URL = (
@@ -86,19 +91,23 @@ class VerificationStep:
             return self._fail("INFRA", f"GenFarmer connect failed: {e}")
 
         try:
-            # Level 1: immediate publish confirmation
+            # Level 1: immediate, best-effort signal only. It must NEVER
+            # short-circuit the step: the publish has already completed by the
+            # time verification runs, and a just-posted Trial Reel needs ~1-2
+            # min to become queryable. The authoritative check is the delayed
+            # Level 2 dashboard pass below. (Previously a failed Level 1 returned
+            # verification_failed in ~13s, skipping the wait + dashboard check
+            # and falsely failing reels that were in fact live.)
             level1 = await self._verify_immediate(worker)
             await self._screenshot(worker, "level1_verification")
-
             if not level1:
-                return StepResult(
-                    step=StepName.VERIFICATION,
-                    status=StepStatus.NEEDS_REVIEW,
-                    code="verification_failed",
-                    message="level 1: could not confirm post-publish screen",
+                logger.info(
+                    "level 1 immediate check inconclusive; proceeding to "
+                    "delayed dashboard verification anyway"
                 )
 
-            # Wait configured delay before Level 2
+            # Wait configured delay before Level 2 (always — the Trial Reel
+            # needs time to appear in the dashboard list).
             delay = int(
                 ctx.settings.get(
                     "verification_delay_seconds",
@@ -106,7 +115,9 @@ class VerificationStep:
                 )
             )
             logger.info(
-                "level 1 passed; waiting %ds for final verification", delay
+                "waiting %ds before dashboard verification (level1=%s)",
+                delay,
+                level1,
             )
             await asyncio.sleep(delay)
 
