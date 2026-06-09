@@ -64,7 +64,14 @@ DEVICE-CONTROL POLICY
   asks you to.
 
 ENTRY PATHS (try in order — see the Instagram AppCard for tactics)
-- Path A: Profile → Professional dashboard → Trial Reels → Create / Try it / +.
+- Path A (preferred): Profile → tap the "Professional dashboard" banner → on the
+  dashboard, the "Trial reels" entry is a row near the **bottom** of the screen
+  (content-desc/text "Trial reels"); scroll down if it is not visible, then tap
+  it → on the Trial reels list tap the **"Create trial reel"** button (content-desc
+  "Create trial reel", near the bottom) → pick the video. "Trial reels" and
+  "Create trial reel" are exact tappable labels — resolve them in the UI tree by
+  text/content-desc; do NOT guess coordinates and do NOT just sit on the
+  dashboard.
 - Path B (only if A exhausted): Profile → top-right menu → Settings and activity →
   For professionals → Account type and tools → Trial reels → Create.
   If "Trial reels" opens the Ad tools screen instead, press Back and try Path C —
@@ -81,7 +88,13 @@ STEPS
    verbatim from the UI (e.g. the profile/action-bar title). If you cannot read
    it with certainty, leave it empty — do NOT guess or invent a username. It is
    informational only and is not used to decide success.
-4. Reach the Trial Reel composer using Path A, then B, then C.
+4. Reach the Trial Reel composer using Path A, then B, then C. Do NOT issue
+   repeated ``wait`` actions — each step must make concrete progress. After at
+   most ONE short wait for a screen to settle, take a real tap toward the goal.
+   If two consecutive actions leave you on the same screen (e.g. you tapped
+   "Professional dashboard" but are still on the profile/dashboard), tap the
+   specific next target ("Trial reels", then "Create trial reel") or switch to
+   the next path — never loop on ``wait``.
 5. Pick the most recent video in the gallery (the file we just pushed). If the
    clips timeline editor appears (filmstrip + "Try Edits" pill), tap the
    top-right Next arrow (drawer_next_button_layout) — NOT the top-left chevron.
