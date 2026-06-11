@@ -5,9 +5,10 @@ on the current fleet we run **capture-only** via ``NoopRotator`` — it does not
 mutate the device, it only (optionally) verifies the device is reachable before
 the fingerprint snapshot + registration proceed.
 
-``GenFarmerAutoRotator`` (fleet: trigger ChangeDevice via the GenFarmer
-Automation REST, THEN verify ADB reachable) is a TODO to be implemented and
-verified on the real farm — it is deliberately not built yet.
+``GenFarmerAutoRotator`` (fleet) drives GenFarmer ChangeDevice via
+``src.genfarmer.changedevice``: apply a fresh, guaranteed Android-12+ identity,
+then verify the phone returns on ADB after the change-reboot. Validated on the
+real farm 2026-06-11 (see ``docs/runbooks/changedevice.md``).
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+
+from src.genfarmer.changedevice import ChangeDeviceClient, default_client
 
 ReachableProbe = Callable[[str], Awaitable[bool]]
 
@@ -76,8 +79,61 @@ class NoopRotator(DeviceIdentityRotator):
         )
 
 
+class GenFarmerAutoRotator(DeviceIdentityRotator):
+    """Fleet rotator: apply a fresh Android>=``min_android`` identity via ChangeDevice.
+
+    ``rotate`` fetches a random profile (looping until Android >= ``min_android``),
+    applies it with a freshly generated ``serialno`` (a NEW account), then waits
+    for the phone to return on ADB after the change-reboot (~90 s).
+
+    To RETURN to an existing account, do not use this rotator — call
+    ``ChangeDeviceClient.apply(serial, saved_profile, keep_serial=True)`` to
+    restore that account's exact saved device identity.
+
+    ``clear_data=True`` additionally wipes app data and rotates the real
+    ``android_id`` (use for maximal per-account isolation; it removes app state).
+    """
+
+    def __init__(
+        self,
+        client: ChangeDeviceClient | None = None,
+        *,
+        min_android: int = 12,
+        clear_data: bool = False,
+        reconnect_timeout: float = 300.0,
+    ) -> None:
+        self._client = client or default_client()
+        self._min_android = min_android
+        self._clear_data = clear_data
+        self._reconnect_timeout = reconnect_timeout
+
+    async def rotate(self, serial: str) -> RotationResult:
+        try:
+            if not await self._client.ready(serial):
+                return RotationResult(
+                    serial, rotated=False, reachable=False,
+                    detail="device is not GenFarmer-ready (ROM helper missing)",
+                )
+            profile = await self._client.fetch_random(min_android=self._min_android)
+            await self._client.apply(
+                serial, profile, clear_data=self._clear_data,
+                keep_serial=False, require_ready=False,
+            )
+            reachable = await self._client.wait_reconnect(serial, timeout=self._reconnect_timeout)
+            return RotationResult(
+                serial, rotated=True, reachable=reachable,
+                detail=f"ChangeDevice -> {profile.summary()}",
+            )
+        except Exception as exc:  # never raise out of rotate()
+            return RotationResult(
+                serial, rotated=False, reachable=False,
+                detail=f"ChangeDevice failed: {exc}",
+            )
+
+
 __all__ = [
     "DeviceIdentityRotator",
+    "GenFarmerAutoRotator",
     "NoopRotator",
     "RotationResult",
     "ReachableProbe",
