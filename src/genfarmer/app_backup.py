@@ -383,7 +383,12 @@ def _default_adb_bin() -> str:
 
 def _run_adb(serial: str, *args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
     cmd = [_default_adb_bin(), "-s", serial, *args]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # stdin=DEVNULL is REQUIRED: `genfarmer -c <cmd>` waits on stdin and hangs
+    # forever if it stays open (e.g. when launched over ssh/PowerShell). Closing
+    # stdin makes it see EOF and run the command. Verified on Pixel 6 Pro.
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+    )
 
 
 def _default_shell(serial: str, command: str, timeout: float) -> str:
