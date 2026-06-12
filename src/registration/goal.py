@@ -25,6 +25,20 @@ GOAL
     (18+ REQUIRED; pick an age roughly 18–45).
 - Remember every value you choose; you must report them in the final result.
 
+BIRTHDAY DATE-PICKER (the "What's your birthday?" / "Set date" screen)
+- The birthday is a 3-column scroll-wheel: Month | Day | Year. Only the YEAR
+  needs changing; it defaults to the CURRENT year (e.g. 2026), which is invalid
+  (age 0). You must lower the Year to make the account ~18–30 years old — i.e. a
+  year roughly 18–30 before the current year (e.g. if it is 2026, choose ~2000).
+- HOW (do this, do NOT scroll): TAP the Year value in the rightmost column — that
+  makes it an EDITABLE text field. Clear it and TYPE the target year directly,
+  e.g. "2000". (The Month and Day columns work the same way — tap then type — but
+  usually only the Year needs changing.) Do not waste steps swiping the wheel.
+- After typing the year, verify the Year shows the value you typed, then tap
+  "SET" (or "OK"/"Done"). Do NOT tap CANCEL.
+- Only if tapping does not make the field editable, fall back to swiping the Year
+  column to decrease the year, re-reading the centered value after each swipe.
+
 START
 - The device may be on the home screen or have Instagram already open. First,
   open the Instagram app (package com.instagram.android). If a logged-in account
@@ -57,9 +71,18 @@ PHONE VERIFICATION (you own this via custom tools)
   ``get_sms_code()``. It blocks until the code arrives (or times out). Enter the
   returned code in the verification field.
 - If ``get_sms_code`` reports a timeout/cancellation, you may call
-  ``buy_phone_number`` again for a fresh number and retry once.
-- Prefer phone verification. If Instagram offers email instead and phone is not
-  available, call ``ask_operator`` to ask how to proceed.
+  ``buy_phone_number`` again for a fresh number and retry ONCE (so at most TWO
+  numbers total).
+- SMS-FAILURE STOP (do this autonomously, do NOT call ask_operator): if
+  ``get_sms_code`` has timed out / been cancelled on TWO numbers, stop and finish
+  with success=false and failure_reason="phone_verification_failed".
+- AUTOMATIC PHONE-CALL screen ("Confirm your account automatically with a phone
+  call", asking for call-log permissions): do NOT use it (the number cannot
+  receive a call) and do NOT ask the operator — treat it as SMS failure and stop
+  with failure_reason="phone_verification_failed".
+- Do NOT use "Sign up with email" — there is no way to read the email inbox. If
+  phone verification is impossible, stop with failure_reason="phone_verification_failed".
+  Only call ``ask_operator`` for genuinely unexpected screens not covered above.
 
 PACE / STEALTH
 - Behave like a human: do not rush. Allow brief natural pauses between actions.

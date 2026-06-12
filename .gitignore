@@ -30,3 +30,10 @@ venv/
 # Logs / temp
 *.log
 .tmp/
+
+# Registration / device runtime artifacts (output, backups, transcripts)
+accounts.csv
+artifacts/
+app_backups/
+clean_backups/
+hermes-history.jsonl

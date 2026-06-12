@@ -5,15 +5,22 @@
 
 Orchestration per run (``RegistrationRunner.run``):
   1. ``rotate(serial)`` via the configured ``DeviceIdentityRotator`` (NoopRotator
-     locally = capture-only) and verify the device is reachable.
-  2. Snapshot the device fingerprint (always) + dump raw getprop to artifacts.
-  3. Build a MobileRun agent with the registration goal + the custom tools
-     (buy_phone_number / get_sms_code / ask_operator) and run it (ONE atomic run).
-  4. Map the agent's structured output to ``RegistrationResult`` and append a row
-     to the CSV with credentials + fingerprint + device serials.
+     for test = skip ChangeDevice) and verify the device is reachable.
+  2. Get a fresh, account-free Instagram onto the device. Fast path: restore a
+     golden clean-data backup (``--clean-backup``) via the genfarmer root shell —
+     no slow APK download. Slow path: install the APK fresh (``--apk``). The
+     clean backup needs Instagram already installed, so a one-time APK bootstrap
+     is used if the package is missing and an APK was supplied.
+  3. Snapshot the device fingerprint + dump raw getprop to artifacts.
+  4. Build a MobileRun agent with the registration goal + the custom tools
+     (buy_phone_number / get_sms_code / ask_operator) and run it.
+  5. On success: save the bundle (fingerprint profile + credentials + Instagram
+     app backup via genfarmer root shell) so next session can be restored
+     without re-login.
 
-Everything external (agent factory, fingerprint snapshot, rotator, 5sim client)
-is injectable so the orchestration is unit-testable without a device or network.
+Everything external (agent factory, fingerprint snapshot, rotator, 5sim client,
+app backup client) is injectable so the orchestration is unit-testable without
+a device or network.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import json
 import logging
 import os
 import subprocess
@@ -29,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from src.genfarmer.app_backup import AppBackupClient, BackupResult, default_backup_client
 from src.registration.fingerprint import snapshot_fingerprint
 from src.registration.goal import build_registration_goal
 from src.registration.output import append_account_row, row_from_parts
@@ -38,6 +47,58 @@ from src.registration.tools import RegistrationSession, build_custom_tools
 from src.worker.agent_runner.mobilerun_agent_runner import AgentFactoryRequest
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# APK install helper
+# ---------------------------------------------------------------------------
+
+INSTAGRAM_PACKAGE = "com.instagram.android"
+
+
+def _install_fresh_apk(
+    serial: str,
+    apk_path: str | Path,
+    *,
+    adb_bin: str | None = None,
+    timeout: float = 120.0,
+) -> None:
+    """Ensure a fresh Instagram install (no account data) on the device.
+
+    Steps:
+      1. Uninstall existing Instagram (ignore if not installed).
+      2. Install the APK from the given path.
+      3. Verify it's installed.
+    """
+    adb = adb_bin or os.environ.get("ADB_BIN") or os.environ.get("ADB") or "adb"
+    apk = Path(apk_path)
+    if not apk.is_file():
+        raise FileNotFoundError(f"APK not found: {apk}")
+
+    def _run(*args: str) -> subprocess.CompletedProcess:
+        cmd = [adb, "-s", serial, *args]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    # Uninstall existing (ignore errors — may not be installed)
+    logger.info("Uninstalling %s from %s...", INSTAGRAM_PACKAGE, serial)
+    r = _run("uninstall", INSTAGRAM_PACKAGE)
+    if r.returncode == 0:
+        logger.info("  uninstalled OK")
+    else:
+        logger.info("  not installed or uninstall skipped: %s", (r.stdout or r.stderr or "").strip())
+
+    # Install fresh APK
+    logger.info("Installing APK: %s", apk.name)
+    r = _run("install", "-r", str(apk))
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        raise RuntimeError(f"APK install failed: {err}")
+    logger.info("  install OK: %s", (r.stdout or "").strip()[:80])
+
+    # Verify
+    r = _run("shell", "pm", "path", INSTAGRAM_PACKAGE)
+    if "package:" not in (r.stdout or ""):
+        raise RuntimeError(f"Verification failed: {INSTAGRAM_PACKAGE} not found after install")
+    logger.info("  verified: %s installed", INSTAGRAM_PACKAGE)
 
 
 def _file_operator_input(
@@ -142,6 +203,8 @@ class RegistrationRunner:
         self,
         *,
         device_serial: str,
+        apk_path: str | Path | None = None,
+        clean_backup_dir: str | Path | None = None,
         csv_path: str = _DEFAULT_CSV,
         country: str = "any",
         operator: str = "any",
@@ -154,12 +217,15 @@ class RegistrationRunner:
         snapshot_fn: SnapshotFn | None = None,
         rotator: DeviceIdentityRotator | None = None,
         five_sim_client: Any | None = None,
+        backup_client: AppBackupClient | None = None,
         device_connection_type: str | None = None,
         device_genfarmer_id: str | None = None,
     ) -> None:
         if not device_serial:
             raise ValueError("device_serial is required")
         self._serial = device_serial
+        self._apk_path = Path(apk_path) if apk_path else None
+        self._clean_backup_dir = Path(clean_backup_dir) if clean_backup_dir else None
         self._csv_path = csv_path
         self._country = country
         self._operator = operator
@@ -172,6 +238,7 @@ class RegistrationRunner:
         self._snapshot_fn = snapshot_fn or snapshot_fingerprint
         self._rotator = rotator or NoopRotator()
         self._five_sim_client = five_sim_client
+        self._backup_client = backup_client
         # tailscale ip:port serials are TCP; default the label accordingly.
         self._conn_type = device_connection_type or (
             "tailscale" if ":" in device_serial else "usb"
@@ -183,7 +250,7 @@ class RegistrationRunner:
         run_artifacts = Path(self._artifacts_dir) / _safe_name(serial) / _timestamp_slug()
         run_artifacts.mkdir(parents=True, exist_ok=True)
 
-        # 1. Rotate (capture-only locally) + verify reachable.
+        # 1. Rotate (capture-only locally / NoopRotator for test) + verify reachable.
         rotation = await self._rotator.rotate(serial)
         if not rotation.ok:
             result = RegistrationResult(
@@ -195,13 +262,23 @@ class RegistrationRunner:
                             trajectory_path=str(run_artifacts), status="failed")
             return result
 
-        # 2. Snapshot fingerprint (always).
+        # 2. Get a fresh, account-free Instagram onto the device (restore clean
+        #    backup / install APK — see _prepare_instagram).
+        prep_error = self._prepare_instagram(serial)
+        if prep_error:
+            logger.error("Instagram prep failed: %s", prep_error)
+            result = RegistrationResult(success=False, failure_reason=prep_error)
+            self._write_row(result, fingerprint={}, raw_getprop_path=None,
+                            trajectory_path=str(run_artifacts), status="failed")
+            return result
+
+        # 3. Snapshot fingerprint (always).
         raw_getprop_path = run_artifacts / "getprop.txt"
         snap = await self._snapshot_fn(serial, raw_getprop_path=raw_getprop_path)
         fingerprint = dict(getattr(snap, "fields", {}) or {})
         raw_path = getattr(snap, "raw_getprop_path", None) or str(raw_getprop_path)
 
-        # 3. Build the agent (goal + custom tools) and run it.
+        # 4. Build the agent (goal + custom tools) and run it.
         session = RegistrationSession(
             client=self._five_sim_client,
             country=self._country,
@@ -219,7 +296,8 @@ class RegistrationRunner:
             goal=goal,
             device_serial=serial,
             variables={"device_serial": serial, "country": self._country},
-            overrides={"use_tcp": ":" in serial, "trajectory_path": str(run_artifacts)},
+            overrides={"use_tcp": ":" in serial, "trajectory_path": str(run_artifacts),
+                       "max_steps": 70},
             config_path=self._config_path,
             platform="instagram",
             timeout_seconds=self._timeout,
@@ -253,9 +331,75 @@ class RegistrationRunner:
         if not result.phone_country:
             result.phone_country = self._country
 
+        # 5. On success: save bundle (fingerprint + credentials + app backup).
+        backup_result: BackupResult | None = None
+        if result.success and self._backup_client:
+            logger.info("Registration succeeded — backing up Instagram app data...")
+            label = result.username or _timestamp_slug()
+            backup_result = self._backup_client.backup(
+                serial, INSTAGRAM_PACKAGE, label=label,
+            )
+            if backup_result.ok:
+                logger.info(
+                    "App backup saved: %s (%d bytes)",
+                    backup_result.backup_dir, backup_result.archive_size_bytes,
+                )
+                # Save fingerprint profile into the same backup dir
+                if backup_result.backup_dir:
+                    fp_path = backup_result.backup_dir / "fingerprint.json"
+                    fp_path.write_text(
+                        json.dumps(fingerprint, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    creds_path = backup_result.backup_dir / "credentials.json"
+                    creds_path.write_text(
+                        json.dumps(result.as_dict(), indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+            else:
+                logger.warning("App backup FAILED: %s", backup_result.error)
+
         status = "success" if result.success else "failed"
         self._write_row(result, fingerprint, raw_path, str(run_artifacts), status)
         return result
+
+    def _prepare_instagram(self, serial: str) -> str | None:
+        """Ensure a fresh, account-free Instagram is on the device.
+
+        Fast path: restore the golden clean-data backup (``--clean-backup``) via
+        the genfarmer root shell — no slow APK download. If Instagram isn't
+        installed yet and an APK is supplied, install it once as a bootstrap,
+        then restore. Slow path: install the APK fresh. With neither configured
+        (e.g. unit tests, or the app is already in a clean state) this is a no-op.
+
+        Returns ``None`` on success or a ``failure_reason`` string on error.
+        """
+        if self._clean_backup_dir:
+            if self._backup_client is None:
+                return "clean_backup_requested_but_no_backup_client"
+            res = self._backup_client.restore(serial, INSTAGRAM_PACKAGE, self._clean_backup_dir)
+            if res.ok:
+                logger.info("Restored clean Instagram backup from %s", self._clean_backup_dir)
+                return None
+            # Package not installed yet → one-time APK bootstrap, then restore.
+            if "not installed" in res.error.lower() and self._apk_path:
+                logger.info("Instagram absent — bootstrapping APK once, then restoring clean data...")
+                try:
+                    _install_fresh_apk(serial, self._apk_path)
+                except (FileNotFoundError, RuntimeError) as exc:
+                    return f"apk_install_failed: {exc}"
+                res = self._backup_client.restore(serial, INSTAGRAM_PACKAGE, self._clean_backup_dir)
+                if res.ok:
+                    logger.info("Restored clean Instagram backup after APK bootstrap")
+                    return None
+            return f"clean_restore_failed: {res.error}"
+
+        if self._apk_path:
+            try:
+                _install_fresh_apk(serial, self._apk_path)
+            except (FileNotFoundError, RuntimeError) as exc:
+                return f"apk_install_failed: {exc}"
+        return None
 
     def _write_row(
         self,
@@ -339,7 +483,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     reg = sub.add_parser("register", help="Register one Instagram account.")
     reg.add_argument("--device-serial", required=True, help="ADB serial (ip:port for TCP).")
-    reg.add_argument("--country", default="any", help="5sim country (default: any).")
+    reg.add_argument("--apk", default=None,
+                     help="Path to Instagram APK. If given, uninstall+install fresh before registration.")
+    reg.add_argument("--clean-backup", default=None,
+                     help="Path to a golden clean-Instagram backup dir (data.tgz + manifest.json). "
+                          "Restored before registration instead of installing the APK (fast path). "
+                          "Falls back to a one-time --apk bootstrap if Instagram isn't installed.")
+    reg.add_argument("--provider", default="5sim", choices=["5sim", "smspool"],
+                     help="SMS number provider (default: 5sim). smspool = non-VoIP real-SIM.")
+    reg.add_argument("--country", default="any", help="SMS country (e.g. vietnam; default: any).")
     reg.add_argument("--operator", default="any", help="5sim operator priority list, e.g. 'virtual4,any' (default: any).")
     reg.add_argument("--max-price", type=float, default=None,
                      help="5sim per-number price cap (raises it; unlocks pricier high-delivery operators).")
@@ -348,9 +500,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     reg.add_argument("--csv", default=_DEFAULT_CSV, help="Output CSV path.")
     reg.add_argument("--config", default=_DEFAULT_CONFIG, help="MobileRun config path.")
     reg.add_argument("--artifacts-dir", default=_DEFAULT_ARTIFACTS, help="Artifacts root.")
+    reg.add_argument("--backup-root", default=None,
+                     help="Root dir for app backups (default: app_backups/).")
+    reg.add_argument("--no-backup", action="store_true",
+                     help="Skip app backup on success.")
     reg.add_argument("--timeout", type=int, default=_DEFAULT_TIMEOUT, help="Agent timeout (s).")
     reg.add_argument("--genfarmer-id", default=None, help="Optional GenFarmer device id.")
     return parser
+
+
+def _make_sms_client(provider: str) -> Any:
+    """Pluggable SMS-number provider. Add new providers here behind the same
+    interface (buy_number / get_code / cancel / ban / finish / balance)."""
+    if provider == "smspool":
+        from src.registration.sms_pool import SmsPoolClient
+
+        return SmsPoolClient()
+    from src.registration.five_sim import FiveSimClient
+
+    return FiveSimClient()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,16 +526,26 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     if args.command == "register":
+        # Build backup client (unless --no-backup)
+        backup_client: AppBackupClient | None = None
+        if not args.no_backup:
+            backup_root = Path(args.backup_root) if args.backup_root else None
+            backup_client = default_backup_client(backup_root=backup_root)
+
         runner = RegistrationRunner(
             device_serial=args.device_serial,
+            apk_path=args.apk,
+            clean_backup_dir=args.clean_backup,
             csv_path=args.csv,
             country=args.country,
+            five_sim_client=_make_sms_client(args.provider),
             operator=args.operator,
             max_price=args.max_price,
             sms_timeout_seconds=args.sms_timeout,
             config_path=args.config,
             timeout_seconds=args.timeout,
             artifacts_dir=args.artifacts_dir,
+            backup_client=backup_client,
             device_genfarmer_id=args.genfarmer_id,
         )
         result = asyncio.run(runner.run())

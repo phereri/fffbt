@@ -148,3 +148,62 @@ class TestRunnerOrchestration:
         result = asyncio.run(runner.run())
         assert not result.success
         assert "request" not in captured  # agent never built
+
+
+class _FakeBackupClient:
+    """Records restore/backup calls; configurable restore outcome."""
+
+    def __init__(self, *, restore_ok=True, restore_error="", first_error="Package not installed: x"):
+        from src.genfarmer.app_backup import BackupResult, RestoreResult
+
+        self._BackupResult = BackupResult
+        self._RestoreResult = RestoreResult
+        self.restore_ok = restore_ok
+        self.restore_error = restore_error
+        self.first_error = first_error
+        self.restore_calls = []
+        self.backup_calls = []
+
+    def restore(self, serial, package, backup_dir, **kw):
+        self.restore_calls.append((serial, package, str(backup_dir)))
+        if self.restore_ok:
+            return self._RestoreResult(ok=True)
+        # First call fails (e.g. not installed), a later call (after bootstrap) succeeds.
+        if len(self.restore_calls) == 1:
+            return self._RestoreResult(ok=False, error=self.first_error)
+        return self._RestoreResult(ok=True)
+
+    def backup(self, serial, package, **kw):
+        self.backup_calls.append((serial, package))
+        return self._BackupResult(ok=True, backup_dir=None, archive_size_bytes=1)
+
+
+class TestPrepareInstagram:
+    def test_clean_backup_restored_before_agent(self, tmp_path):
+        backup = _FakeBackupClient(restore_ok=True)
+        runner, captured = _runner(
+            tmp_path, clean_backup_dir=str(tmp_path / "clean"), backup_client=backup
+        )
+        result = asyncio.run(runner.run())
+        assert result.success
+        assert len(backup.restore_calls) == 1
+        assert backup.restore_calls[0][1] == "com.instagram.android"
+        assert "request" in captured  # agent ran after restore
+
+    def test_clean_restore_failure_aborts(self, tmp_path):
+        # restore fails and there is no APK to bootstrap from → abort before agent.
+        backup = _FakeBackupClient(restore_ok=False, first_error="tar extract failed")
+        runner, captured = _runner(
+            tmp_path, clean_backup_dir=str(tmp_path / "clean"), backup_client=backup
+        )
+        result = asyncio.run(runner.run())
+        assert not result.success
+        assert "clean_restore_failed" in (result.failure_reason or "")
+        assert "request" not in captured  # agent never built
+
+    def test_clean_backup_requires_backup_client(self, tmp_path):
+        runner, captured = _runner(tmp_path, clean_backup_dir=str(tmp_path / "clean"))
+        result = asyncio.run(runner.run())
+        assert not result.success
+        assert result.failure_reason == "clean_backup_requested_but_no_backup_client"
+        assert "request" not in captured
