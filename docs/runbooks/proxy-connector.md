@@ -61,6 +61,27 @@ Verify egress after: `adb shell curl -s https://api.ipify.org` should show the p
 (Tailscale must survive the egress change — gentler than the full-tunnel VPN, but
 still verify on a spare device before fleet use.)
 
+### ⚠️ `update_proxy` alone does NOT activate (verified 2026-06-11, router build 20260511)
+On the live farm router, `POST /api/update_proxy` returns `{"success":true}` and is
+**adb-safe** (Tailscale survives — verified on spare SM-G781B 192.168.4.161), BUT:
+- the device row from `GET /api/devices` shows **no `proxy` object** afterwards, and
+- egress (`curl api.ipify.org`) **stays on the bare fleet IP** (`14.245.75.171`),
+  even after 45s — the assignment does not take effect.
+
+`GET /api/system/config` on this router shows the gate:
+```json
+{"data":{"webrtcMode":0,"globalProxyMode":0,"globalProxy":null,"isolatedMode":0,"whiteListDevice":null},"success":true}
+```
+`globalProxyMode:0` = proxy mode OFF. The official GenRouter doc
+(`fast-router-proxy.gitbook.io/genrouter/how-to-use/integrations`) lists ONLY
+`update_proxy` and read-only `system/config`/`system/info`/`router/info`/`devices`
++ `router/create_wifi`; it documents **no** endpoint to flip `globalProxyMode`/
+`globalProxy` or to "apply" a proxy. So activation must be done via the **GenRouter
+web UI** (or an undocumented POST). Do NOT blind-POST config to this router — it is
+SHARED by the whole farm and a bad write can drop everyone's networking.
+Other read-only endpoints found: `/api/system/info` (build/version/license),
+`/api/system/config`, `/api/system/network`, `/api/router/info`.
+
 ## Proxy list
 Saved (gitignored) at `.secrets/proxies.json`: `vietnam_socks5`,
 `america_datacenter_socks5`, `america_isp_socks5`; format `ip:port:user:pass`.
