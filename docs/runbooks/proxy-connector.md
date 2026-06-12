@@ -82,6 +82,28 @@ SHARED by the whole farm and a bad write can drop everyone's networking.
 Other read-only endpoints found: `/api/system/info` (build/version/license),
 `/api/system/config`, `/api/system/network`, `/api/router/info`.
 
+### `update_proxy` is a NO-OP on this build — use the panel's Proxy Distribute (2026-06-11)
+Reverse-engineering the GenRouter web UI (`/assets/*.js`) shows it does **NOT** call
+`/api/update_proxy` anywhere. The documented `update_proxy` is an external-integration
+endpoint that this firmware accepts (`{"success":true}`) but does not wire to the
+actual proxy distribution — assignments never appear on the device row and egress
+never changes, regardless of pool membership or payload shape. So **do not rely on
+`update_proxy`** for per-device proxying here.
+What the UI actually uses:
+- Proxy POOL CRUD: `GET/POST /api/db-proxy`, `/api/db-proxy/{id}`; test one with
+  `/api/check_proxy`. (Pool already holds many VN socks5 entries, e.g. id127
+  `14.235.129.92:40833`.)
+- Per-device assignment is the **"Proxy Distribute"** UI feature: it stages device→
+  proxy mappings in a client-side IndexedDB (Dexie, `devices: ++id,name,ip,mac,
+  status,type,proxy`, `is_change` flag; types http/socks5/ovpn/dpn/pppoe) and pushes
+  on "Apply". The push endpoint is built dynamically (not a literal in the bundle).
+- Devices already proxied (verified live) DO show a `proxy` object in `/api/devices`
+  with `dns_server`/`interface` fields — so that row IS the source of truth for
+  whether a device is proxied. The Pixel 6 Pro (`192.168.4.169`, blank hostname,
+  MAC `04:d6:aa:18:eb:52`) had none despite UI attempts → assignment must target
+  that exact IP. ChangeDevice spoofs the model (getprop=Pixel 6 Pro, device_name=
+  SM-N950F, DHCP hostname blank) so pick by IP/MAC, not name.
+
 ## Proxy list
 Saved (gitignored) at `.secrets/proxies.json`: `vietnam_socks5`,
 `america_datacenter_socks5`, `america_isp_socks5`; format `ip:port:user:pass`.
