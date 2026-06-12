@@ -210,6 +210,7 @@ class RegistrationRunner:
         operator: str = "any",
         max_price: float | None = None,
         sms_timeout_seconds: float = 300.0,
+        sms_poll_window_seconds: float = 30.0,
         config_path: str = _DEFAULT_CONFIG,
         timeout_seconds: int = _DEFAULT_TIMEOUT,
         artifacts_dir: str = _DEFAULT_ARTIFACTS,
@@ -231,6 +232,7 @@ class RegistrationRunner:
         self._operator = operator
         self._max_price = max_price
         self._sms_timeout = float(sms_timeout_seconds)
+        self._sms_poll_window = float(sms_poll_window_seconds)
         self._config_path = config_path
         self._timeout = int(timeout_seconds)
         self._artifacts_dir = artifacts_dir
@@ -285,6 +287,7 @@ class RegistrationRunner:
             operator=self._operator,
             max_price=self._max_price,
             code_timeout=self._sms_timeout,
+            code_poll_window=self._sms_poll_window,
             artifacts_dir=str(run_artifacts),
             operator_input=_file_operator_input(run_artifacts),
             capture_fn=_adb_capture(serial, run_artifacts),
@@ -496,7 +499,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     reg.add_argument("--max-price", type=float, default=None,
                      help="5sim per-number price cap (raises it; unlocks pricier high-delivery operators).")
     reg.add_argument("--sms-timeout", type=float, default=300.0,
-                     help="Seconds to wait for the SMS code per number (default: 300).")
+                     help="Total seconds to wait for the SMS code per number, across resend retries (default: 300).")
+    reg.add_argument("--sms-poll-window", type=float, default=30.0,
+                     help="Seconds get_sms_code polls per call before telling the agent to resend (default: 30).")
     reg.add_argument("--csv", default=_DEFAULT_CSV, help="Output CSV path.")
     reg.add_argument("--config", default=_DEFAULT_CONFIG, help="MobileRun config path.")
     reg.add_argument("--artifacts-dir", default=_DEFAULT_ARTIFACTS, help="Artifacts root.")
@@ -542,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             operator=args.operator,
             max_price=args.max_price,
             sms_timeout_seconds=args.sms_timeout,
+            sms_poll_window_seconds=args.sms_poll_window,
             config_path=args.config,
             timeout_seconds=args.timeout,
             artifacts_dir=args.artifacts_dir,

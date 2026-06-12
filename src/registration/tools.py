@@ -42,6 +42,7 @@ class RegistrationSession:
         product: str = "instagram",
         max_price: float | None = None,
         code_timeout: float = 180.0,
+        code_poll_window: float = 30.0,
         artifacts_dir: str | Path | None = None,
         operator_input: OperatorInput | None = None,
         capture_fn: CaptureFn | None = None,
@@ -55,11 +56,13 @@ class RegistrationSession:
         self._operators = [o.strip() for o in str(operator).split(",") if o.strip()] or ["any"]
         self._max_price = max_price
         self._product = product
-        self._code_timeout = code_timeout
+        self._code_timeout = float(code_timeout)        # total budget per number
+        self._code_poll_window = float(code_poll_window)  # one get_sms_code attempt
         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir else None
         self._operator_input = operator_input or input
         self._capture_fn = capture_fn
         self._order: FiveSimOrder | None = None
+        self._code_waited = 0.0  # cumulative seconds spent polling the current number
         self._ask_counter = 0
 
     # -- exposed state ------------------------------------------------------
@@ -113,6 +116,7 @@ class RegistrationSession:
                 + " | ".join(errors)
             )
         self._order = order
+        self._code_waited = 0.0  # fresh code-wait budget for this number
         return ToolResult.ok(
             f"Bought phone {order.phone} (order_id={order.id}, "
             f"country={target_country}, operator={used_operator}). Use this number "
@@ -120,18 +124,42 @@ class RegistrationSession:
         )
 
     async def get_sms_code(self) -> ToolResult:
-        """Poll the active order for the SMS code; auto-cancel on timeout."""
+        """Poll the active order for the SMS code in short windows.
+
+        Instagram's SMS often does not arrive on the first send. Rather than block
+        for the whole budget on one wait, we poll for ``code_poll_window`` seconds
+        (default 30s) per call: if a code arrives, return it; if not — and the
+        total budget is not yet spent — return a NON-fatal message telling the
+        agent to tap "Resend code to SMS" and call again (the number stays live).
+        Only when the cumulative ``code_timeout`` budget is exhausted do we cancel
+        the order and tell the agent to buy a fresh number.
+        """
         if self._order is None:
             return ToolResult.fail("no active order; call buy_phone_number first.")
-        try:
-            code = await self._client.get_code(
-                self._order.id, timeout=self._code_timeout
-            )
-        except FiveSimTimeout as exc:
+
+        remaining = self._code_timeout - self._code_waited
+        if remaining <= 0:
             await self._release("cancel")
             return ToolResult.fail(
-                f"no SMS code within timeout ({exc}); order cancelled. "
+                f"no SMS after {int(self._code_timeout)}s of retries; order cancelled. "
                 f"You may buy a new number."
+            )
+        window = min(self._code_poll_window, remaining)
+        try:
+            code = await self._client.get_code(self._order.id, timeout=window)
+        except FiveSimTimeout:
+            self._code_waited += window
+            if self._code_waited >= self._code_timeout:
+                await self._release("cancel")
+                return ToolResult.fail(
+                    f"no SMS within {int(self._code_timeout)}s total; order cancelled. "
+                    f"You may buy a new number."
+                )
+            return ToolResult.ok(
+                f"NO CODE YET after {int(window)}s "
+                f"(waited {int(self._code_waited)}/{int(self._code_timeout)}s). This is "
+                f"NOT a code — do NOT type anything. Tap 'Resend code to SMS' (via "
+                f"'I didn't get the code' if needed), then call get_sms_code again."
             )
         except FiveSimError as exc:
             return ToolResult.fail(f"5sim check failed: {exc}")

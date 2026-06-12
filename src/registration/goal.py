@@ -81,11 +81,17 @@ PHONE VERIFICATION (you own this via custom tools)
   * If "I didn't get the code" offers ONLY WhatsApp / phone-call options (no SMS /
     text option at all), this number cannot be SMS-verified — treat it as an SMS
     failure (follow the timeout/retry rule below).
-- ``get_sms_code()`` blocks until the code arrives (or times out). Enter the
-  returned code in the verification field.
-- If ``get_sms_code`` reports a timeout/cancellation, you may call
-  ``buy_phone_number`` again for a fresh number and retry ONCE (so at most TWO
-  numbers total).
+- ``get_sms_code()`` polls for ~30 seconds per call (it does NOT block for minutes).
+  Three possible replies:
+  * A line starting "SMS code: <digits>" — type those digits in the code field.
+  * A line starting "NO CODE YET ..." — the code has not arrived. Do NOT type
+    anything. Tap "I didn't get the code" → "Resend code to SMS", then call
+    ``get_sms_code()`` AGAIN. Keep doing this resend-then-poll loop until you get a
+    code or get the cancellation message below.
+  * A "Failed: ... order cancelled. You may buy a new number." — the whole budget
+    is spent; follow the new-number rule below.
+- NEW NUMBER: after a number is cancelled, you may call ``buy_phone_number`` again
+  for a fresh number and retry ONCE (so at most TWO numbers total).
 - SMS-FAILURE STOP (do this autonomously, do NOT call ask_operator): if
   ``get_sms_code`` has timed out / been cancelled on TWO numbers, stop and finish
   with success=false and failure_reason="phone_verification_failed".

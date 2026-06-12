@@ -133,15 +133,50 @@ class TestGetSmsCode:
         assert not res.success
         assert "no active order" in res.message.lower()
 
-    def test_timeout_auto_cancels(self):
-        sess, client = _session()
+    def test_no_code_within_window_keeps_order_and_prompts_resend(self):
+        # One poll window times out but the total budget remains -> NON-fatal:
+        # the number stays live and the agent is told to resend + retry.
+        sess, client = _session(code_timeout=180.0, code_poll_window=30.0)
         asyncio.run(sess.buy_phone_number())
         client.get_code_raises = FiveSimTimeout("no sms")
         res = asyncio.run(sess.get_sms_code())
+        assert res.success
+        assert "NO CODE YET" in res.message and "Resend" in res.message
+        assert client.cancelled == []            # NOT cancelled
+        assert sess.active_order is not None      # number kept for retry
+
+    def test_budget_exhausted_cancels(self):
+        # When cumulative wait reaches code_timeout, the order is cancelled.
+        sess, client = _session(code_timeout=30.0, code_poll_window=30.0)
+        asyncio.run(sess.buy_phone_number())
+        client.get_code_raises = FiveSimTimeout("no sms")
+        res = asyncio.run(sess.get_sms_code())   # one 30s window == full budget
         assert not res.success
+        assert "buy a new number" in res.message.lower()
         assert client.cancelled == [555]
-        # Order released after cancel so a retry buy is allowed.
         assert sess.active_order is None
+
+    def test_retries_accumulate_then_cancel(self):
+        # Two 30s windows against a 60s budget: first keeps the order, second cancels.
+        sess, client = _session(code_timeout=60.0, code_poll_window=30.0)
+        asyncio.run(sess.buy_phone_number())
+        client.get_code_raises = FiveSimTimeout("no sms")
+        r1 = asyncio.run(sess.get_sms_code())
+        assert r1.success and sess.active_order is not None
+        r2 = asyncio.run(sess.get_sms_code())
+        assert not r2.success and sess.active_order is None
+        assert client.cancelled == [555]
+
+    def test_buy_resets_wait_budget(self):
+        # A fresh number resets the accumulated wait so its full budget applies.
+        sess, client = _session(code_timeout=30.0, code_poll_window=30.0)
+        asyncio.run(sess.buy_phone_number())
+        client.get_code_raises = FiveSimTimeout("no sms")
+        asyncio.run(sess.get_sms_code())          # exhausts + cancels first number
+        client.get_code_raises = None
+        asyncio.run(sess.buy_phone_number())      # new number, budget reset
+        res = asyncio.run(sess.get_sms_code())    # code available now
+        assert res.success and "123456" in res.message
 
 
 # ---------------------------------------------------------------------------
