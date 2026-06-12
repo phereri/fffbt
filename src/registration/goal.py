@@ -67,8 +67,21 @@ PHONE VERIFICATION (you own this via custom tools)
   ``ask_operator`` stating EXACTLY what the number field contains character by
   character (especially whether the leading "+" is present) so the operator can
   see the screenshot and decide.
-- When Instagram says it sent an SMS / asks for the confirmation code, call
-  ``get_sms_code()``. It blocks until the code arrives (or times out). Enter the
+- CONFIRMATION CODE — FORCE SMS, NOT WHATSAPP. The number you bought can receive
+  SMS/text only; it has NO WhatsApp. On the "Enter the confirmation code" screen,
+  read HOW Instagram says it sent the code:
+  * If it says the code was sent by SMS / text message, call ``get_sms_code()``.
+  * If it says the code was sent "via WhatsApp" (or anything that is NOT SMS/text),
+    do NOT wait and do NOT call ``get_sms_code`` yet — that code will never arrive.
+    Tap "I didn't get the code" (or "Didn't get a code?" / "Resend"), then from the
+    options choose the one that sends the code by SMS / TEXT MESSAGE (e.g. "Send
+    code in a text message", "Text me the code", "Resend via SMS"). Do NOT pick
+    "Send via WhatsApp" and do NOT pick "Call me". Only AFTER the screen confirms
+    the code was sent by SMS/text, call ``get_sms_code()``.
+  * If "I didn't get the code" offers ONLY WhatsApp / phone-call options (no SMS /
+    text option at all), this number cannot be SMS-verified — treat it as an SMS
+    failure (follow the timeout/retry rule below).
+- ``get_sms_code()`` blocks until the code arrives (or times out). Enter the
   returned code in the verification field.
 - If ``get_sms_code`` reports a timeout/cancellation, you may call
   ``buy_phone_number`` again for a fresh number and retry ONCE (so at most TWO
