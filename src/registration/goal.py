@@ -72,15 +72,19 @@ PHONE VERIFICATION (you own this via custom tools)
   read HOW Instagram says it sent the code:
   * If it says the code was sent by SMS / text message, call ``get_sms_code()``.
   * If it says the code was sent "via WhatsApp" (or anything that is NOT SMS/text),
-    do NOT wait and do NOT call ``get_sms_code`` yet — that code will never arrive.
-    Tap "I didn't get the code" (or "Didn't get a code?" / "Resend"), then from the
-    options choose the one that sends the code by SMS / TEXT MESSAGE (e.g. "Send
-    code in a text message", "Text me the code", "Resend via SMS"). Do NOT pick
-    "Send via WhatsApp" and do NOT pick "Call me". Only AFTER the screen confirms
-    the code was sent by SMS/text, call ``get_sms_code()``.
-  * If "I didn't get the code" offers ONLY WhatsApp / phone-call options (no SMS /
-    text option at all), this number cannot be SMS-verified — treat it as an SMS
-    failure (follow the timeout/retry rule below).
+    tap "I didn't get the code" (or "Didn't get a code?" / "Resend"), then choose
+    the option that sends the code by SMS / TEXT (e.g. "Send code via SMS", "Send
+    code in a text message", "Text me the code"). Do NOT pick WhatsApp or "Call me".
+  * CRITICAL — after you tap "Send code via SMS", the menu closes and you RETURN to
+    the "Enter the confirmation code" screen. THIS IS NORMAL AND EXPECTED: the
+    screen does NOT visibly change and shows NO confirmation. This does NOT mean it
+    failed. Do NOT tap "Send code via SMS" again and again, and do NOT conclude SMS
+    is impossible. The ONLY way to know if the code arrived is to call
+    ``get_sms_code()``. So: tap "Send code via SMS" ONCE, then immediately call
+    ``get_sms_code()`` and act on its reply (below).
+  * If the "I didn't get the code" menu offers ONLY WhatsApp / phone-call options
+    (literally NO SMS/text option exists), only THEN treat it as an SMS failure
+    (follow the new-number rule below).
 - ``get_sms_code()`` polls for ~30 seconds per call (it does NOT block for minutes).
   Three possible replies:
   * A line starting "SMS code: <digits>" — type those digits in the code field.
