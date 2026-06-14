@@ -107,13 +107,27 @@ PHONE VERIFICATION (you own this via custom tools)
   phone verification is impossible, stop with failure_reason="phone_verification_failed".
   Only call ``ask_operator`` for genuinely unexpected screens not covered above.
 
-PACE / STEALTH
-- Behave like a human: do not rush. Allow brief natural pauses between actions.
-- Do not spam taps; resolve each screen from a fresh UI tree before acting.
+PERMISSION DIALOGS (contacts, location, notifications, microphone, camera)
+- Instagram will ask for various Android permissions during and after signup.
+  ALWAYS tap "Don't Allow" / "Deny" / "Not Now" / "Skip" for EVERY permission
+  dialog — contacts, location/GPS, notifications, microphone, camera, and any
+  other system permission popup. NEVER tap "Allow" or "OK" on a permission dialog.
+- If a permission dialog appears at any point (even mid-flow), dismiss it first
+  before continuing with the registration step.
+
+PACE / STEALTH — TYPE SLOWLY
+- Behave like a human. Add natural pauses between actions (1–3 seconds between
+  taps on different elements).
+- When typing any text (name, username, password, phone number, birthday year,
+  verification code): type SLOWLY — pause 200–400 ms between each character.
+  Do not paste or type all characters at once; use the character-by-character
+  typing tool, not bulk input.
+- Do not spam taps; read a fresh screenshot before each action.
 
 DEVICE-CONTROL POLICY
 - Use Mobilerun TCP UI tools only (the AppCard names the specific helpers).
-- Do NOT issue raw ADB tap/swipe coordinates.
+- Use vision/screenshot-based navigation — identify elements from the screenshot,
+  do NOT use hardcoded coordinates or element indices unless no other option exists.
 - Do NOT take destructive actions.
 
 WHEN YOU ARE STUCK

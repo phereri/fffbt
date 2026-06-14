@@ -511,6 +511,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      help="Skip app backup on success.")
     reg.add_argument("--timeout", type=int, default=_DEFAULT_TIMEOUT, help="Agent timeout (s).")
     reg.add_argument("--genfarmer-id", default=None, help="Optional GenFarmer device id.")
+
+    # -- register-loop: self-recovering SMS recipe ladder -------------------
+    loop = sub.add_parser(
+        "register-loop",
+        help="Register with self-recovery: try a ladder of SMS recipes "
+             "(provider/country/operator) until one delivers, restoring the "
+             "clean backup between attempts.",
+    )
+    loop.add_argument("--device-serial", required=True, help="ADB serial (ip:port for TCP).")
+    loop.add_argument("--apk", default=None, help="Instagram APK (one-time bootstrap if absent).")
+    loop.add_argument("--clean-backup", default=None,
+                      help="Golden clean-Instagram backup dir, restored before EACH attempt.")
+    loop.add_argument("--recipes", default=None,
+                      help="Path to a JSON ladder (list of recipe objects). Default: built-in ladder.")
+    loop.add_argument("--max-attempts", type=int, default=None,
+                      help="Cap the number of recipes tried (default: all).")
+    loop.add_argument("--csv", default=_DEFAULT_CSV, help="Output CSV path.")
+    loop.add_argument("--config", default=_DEFAULT_CONFIG, help="MobileRun config path.")
+    loop.add_argument("--artifacts-dir", default=_DEFAULT_ARTIFACTS, help="Artifacts root.")
+    loop.add_argument("--backup-root", default=None, help="Root dir for app backups.")
+    loop.add_argument("--no-backup", action="store_true", help="Skip app backup on success.")
+    loop.add_argument("--timeout", type=int, default=_DEFAULT_TIMEOUT, help="Agent timeout (s).")
+    loop.add_argument("--genfarmer-id", default=None, help="Optional GenFarmer device id.")
     return parser
 
 
@@ -557,6 +580,48 @@ def main(argv: list[str] | None = None) -> int:
         result = asyncio.run(runner.run())
         print(result.as_dict())
         return 0 if result.success else 1
+
+    if args.command == "register-loop":
+        from src.registration.ladder import (
+            DEFAULT_LADDER,
+            DeviceConfig,
+            RecipeLadder,
+            default_runner_factory,
+            load_recipes,
+        )
+
+        backup_client = None
+        if not args.no_backup:
+            backup_root = Path(args.backup_root) if args.backup_root else None
+            backup_client = default_backup_client(backup_root=backup_root)
+
+        recipes = list(load_recipes(args.recipes)) if args.recipes else list(DEFAULT_LADDER)
+        cfg = DeviceConfig(
+            device_serial=args.device_serial,
+            clean_backup_dir=args.clean_backup,
+            apk_path=args.apk,
+            csv_path=args.csv,
+            config_path=args.config,
+            artifacts_dir=args.artifacts_dir,
+            backup_client=backup_client,
+            genfarmer_id=args.genfarmer_id,
+            timeout_seconds=args.timeout,
+            # NoopRotator: on the Tailscale test setup the heavy ChangeDevice is
+            # driven once up front by the operator (it reboots + drops Tailscale).
+            rotator=NoopRotator(),
+        )
+        ladder = RecipeLadder(
+            recipes,
+            default_runner_factory(cfg),
+            max_attempts=args.max_attempts,
+        )
+        outcome = asyncio.run(ladder.run())
+        print("LADDER:", outcome.stopped_reason)
+        for a in outcome.attempts:
+            print("  ", a.summary())
+        if outcome.final:
+            print(outcome.final.as_dict())
+        return 0 if outcome.success else 1
 
     return 2
 
