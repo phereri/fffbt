@@ -134,10 +134,45 @@ python -m src.runner post-one --device 100.100.57.41:5555 --video /clips/a.mp4 -
 | `--video` | local `.mp4` path or http(s)/S3 URL (required) |
 | `--caption` | caption body text (required) |
 | `--hashtags` | comma/space separated, with or without `#` |
-| `--expected-username` | informational; the IG username expected on the device |
+| `--account` (`--expected-username`) | IG username expected on the device; logged + informational |
+| `--video-id` | bucket folder this video came from (e.g. `Cowboy`) — recorded in the log |
+| `--category` | category from the folder's `meta.json` — recorded in the log |
+| `--source-key` | full S3 key of the exact file — recorded in the log |
+| `--log` | posted-reels JSONL path (default `$POSTED_REELS_LOG` or `posted_reels.jsonl`) |
 | `--no-verify` | skip the delayed dashboard confirmation (publish only) |
 | `--verify-delay` | seconds to wait before verification (default 180) |
+| `--no-url` | skip best-effort post-URL capture |
 | `--json` | emit a JSON result object |
+
+### Where posted reels are recorded
+
+Every published attempt appends one JSON line to a **posted-reels log** (JSONL —
+append-safe, greppable, machine-readable). Default `posted_reels.jsonl` in the
+working dir; override with `--log` or `$POSTED_REELS_LOG`. Each line ties the
+**source video → category → resulting link**:
+
+```json
+{"ts":"2026-06-14T09:30:00Z","platform":"instagram","status":"published",
+ "video_id":"Cowboy","category":"trend","source_key":"ferma/Cowboy/VID_x.mp4",
+ "post_url":"https://www.instagram.com/reel/ABC/","device":"100.100.57.41:5555",
+ "account":"uctamdoan.83862","caption":"…","verified":true}
+```
+
+`status` is `published` (verified), `published_unverified` (live but dashboard
+not confirmed, or `--no-verify`), or `failed`. `post_url` is **best-effort** —
+Instagram often withholds a Trial Reel's public link for 1–2 minutes after
+publishing (sometimes longer), so a `null` URL on a live post is normal. This
+log is also what a later step will read to decide "posted to every required
+platform → delete the folder from S3".
+
+Pass the bucket provenance through so the link is traceable:
+
+```bash
+python -m src.runner post-one --device 100.100.57.41:5555 \
+  --video "https://s3…/ferma/Cowboy/VID_x.mp4?sig=…" --caption "…" \
+  --video-id Cowboy --category trend --source-key ferma/Cowboy/VID_x.mp4 \
+  --account uctamdoan.83862
+```
 
 ## Exit codes & result
 

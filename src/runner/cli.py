@@ -63,9 +63,14 @@ def _cmd_post_one(args: argparse.Namespace) -> int:
             video=args.video,
             caption=args.caption,
             hashtags=hashtags,
-            expected_username=args.expected_username,
+            expected_username=args.account,
             verify=not args.no_verify,
             verify_delay_seconds=args.verify_delay,
+            capture_url=not args.no_url,
+            bucket_video_id=args.video_id,
+            category=args.category,
+            source_key=args.source_key,
+            log_path=args.log,
         )
     )
 
@@ -76,6 +81,7 @@ def _cmd_post_one(args: argparse.Namespace) -> int:
                     "success": result.success,
                     "published": result.published,
                     "verified": result.verified,
+                    "post_url": result.post_url,
                     "message": result.message,
                     "code": result.code,
                     "details": result.details,
@@ -87,8 +93,8 @@ def _cmd_post_one(args: argparse.Namespace) -> int:
         verdict = "SUCCESS" if result.success else "FAILED"
         print(f"[{verdict}] {result.message}")
         print(
-            f"  published={result.published} "
-            f"verified={result.verified} code={result.code}"
+            f"  published={result.published} verified={result.verified} "
+            f"url={result.post_url} code={result.code}"
         )
 
     return 0 if result.success else 1
@@ -265,9 +271,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma/space separated hashtags (with or without leading #).",
     )
     p_post.add_argument(
+        "--account",
         "--expected-username",
+        dest="account",
         default=None,
-        help="Optional: the IG username expected on the device (informational).",
+        help="Optional: the IG username expected on the device (logged + informational).",
+    )
+    # Provenance — recorded verbatim in the posted-reels log so the resulting
+    # link can be tied back to the source video. None of these affect posting.
+    p_post.add_argument(
+        "--video-id",
+        default=None,
+        help="Bucket folder name this video came from (e.g. Cowboy).",
+    )
+    p_post.add_argument(
+        "--category",
+        default=None,
+        help="Category from the folder's meta.json (e.g. trend, mems).",
+    )
+    p_post.add_argument(
+        "--source-key",
+        default=None,
+        help="Full S3 key of the exact video file (e.g. ferma/Cowboy/VID_x.mp4).",
+    )
+    p_post.add_argument(
+        "--log",
+        default=None,
+        help="Posted-reels JSONL log path (default $POSTED_REELS_LOG or "
+        "posted_reels.jsonl).",
     )
     p_post.add_argument(
         "--no-verify",
@@ -279,6 +310,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=180,
         help="Seconds to wait before dashboard verification (default 180).",
+    )
+    p_post.add_argument(
+        "--no-url",
+        action="store_true",
+        help="Skip best-effort post-URL capture after publishing.",
     )
     p_post.add_argument("--json", action="store_true", help="Emit JSON result.")
     p_post.set_defaults(func=_cmd_post_one)

@@ -13,6 +13,20 @@ from src.worker.session.types import StepName, StepResult, StepStatus
 _PREP = "src.runner.post_one.VideoPreparationStep"
 _UI = "src.runner.post_one.MobileUIAutomationStep"
 _VERIFY = "src.runner.post_one._verify_dashboard"
+_CAPTURE = "src.runner.post_one._capture_post_url"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_side_effects(tmp_path, monkeypatch):
+    """Keep every test off the real device/LLM and off the repo's log file.
+
+    - URL capture is patched to None by default (tests that care override it).
+    - The posted-reels log is redirected to a tmp file so no test writes to the
+      repo's posted_reels.jsonl.
+    """
+    monkeypatch.setenv("POSTED_REELS_LOG", str(tmp_path / "posted.jsonl"))
+    with patch(_CAPTURE, new_callable=AsyncMock, return_value=None):
+        yield
 
 
 def run(coro):
@@ -180,6 +194,120 @@ class TestVideoSourceRouting:
         kw = self._capture_prep_kwargs("/tmp/clip.mp4")
         assert "local_video_path" in kw
         assert "video_url" not in kw
+
+
+class TestUrlCapture:
+    def test_captured_url_on_result(self):
+        p_prep, _ = _patch_prep(_ok(StepName.VIDEO_PREPARATION))
+        p_ui, _ = _patch_ui(_ok(StepName.MOBILE_UI_AUTOMATION))
+        with patch(_VERIFY, new_callable=AsyncMock, return_value=True), patch(
+            _CAPTURE,
+            new_callable=AsyncMock,
+            return_value="https://www.instagram.com/reel/ABC/",
+        ):
+            try:
+                r = run(post_one(device_serial="d1", video="v.mp4", caption="c"))
+            finally:
+                p_prep.stop()
+                p_ui.stop()
+        assert r.post_url == "https://www.instagram.com/reel/ABC/"
+        assert "instagram.com" in r.message
+
+    def test_no_capture_when_disabled(self):
+        p_prep, _ = _patch_prep(_ok(StepName.VIDEO_PREPARATION))
+        p_ui, _ = _patch_ui(_ok(StepName.MOBILE_UI_AUTOMATION))
+        with patch(_VERIFY, new_callable=AsyncMock, return_value=True), patch(
+            _CAPTURE, new_callable=AsyncMock
+        ) as cap:
+            try:
+                r = run(
+                    post_one(
+                        device_serial="d1", video="v.mp4", caption="c",
+                        capture_url=False,
+                    )
+                )
+            finally:
+                p_prep.stop()
+                p_ui.stop()
+        assert r.post_url is None
+        cap.assert_not_called()
+
+
+class TestPostedLog:
+    def _post(self, tmp_path, **kw):
+        from src.runner import posted_log
+
+        log = tmp_path / "posted.jsonl"
+        p_prep, _ = _patch_prep(_ok(StepName.VIDEO_PREPARATION))
+        p_ui, _ = _patch_ui(_ok(StepName.MOBILE_UI_AUTOMATION))
+        with patch(_VERIFY, new_callable=AsyncMock, return_value=True):
+            try:
+                run(
+                    post_one(
+                        device_serial="d1", video="v.mp4", caption="c",
+                        log_path=str(log), **kw,
+                    )
+                )
+            finally:
+                p_prep.stop()
+                p_ui.stop()
+        return posted_log.read_records(log)
+
+    def test_logs_provenance_on_success(self, tmp_path):
+        recs = self._post(
+            tmp_path,
+            bucket_video_id="Cowboy",
+            category="trend",
+            source_key="ferma/Cowboy/VID_x.mp4",
+        )
+        assert len(recs) == 1
+        r = recs[0]
+        assert r["video_id"] == "Cowboy"
+        assert r["category"] == "trend"
+        assert r["source_key"] == "ferma/Cowboy/VID_x.mp4"
+        assert r["status"] == "published"
+        assert r["platform"] == "instagram"
+        assert r["verified"] is True
+        assert "ts" in r
+
+    def test_logs_failed_publish(self, tmp_path):
+        from src.runner import posted_log
+
+        log = tmp_path / "p.jsonl"
+        p_prep, _ = _patch_prep(_ok(StepName.VIDEO_PREPARATION))
+        p_ui, _ = _patch_ui(
+            _needs_review(StepName.MOBILE_UI_AUTOMATION, "share_did_not_register", "x")
+        )
+        try:
+            run(
+                post_one(
+                    device_serial="d1", video="v.mp4", caption="c",
+                    bucket_video_id="Cowboy", log_path=str(log),
+                )
+            )
+        finally:
+            p_prep.stop()
+            p_ui.stop()
+        recs = posted_log.read_records(log)
+        assert len(recs) == 1
+        assert recs[0]["status"] == "failed"
+        assert recs[0]["code"] == "share_did_not_register"
+
+    def test_no_log_when_prep_fails(self, tmp_path):
+        from src.runner import posted_log
+
+        log = tmp_path / "p.jsonl"
+        p_prep, _ = _patch_prep(_fail(StepName.VIDEO_PREPARATION, "INFRA", "x"))
+        try:
+            run(
+                post_one(
+                    device_serial="d1", video="v.mp4", caption="c", log_path=str(log)
+                )
+            )
+        finally:
+            p_prep.stop()
+        # prep failure happens before publish; nothing posted -> no log line
+        assert posted_log.read_records(log) == []
 
 
 class TestResultType:

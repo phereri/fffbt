@@ -31,3 +31,6 @@ venv/
 # Logs / temp
 *.log
 .tmp/
+
+# Standalone runner output (published-reel records)
+posted_reels.jsonl

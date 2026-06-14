@@ -92,6 +92,17 @@ class TestPostOneCommand:
                     "--no-verify",
                     "--verify-delay",
                     "60",
+                    "--video-id",
+                    "Cowboy",
+                    "--category",
+                    "trend",
+                    "--source-key",
+                    "ferma/Cowboy/VID_x.mp4",
+                    "--account",
+                    "uctamdoan.83862",
+                    "--log",
+                    "/tmp/posted.jsonl",
+                    "--no-url",
                 ]
             )
         assert seen["device_serial"] == "d1:5555"
@@ -100,6 +111,12 @@ class TestPostOneCommand:
         assert seen["hashtags"] == ["foo", "bar"]
         assert seen["verify"] is False
         assert seen["verify_delay_seconds"] == 60
+        assert seen["bucket_video_id"] == "Cowboy"
+        assert seen["category"] == "trend"
+        assert seen["source_key"] == "ferma/Cowboy/VID_x.mp4"
+        assert seen["expected_username"] == "uctamdoan.83862"
+        assert seen["log_path"] == "/tmp/posted.jsonl"
+        assert seen["capture_url"] is False
 
     def test_missing_required_arg_errors(self):
         with pytest.raises(SystemExit):

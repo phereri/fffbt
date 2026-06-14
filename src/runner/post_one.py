@@ -46,6 +46,10 @@ class PostOneResult:
     ``success`` is the overall verdict the CLI exits on:
       * verify enabled  -> published AND dashboard-confirmed
       * verify disabled -> published
+
+    ``post_url`` is best-effort: Instagram often does not expose a public Trial
+    Reel link for 1-2 minutes after publishing (and sometimes not at all), so a
+    null URL on a successful post is normal — the post is still live.
     """
 
     success: bool
@@ -53,6 +57,7 @@ class PostOneResult:
     verified: bool | None
     message: str
     code: str | None = None
+    post_url: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -69,14 +74,26 @@ async def post_one(
     expected_username: str | None = None,
     verify: bool = True,
     verify_delay_seconds: int = _DEFAULT_VERIFY_DELAY_SECONDS,
+    capture_url: bool = True,
+    bucket_video_id: str | None = None,
+    category: str | None = None,
+    source_key: str | None = None,
+    log_path: str | None = None,
     settings: dict[str, Any] | None = None,
 ) -> PostOneResult:
-    """Publish one Trial Reel and (optionally) confirm it via the dashboard.
+    """Publish one Trial Reel, confirm it, capture its link, and log the result.
 
     Parameters mirror the CLI. ``video`` may be a local ``.mp4`` path or any
     ``http(s)``/S3 presigned URL. ``settings`` lets a caller pass through
     Mobilerun overrides (config_path, app_cards_dir, trajectories_dir, etc.);
     it is merged into the synthetic ``StepContext.settings``.
+
+    The bucket-provenance fields (``bucket_video_id`` = the S3 folder name,
+    ``category`` from its meta.json, ``source_key`` = the exact S3 key) are not
+    used to drive posting — they are recorded verbatim in the posted-reels log
+    so the link can later be tied back to the source video. On any published
+    outcome a line is appended to the JSONL log (``log_path`` /
+    ``POSTED_REELS_LOG`` / ``posted_reels.jsonl``).
     """
     if not device_serial:
         return PostOneResult(False, False, None, "no device_serial provided", "INFRA")
@@ -145,7 +162,22 @@ async def post_one(
     publish = await MobileUIAutomationStep().run(
         ctx, device_serial=device_serial, caption_text=caption_text
     )
+
+    # Provenance recorded on every logged line (independent of outcome).
+    log_ctx = dict(
+        bucket_video_id=bucket_video_id,
+        category=category,
+        source_key=source_key,
+        source_video=video,
+        device=device_serial,
+        account=expected_username,
+        caption=caption_text,
+        log_path=log_path,
+    )
+
     if publish.status != StepStatus.OK:
+        _log_post(status="failed", verified=None, post_url=None,
+                  code=publish.code or "publish_failed", **log_ctx)
         return PostOneResult(
             success=False,
             published=False,
@@ -155,37 +187,141 @@ async def post_one(
             details={"publish": publish.message, "publish_status": publish.status.value},
         )
 
-    if not verify:
-        return PostOneResult(
-            success=True,
-            published=True,
-            verified=None,
-            message="Trial Reel published (verification skipped)",
-            details={"publish": publish.message},
-        )
-
     # --- Step 3: delayed dashboard confirmation (in-process agent) -----------
-    verified = await _verify_dashboard(ctx, device_serial, verify_delay_seconds)
-    if verified:
+    verified: bool | None = None
+    if verify:
+        verified = await _verify_dashboard(ctx, device_serial, verify_delay_seconds)
+
+    # --- Step 4: best-effort post-URL capture --------------------------------
+    post_url: str | None = None
+    if capture_url:
+        post_url = await _capture_post_url(ctx, device_serial)
+
+    # --- Step 5: record the result -------------------------------------------
+    if verify and not verified:
+        _log_post(status="published_unverified", verified=False, post_url=post_url,
+                  code="verification_failed", **log_ctx)
         return PostOneResult(
-            success=True,
+            success=False,
             published=True,
-            verified=True,
-            message="Trial Reel published and confirmed in Professional dashboard",
+            verified=False,
+            message=(
+                "Trial Reel published but NOT confirmed in the Professional "
+                "dashboard (needs review)"
+            ),
+            code="verification_failed",
+            post_url=post_url,
             details={"publish": publish.message},
         )
 
+    status = "published" if verified else "published_unverified"
+    _log_post(status=status, verified=verified, post_url=post_url, code=None, **log_ctx)
+    msg = "Trial Reel published"
+    if verified:
+        msg += " and confirmed in Professional dashboard"
+    elif not verify:
+        msg += " (verification skipped)"
+    if post_url:
+        msg += f"; url: {post_url}"
     return PostOneResult(
-        success=False,
+        success=True,
         published=True,
-        verified=False,
-        message=(
-            "Trial Reel published but NOT confirmed in the Professional "
-            "dashboard (needs review)"
-        ),
-        code="verification_failed",
+        verified=verified,
+        message=msg,
+        post_url=post_url,
         details={"publish": publish.message},
     )
+
+
+def _log_post(
+    *,
+    status: str,
+    verified: bool | None,
+    post_url: str | None,
+    code: str | None,
+    bucket_video_id: str | None,
+    category: str | None,
+    source_key: str | None,
+    source_video: str | None,
+    device: str | None,
+    account: str | None,
+    caption: str | None,
+    log_path: str | None,
+) -> None:
+    """Append one line to the posted-reels JSONL log (best-effort, never raises)."""
+    try:
+        from src.runner.posted_log import PostedRecord, append_record
+
+        append_record(
+            PostedRecord.now(
+                status=status,
+                video_id=bucket_video_id,
+                category=category,
+                source_key=source_key,
+                source_video=source_video,
+                post_url=post_url,
+                device=device,
+                account=account,
+                caption=caption,
+                verified=verified,
+                code=code,
+            ),
+            log_path,
+        )
+    except Exception as e:  # pragma: no cover - logging must never break a post
+        logger.warning("post_one: failed to write posted log: %s", e)
+
+
+async def _capture_post_url(ctx: StepContext, device_serial: str) -> str | None:
+    """Best-effort: drive the URL-capture goal through the in-process agent.
+
+    Reuses the worker's ``_GOAL_CAPTURE_URL`` text. Returns a validated
+    instagram.com URL or None — IG frequently withholds the public link for the
+    first 1-2 minutes after publishing, so None is an expected, non-fatal
+    outcome.
+    """
+    from src.worker.agent_runner.mobilerun_agent_runner import run_agent_goal
+    from src.worker.steps.verification import _GOAL_CAPTURE_URL
+
+    try:
+        structured = await run_agent_goal(
+            device_serial=device_serial,
+            goal=_GOAL_CAPTURE_URL,
+            config_path=ctx.settings.get("mobilerun_config_path"),
+            app_cards_dir=ctx.settings.get("mobilerun_app_cards_dir"),
+            trajectories_dir=ctx.settings.get("mobilerun_trajectories_dir"),
+            output_model=_url_capture_model(),
+            timeout_seconds=int(ctx.settings.get("url_capture_timeout_seconds", "60")),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.info("post_one: url capture raised: %s", e)
+        return None
+
+    if structured is None:
+        return None
+    if isinstance(structured, dict):
+        url = structured.get("post_url") or structured.get("url") or ""
+    else:
+        url = getattr(structured, "post_url", "") or ""
+    url = str(url).strip()
+    if url and "instagram.com" in url:
+        return url
+    return None
+
+
+def _url_capture_model() -> type:
+    from pydantic import BaseModel, Field
+
+    class UrlCaptureResult(BaseModel):
+        post_url: str | None = Field(
+            default=None,
+            description=(
+                "The public instagram.com URL of the just-posted Trial Reel, "
+                "read from Copy link / clipboard. Empty if not available."
+            ),
+        )
+
+    return UrlCaptureResult
 
 
 async def _verify_dashboard(
