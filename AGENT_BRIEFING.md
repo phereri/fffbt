@@ -18,8 +18,8 @@ that is on the SAME LAN as ~200 Android phones. The code is in a GitHub repo.
 ### 1. Clone the repo
 
 ```powershell
-git clone -b feat/instagram-autoreg https://github.com/phereri/fffbt.git C:\fffbt-ar
-cd C:\fffbt-ar
+git clone -b feat/instagram-autoreg https://github.com/phereri/fffbt.git C:\Users\Admin\Projects\fffbt
+cd C:\Users\Admin\Projects\fffbt
 ```
 
 ### 2. Create Python venv and install dependencies
@@ -48,7 +48,7 @@ each attempt. Capture it once from a device that has Instagram installed but is
 NOT logged in:
 
 ```powershell
-cd C:\fffbt-ar
+cd C:\Users\Admin\Projects\fffbt
 .venv\Scripts\python -m src.registration.backup 192.168.4.169:5555 --clear
 ```
 
@@ -119,7 +119,7 @@ adb -s 192.168.4.169:5555 shell settings get secure android_id
 ### Step 3: Run the registration ladder
 
 ```powershell
-cd C:\fffbt-ar
+cd C:\Users\Admin\Projects\fffbt
 .venv\Scripts\python.exe -X utf8 -u _run_loop.py
 ```
 

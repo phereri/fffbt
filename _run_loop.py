@@ -16,7 +16,7 @@ import os, sys
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-for env_path in [HERE / ".env", Path(r"C:\fffbt\.env")]:
+for env_path in [HERE / ".env", Path(r"C:\Users\Admin\Projects\fffbt\.env"), Path(r"C:\fffbt\.env")]:
     if env_path.is_file():
         for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
