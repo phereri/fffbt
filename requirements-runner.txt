@@ -1,0 +1,20 @@
+# Dependencies for the standalone Trial Reel poster (src/runner/).
+#
+# This is the ONLY install a fresh clone needs to drive prepared phones from the
+# LAN — no Supabase, no Google, no Appium. Install with:
+#   pip install -r requirements-runner.txt
+#
+# (For the full DB pipeline / dev test suite use requirements-dev.txt and
+# src/worker/requirements.txt instead.)
+
+# Mobilerun agent engine — drives Instagram via the in-process MobileAgent.
+# Published on PyPI; the runner imports it lazily, only when a real device run
+# starts, so the unit tests pass without it.
+mobilerun>=0.6.0rc4
+
+# Structured-output models the agent path builds at runtime.
+pydantic>=2.0
+
+# S3 video source (src/runner/s3_source.py) for the Ferma bucket. Lazy import;
+# only the `s3` CLI commands need it.
+boto3>=1.34

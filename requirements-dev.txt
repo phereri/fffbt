@@ -1,0 +1,22 @@
+# Development / test dependencies for fffbt.
+#
+# The runtime code is deliberately stdlib-only with lazy imports — `mobilerun`
+# and `pydantic` are imported only when a real MobileAgent is constructed, so
+# the unit-test suite runs without them. These pins cover:
+#   - the test runner (async tests use pytest-asyncio)
+#   - pydantic, needed once you build a real agent (registration/result.py,
+#     agent_runner) and harmless to have installed for tests
+#
+# `mobilerun` is intentionally NOT listed here: it is not published on PyPI and
+# must be installed from its own source on the host that drives real devices:
+#   pip install -e /path/to/mobilerun
+# Until then, all unit tests still pass (they mock the agent boundary).
+
+pytest==9.0.3
+pytest-asyncio==1.3.0
+pydantic>=2.0
+
+# Standalone runner S3 video source (src/runner/s3_source.py) — talks to the
+# TWC Storage S3-compatible bucket. Only needed for the `s3` CLI commands; the
+# import is lazy so the rest of the runner works without it installed.
+boto3>=1.34

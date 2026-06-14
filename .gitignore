@@ -8,6 +8,7 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+runner.env
 
 # Service account keys — never commit
 *.json.key
@@ -30,3 +31,6 @@ venv/
 # Logs / temp
 *.log
 .tmp/
+
+# Standalone runner output (published-reel records)
+posted_reels.jsonl
