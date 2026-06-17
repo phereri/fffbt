@@ -39,6 +39,7 @@ class AgentPostResult:
     video_id: str | None = None
     caption: str | None = None
     post_url: str | None = None
+    path_used: str | None = None
     failure_reason: str | None = None
 
     @classmethod
@@ -60,6 +61,7 @@ class AgentPostResult:
             video_id=_optional_str(_attr(obj, "video_id", video_id)),
             caption=_optional_str(_attr(obj, "caption", caption)),
             post_url=_optional_str(_attr(obj, "post_url", None)),
+            path_used=_optional_str(_attr(obj, "path_used", None)),
             failure_reason=_optional_str(_attr(obj, "failure_reason", None)),
         )
 

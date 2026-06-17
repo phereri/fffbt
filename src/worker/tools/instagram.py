@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import shlex
 import time
 from typing import Any, Awaitable, Callable
@@ -28,6 +29,8 @@ from src.worker.tools._ui import (
 )
 
 ReadUi = Callable[[], Awaitable[list[dict[str, Any]]]]
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +127,26 @@ async def dismiss_keyboard(
     await asyncio.sleep(0.5)
     if await _hidden():
         return ToolResult.ok("dismiss_keyboard: hidden via BACK")
+
+    # 3. The Mobilerun Keyboard is a custom IME that ignores focus-loss AND
+    #    BACK (see AppCard), so rungs 1-2 cannot collapse it — this is what left
+    #    the keyboard covering Share. Drop it the Portal-sanctioned way:
+    #    ``ime disable`` makes Android fall back to the device's stock IME, so
+    #    the overlay disappears and Share becomes tappable. Re-enable it
+    #    immediately (enable only — NOT set) so it stays available; the MobileRun
+    #    driver's connect()/setup_keyboard makes it active again next run.
+    try:
+        await shell(serial, f"ime disable {_MOBILERUN_KEYBOARD_COMPONENT}", timeout=10)
+        await asyncio.sleep(0.7)
+        hidden = await _hidden()
+        try:
+            await shell(serial, f"ime enable {_MOBILERUN_KEYBOARD_COMPONENT}", timeout=10)
+        except Exception:
+            pass
+        if hidden:
+            return ToolResult.ok("dismiss_keyboard: hidden via ime disable (Mobilerun)")
+    except Exception:
+        pass
 
     return ToolResult.fail(
         f"dismiss_keyboard: IME still shown after {timeout_s:.1f}s"
@@ -666,3 +689,157 @@ async def tap_share_and_confirm(
         "on screen after swipe + shell_tap + swipe + observe + resource_id - "
         "share did not register"
     )
+
+
+# ---------------------------------------------------------------------------
+# Trial-Reel link capture (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+def _clean_reel_url(text: str | None) -> str | None:
+    """Extract a clean ``https://www.instagram.com/reel/<code>/`` from text."""
+    if not text:
+        return None
+    marker = "instagram.com/reel/"
+    i = text.find(marker)
+    if i == -1:
+        return None
+    start = text.rfind("http", 0, i)
+    url = text[start if start != -1 else i:].strip()
+    for ws in (" ", "\n", "\t", '"', "'"):
+        j = url.find(ws)
+        if j != -1:
+            url = url[:j]
+    url = url.split("?")[0].split("#")[0]
+    if not url.endswith("/"):
+        url += "/"
+    return url if "instagram.com/reel/" in url else None
+
+
+async def capture_trial_reel_link(
+    serial: str, read_ui: "ReadUi", *, settle_s: float = 1.2
+) -> str | None:
+    """Read the newest Trial Reel's public link deterministically (no LLM).
+
+    From any in-app state: Profile tab -> Reels sub-tab -> first "Drafts and
+    trial reels" tile -> "Trial reels" -> first (newest) tile -> Share ->
+    "Copy link", then paste the clipboard into the share-sheet search box and
+    read the URL from the a11y tree. Returns a clean reel URL or None.
+
+    Reads a REAL field value, so (unlike the LLM capture goal, which has no
+    clipboard access) it cannot hallucinate a URL. Uses raw ``input tap`` — the
+    ``input_tap`` helper's scaled touchscreen-swipe misfires on some devices.
+    Best-effort: never raises.
+    """
+    def _center(n: dict[str, Any] | None) -> tuple[int, int] | None:
+        if not n:
+            return None
+        b = parse_bounds(n.get("bounds"))
+        return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2) if b else None
+
+    def _by_rid(nodes: list[dict[str, Any]], suffix: str) -> dict[str, Any] | None:
+        for n in nodes:
+            if node_resource_id(n).endswith(suffix) and parse_bounds(n.get("bounds")):
+                return n
+        return None
+
+    def _by_text(nodes, needle, *, min_y=None):
+        nl = needle.lower()
+        cands = []
+        for n in nodes:
+            if nl not in node_text(n).lower():
+                continue
+            b = parse_bounds(n.get("bounds"))
+            if not b:
+                continue
+            if min_y is not None and (b[1] + b[3]) // 2 < min_y:
+                continue
+            cands.append(n)
+        if not cands:
+            return None
+        return min(cands, key=lambda n: (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(parse_bounds(n["bounds"])))
+
+    async def _tap(xy: tuple[int, int] | None) -> None:
+        if not xy:
+            return
+        await shell(serial, f"input tap {int(xy[0])} {int(xy[1])}", timeout=10)
+        await asyncio.sleep(settle_s)
+
+    try:
+        # 0) reach the profile Reels grid
+        for _ in range(5):
+            nodes = await read_ui()
+            if _by_rid(nodes, "drafts_text"):
+                break
+            reels_tab = next(
+                (n for n in nodes
+                 if node_resource_id(n).endswith("profile_tab_icon_view")
+                 and node_text(n).strip().lower() == "reels"),
+                None,
+            )
+            if reels_tab is not None:
+                await _tap(_center(reels_tab))
+                continue
+            prof = _by_text(nodes, "Profile", min_y=1650)
+            if prof is not None:
+                await _tap(_center(prof))
+                continue
+            await asyncio.sleep(settle_s)
+
+        # 1) open the Drafts/Trial-reels selector via the first tile's thumbnail
+        nodes = await read_ui()
+        dt = _by_rid(nodes, "drafts_text")
+        if dt is None:
+            logger.info("capture_trial_reel_link: reels grid (drafts_text) not reached")
+            return None
+        b = parse_bounds(dt["bounds"])
+        await _tap(((b[0] + b[2]) // 2, b[1] - (b[3] - b[1])))
+
+        # 2) tap the 'Trial reels' row (retry — the row can ignore the first tap)
+        for _ in range(3):
+            nodes = await read_ui()
+            if _by_rid(nodes, "trials_list") or _by_text(nodes, "Create trial reel"):
+                break
+            await _tap(_center(_by_text(nodes, "Trial reels")))
+
+        # 3) open the first (newest) tile in the trials list
+        nodes = await read_ui()
+        tl = _by_rid(nodes, "trials_list")
+        if tl is None:
+            logger.info("capture_trial_reel_link: trials_list not reached")
+            return None
+        tb = parse_bounds(tl["bounds"])
+        col_w = (tb[2] - tb[0]) // 3
+        await _tap((tb[0] + col_w // 2, tb[1] + col_w // 2))
+
+        # 4) Share (retry until the share sheet appears)
+        opened = False
+        for _ in range(4):
+            nodes = await read_ui()
+            if _by_text(nodes, "Copy link") or _by_rid(nodes, "search_edit_text"):
+                opened = True
+                break
+            await _tap(_center(_by_rid(nodes, "direct_share_button")))
+        if not opened:
+            logger.info("capture_trial_reel_link: share sheet did not open")
+            return None
+
+        # 5) Copy link
+        nodes = await read_ui()
+        await _tap(_center(_by_text(nodes, "Copy link")))
+
+        # 6) paste into the search box and read the URL from the tree
+        nodes = await read_ui()
+        await _tap(_center(_by_rid(nodes, "search_edit_text")))
+        await shell(serial, "input keyevent 279", timeout=10)  # KEYCODE_PASTE
+        await asyncio.sleep(0.8)
+        nodes = await read_ui()
+        sf = _by_rid(nodes, "search_edit_text")
+        url = _clean_reel_url(node_text(sf) if sf else "")
+        if not url:
+            for n in nodes:
+                url = _clean_reel_url(node_text(n))
+                if url:
+                    break
+        return url
+    except Exception:  # pragma: no cover - capture must never break a post
+        logger.info("capture_trial_reel_link: failed", exc_info=True)
+        return None

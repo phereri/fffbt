@@ -77,9 +77,12 @@ ENTRY PATHS (try in order — see the Instagram AppCard for tactics)
   If "Trial reels" opens the Ad tools screen instead, press Back and try Path C —
   never boost a post or pick ads.
 - Path C (only if A and B exhausted): Profile → plus top-left (NOT bottom-nav
-  Create) → menu Reel → gallery → Next through editor → on the Share screen turn
-  the **Trial** toggle ON before caption + share.
-
+  Create) → menu Reel → gallery → Next through editor → on the Share screen
+  ENTER + verify the caption FIRST (the caption field is at the TOP and is
+  visible on arrival), THEN scroll down and turn the **Trial** toggle ON, then
+  Share. Do NOT scroll away from a visible caption field before filling it —
+  losing the field is the #1 cause of a stuck Path C.
+{preferred_path_note}
 STEPS
 {prepare_push_steps}
 3. Instagram should already be open on the device. Confirm login state from the
@@ -126,7 +129,10 @@ STEPS
      activity changed, and you land on the Trial reels list (``trials_list``) or
      a post-processing screen. Treat that as published — stop and return.
 7. After publish succeeds, return PostResult(success=true) immediately. Leave
-   ``post_url`` null; the scheduler verification step copies the link.
+   ``post_url`` null; the scheduler verification step copies the link. Also set
+   ``path_used`` to the single entry-path letter — "A", "B", or "C" — that
+   actually reached the Trial Reel composer (used to speed up this account next
+   time). Leave it null if unsure.
 8. Do NOT mark anything in the database; the host owns DB transitions.
 
 {hard_stop_rules}
@@ -169,6 +175,7 @@ def build_trial_reel_goal(
     video_id: str | None,
     local_video_path: str | Path | None = None,
     host_video_in_gallery: str | None = None,
+    preferred_path: str | None = None,
 ) -> str:
     """Render the natural-language goal handed to the MobileRun agent.
 
@@ -195,6 +202,16 @@ def build_trial_reel_goal(
         host_note = _HOST_LOCAL_VIDEO_NOTE.format(local_video_path=resolved or "(unknown)")
         prep_steps = _HOST_PREPARE_PUSH_STEPS.format(local_video_path=resolved)
 
+    pref = (preferred_path or "").strip().upper()
+    if pref in ("A", "B", "C"):
+        preferred_path_note = (
+            f"\nLEARNED (this account): Path {pref} reached the Trial Reel composer "
+            f"last time — TRY PATH {pref} FIRST. If it does not work, fall back to "
+            "the remaining paths in A → B → C order.\n"
+        )
+    else:
+        preferred_path_note = ""
+
     return _GOAL_TEMPLATE.format(
         device_serial=device_serial,
         host_video_note=host_note,
@@ -202,6 +219,7 @@ def build_trial_reel_goal(
         caption_full=caption_full,
         expected_username=expected_username or "(unknown)",
         video_id=video_id or "(none)",
+        preferred_path_note=preferred_path_note,
         hard_stop_rules=HARD_STOP_RULES,
     )
 

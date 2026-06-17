@@ -167,6 +167,7 @@ class MobileRunAgentRunner:
         model_overrides: dict[str, Any] | None = None,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
         agent_factory: AgentFactory | None = None,
+        preferred_path: str | None = None,
     ) -> None:
         if mode != "proof_of_posting":
             raise ValueError(
@@ -187,6 +188,7 @@ class MobileRunAgentRunner:
         self._host_video_in_gallery = host_video_in_gallery
         self._mode = mode
         self._timeout_seconds = int(timeout_seconds)
+        self._preferred_path = preferred_path
 
         self._config_path = str(
             config_path
@@ -220,6 +222,7 @@ class MobileRunAgentRunner:
             video_id=self._video_id,
             local_video_path=self._local_video_path,
             host_video_in_gallery=self._host_video_in_gallery,
+            preferred_path=self._preferred_path,
         )
 
         # TCP control is mandatory for the agent path. Everything else either
@@ -510,6 +513,14 @@ def _post_result_pydantic_model() -> type:
         video_id: str | None = Field(default=None)
         caption: str | None = Field(default=None)
         post_url: str | None = Field(default=None)
+        path_used: str | None = Field(
+            default=None,
+            description=(
+                "The entry-path letter (A, B, or C) that reached the Trial Reel "
+                "composer. Recorded so this account can try it first next time. "
+                "Null if unsure."
+            ),
+        )
         failure_reason: str | None = Field(
             default=None,
             description="Machine-friendly reason when success is False.",

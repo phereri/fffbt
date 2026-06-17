@@ -412,6 +412,10 @@ class MobileUIAutomationStep:
             model_overrides=ctx.settings.get("mobilerun_overrides") or {},
             timeout_seconds=int(ctx.settings.get("mobilerun_timeout_seconds") or 1500),
         )
+        # Only pass preferred_path when set, so existing runner factories / test
+        # stubs that don't accept the kwarg are unaffected.
+        if ctx.settings.get("preferred_trial_path"):
+            runner_kwargs["preferred_path"] = ctx.settings["preferred_trial_path"]
         try:
             runner = self._agent_runner_factory(**runner_kwargs)
         except Exception as exc:
@@ -441,6 +445,11 @@ class MobileUIAutomationStep:
                 "adb_fallback_used": False,
                 "agent_status": agent_result.agent_status,
                 "failure_reason": agent_result.failure_reason,
+                "path_used": (
+                    agent_result.structured.path_used
+                    if agent_result.structured is not None
+                    else None
+                ),
             }
         }
         if agent_result.category is ResultCategory.OK:

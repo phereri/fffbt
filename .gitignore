@@ -34,3 +34,20 @@ venv/
 
 # Standalone runner output (published-reel records)
 posted_reels.jsonl
+
+# MVP local per-account learned preferences
+data/account_memory.json
+
+# MVP fleet launcher local state + per-loop logs
+data/device_accounts.json
+data/fleet_pids.json
+data/fleet_events.jsonl
+post_fleet.log
+post_loop.log
+post_loop_*.log
+
+# Run artifacts / local backups (never commit)
+trajectories/
+*.bak
+*.bak-*
+*.out
