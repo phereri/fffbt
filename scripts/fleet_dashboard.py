@@ -501,6 +501,22 @@ INDEX_HTML = r"""<!doctype html>
   .viewtoggle button{background:var(--panel);color:var(--muted);border:none;padding:4px 12px;
     font:inherit;font-size:12px;cursor:pointer}
   .viewtoggle button.on{background:var(--info);color:#0d1117;font-weight:600}
+  /* device controls + pagination */
+  .devctrl{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .devctrl input,.devctrl select{background:var(--panel);color:var(--fg);
+    border:1px solid var(--line);border-radius:7px;padding:6px 9px;font:inherit;font-size:13px}
+  .devctrl input[type=search]{min-width:200px}
+  .devctrl label{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}
+  .devctrl label select{color:var(--fg)}
+  .dirbtn{background:var(--panel);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:6px 11px;cursor:pointer;font:inherit}
+  .dirbtn:hover{background:var(--panel2)}
+  .pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:14px;
+    color:var(--muted);font-size:13px}
+  .pager button{background:var(--panel);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:5px 12px;cursor:pointer;font:inherit}
+  .pager button:disabled{opacity:.4;cursor:default}
+  .pager button:not(:disabled):hover{background:var(--panel2)}
   .dev{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .dev .top{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
   .dev .top .name{font-weight:650}
@@ -537,13 +553,54 @@ INDEX_HTML = r"""<!doctype html>
   <h2>Stage timing — what to optimise</h2>
   <div id="stages"></div>
 
-  <h2>Devices
+  <h2>Devices <span class="mini" id="devcount"></span>
     <span class="viewtoggle" id="viewtoggle">
       <button data-view="cards">▦ Cards</button>
       <button data-view="list">☰ List</button>
     </span>
   </h2>
+  <div class="devctrl" id="devctrl">
+    <input type="search" id="fSearch" placeholder="🔍 account / device…" autocomplete="off"/>
+    <select id="fState" title="filter by status">
+      <option value="">all statuses</option>
+      <option value="working">working</option>
+      <option value="sleeping">sleeping</option>
+      <option value="rate_limited">rate-limited</option>
+      <option value="recovering">recovering</option>
+      <option value="starting">starting</option>
+      <option value="done">done</option>
+      <option value="stopped">stopped</option>
+      <option value="offline">offline</option>
+      <option value="idle">idle</option>
+    </select>
+    <select id="fAlive" title="filter by process">
+      <option value="">any process</option>
+      <option value="alive">alive only</option>
+      <option value="dead">not running</option>
+    </select>
+    <span class="grow"></span>
+    <label class="mini">sort
+      <select id="fSort">
+        <option value="account">account</option>
+        <option value="state">status</option>
+        <option value="posted">posted</option>
+        <option value="failed">failed</option>
+        <option value="avg">avg time</option>
+        <option value="last">last post</option>
+      </select>
+    </label>
+    <button id="fDir" class="dirbtn" title="toggle direction">▲</button>
+    <label class="mini" id="fSizeWrap">per page
+      <select id="fSize">
+        <option value="10">10</option>
+        <option value="20">20</option>
+        <option value="50">50</option>
+        <option value="0">all</option>
+      </select>
+    </label>
+  </div>
   <div id="devs"></div>
+  <div class="pager" id="pager"></div>
 
   <div class="grid2">
     <div>
@@ -622,7 +679,43 @@ function renderStages(d){
 }
 
 let VIEW = localStorage.getItem('fleetView') || 'cards';
-const openKeys = new Set();   // detail keys kept open across refreshes
+const CTRL = {                // filter / sort / pagination state (persisted)
+  search:'', state:'', alive:'',
+  sort: localStorage.getItem('fleetSort') || 'account',
+  dir:  localStorage.getItem('fleetDir')  || 'asc',
+  size: parseInt(localStorage.getItem('fleetSize') ?? '10', 10),
+  page: 1,
+};
+
+// how many cards fit per row — mirrors the CSS grid
+// (repeat(auto-fill, minmax(420px,1fr)) with a 14px gap)
+function cardsPerRow(){
+  const w=($('#devs').clientWidth)||1200, min=420, gap=14;
+  return Math.max(1, Math.floor((w+gap)/(min+gap)));
+}
+
+function processAccounts(accounts){
+  const q=CTRL.search.trim().toLowerCase();
+  let rows=accounts.filter(a=>{
+    if(q && !((a.account||'').toLowerCase().includes(q) || (a.device||'').toLowerCase().includes(q))) return false;
+    if(CTRL.state && (a.status||{}).state!==CTRL.state) return false;
+    if(CTRL.alive==='alive' && !a.alive) return false;
+    if(CTRL.alive==='dead' && a.alive) return false;
+    return true;
+  });
+  const val=a=>{
+    switch(CTRL.sort){
+      case 'posted': return a.counts.posted;
+      case 'failed': return a.counts.failed;
+      case 'avg':    return a.timings.total.avg||0;
+      case 'last':   return a.last_post_ts? Date.parse(a.last_post_ts):0;
+      case 'state':  return (a.status||{}).state||'';
+      default:       return (a.account||'').toLowerCase();
+    }
+  };
+  rows.sort((x,y)=>{ const a=val(x),b=val(y); const c=a<b?-1:a>b?1:0; return CTRL.dir==='asc'?c:-c; });
+  return rows;
+}
 
 function stageLineHTML(st){
   const liveStage = st.state==='working' && st.live_since;
@@ -633,10 +726,12 @@ function stageLineHTML(st){
   return s;
 }
 
-// shared detail body (recent posts + stage avgs + logs), reused by both views
-function deviceDetail(a){
-  const tg=a.timings;
-  const recent = (a.recent||[]).slice().reverse().map(r=>{
+// status signature: rebuild the status line only when one of these changes
+// (it contains a live timer child we don't want to recreate every 3s tick).
+function stageSig(st){ return [st.state,st.label,st.since,st.until,st.live_since].join('|'); }
+
+function recentRowsHTML(a){
+  return (a.recent||[]).slice().reverse().map(r=>{
     const link = r.url? `<a href="${esc(r.url)}" target="_blank">link</a>` : '<span class="muted">no link</span>';
     const vc = r.verdict==='SUCCESS'?'var(--accent)':'var(--warn)';
     return `<tr><td>${esc(r.name||'—')}</td>
@@ -644,77 +739,172 @@ function deviceDetail(a){
       <td class="right">${fmtDur(r.total)}</td><td class="right">${ago(r.ts)}</td>
       <td class="right">${link}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">no posts yet</td></tr>';
-  return `<div class="mini">stage avg — prepare ${fmtDur(tg.prepare.avg)} · publish ${fmtDur(tg.publish.avg)} · verify ${fmtDur(tg.verify.avg)}</div>
-    <details data-key="rec:${esc(a.account)}"><summary>recent posts (${(a.recent||[]).length})</summary>
-      <table style="margin-top:6px"><tbody>${recent}</tbody></table>
+}
+
+// the collapsible detail skeleton — built ONCE per node so its <details> are
+// never recreated (open state survives every refresh natively).
+function detailSkeleton(){
+  return `<div class="mini d-stageavg"></div>
+    <details><summary class="d-recsum"></summary>
+      <table style="margin-top:6px"><tbody class="d-recbody"></tbody></table>
     </details>
-    <details data-key="log:${esc(a.account)}"><summary>log (last ${(a.log||[]).length} lines)</summary>
-      <pre class="log">${esc((a.log||[]).join('\n'))||'(empty)'}</pre>
+    <details><summary class="d-logsum"></summary>
+      <pre class="log d-logpre"></pre>
     </details>`;
 }
 
-function cardHTML(a){
-  const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)', c=a.counts, tg=a.timings;
-  return `<div class="dev">
-    <div class="top">
-      <span class="dot" style="background:${a.alive?'var(--accent)':'var(--bad)'}"></span>
-      <span class="name">@${esc(a.account)}</span>
-      <span class="grow"></span>
-      <span class="pill mini">${esc(a.device)}${a.pid?(' · pid '+a.pid):''}</span>
-    </div>
-    <div class="body">
-      <div style="color:${color};font-weight:600;margin-bottom:8px">${stageLineHTML(st)}</div>
-      <div class="stat-row">
-        <div><b style="color:var(--accent)">${c.posted}</b> <span class="mini">posted</span></div>
-        <div><b>${c.confirmed}</b> <span class="mini">confirmed</span></div>
-        <div><b style="color:var(--warn)">${c.unconfirmed}</b> <span class="mini">unconf.</span></div>
-        <div><b style="color:${c.failed?'var(--bad)':'inherit'}">${c.failed}</b> <span class="mini">failed</span></div>
-        <div><b>${fmtDur(tg.total.avg)}</b> <span class="mini">avg</span></div>
+// Build a persistent DOM node for one account, plus an update() that writes ONLY
+// the leaf values that actually changed. Nothing is destroyed on refresh, so an
+// expanded <details> stays open and the scroll position is kept.
+function buildDevNode(view, a){
+  const root=document.createElement(view==='list'?'details':'div');
+  if(view==='list'){
+    root.className='lrow';
+    root.innerHTML =
+      `<summary>
+        <span class="dot"></span>
+        <span class="lname">@${esc(a.account)} <span class="mini">${esc(a.device)}</span></span>
+        <span class="lstate"></span>
+        <span class="lstat"><b class="s-posted" style="color:var(--accent)"></b><br><span class="mini">posted</span></span>
+        <span class="lstat"><b class="s-failed"></b><br><span class="mini">failed</span></span>
+        <span class="lstat"><b class="s-avg"></b><br><span class="mini">avg</span></span>
+        <span class="lstat mini"><span class="s-last"></span><br><span class="mini">last</span></span>
+        <span class="chev">▸</span>
+      </summary>
+      <div class="ldetail">${detailSkeleton()}</div>`;
+  } else {
+    root.className='dev';
+    root.innerHTML =
+      `<div class="top">
+        <span class="dot"></span>
+        <span class="name">@${esc(a.account)}</span>
+        <span class="grow"></span>
+        <span class="pill mini s-dev"></span>
       </div>
-      ${deviceDetail(a)}
-    </div>
-  </div>`;
+      <div class="body">
+        <div class="c-state" style="font-weight:600;margin-bottom:8px"></div>
+        <div class="stat-row">
+          <div><b class="s-posted" style="color:var(--accent)"></b> <span class="mini">posted</span></div>
+          <div><b class="s-confirmed"></b> <span class="mini">confirmed</span></div>
+          <div><b class="s-unconf" style="color:var(--warn)"></b> <span class="mini">unconf.</span></div>
+          <div><b class="s-failed"></b> <span class="mini">failed</span></div>
+          <div><b class="s-avg"></b> <span class="mini">avg</span></div>
+        </div>
+        ${detailSkeleton()}
+      </div>`;
+  }
+  const q=s=>root.querySelector(s);
+  const refs={
+    dot:q('.dot'), state:q(view==='list'?'.lstate':'.c-state'),
+    posted:q('.s-posted'), failed:q('.s-failed'), avg:q('.s-avg'),
+    last:q('.s-last'), confirmed:q('.s-confirmed'), unconf:q('.s-unconf'), devpill:q('.s-dev'),
+    stageAvg:q('.d-stageavg'), recSum:q('.d-recsum'), recBody:q('.d-recbody'),
+    logSum:q('.d-logsum'), logPre:q('.d-logpre'),
+  };
+  const prev={};
+  const setText=(el,key,val)=>{ if(el && prev[key]!==val){ prev[key]=val; el.textContent=val; } };
+  const setHTML=(el,key,val)=>{ if(el && prev[key]!==val){ prev[key]=val; el.innerHTML=val; } };
+
+  function update(a){
+    const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)', c=a.counts, tg=a.timings;
+    const dotc=a.alive?'var(--accent)':'var(--bad)';
+    if(prev.dot!==dotc){ prev.dot=dotc; refs.dot.style.background=dotc; }
+    if(view!=='list') setText(refs.devpill,'dev', a.device+(a.pid?(' · pid '+a.pid):''));
+    // status line — only rebuilt when its signature changes (keeps the live timer)
+    const sig=stageSig(st);
+    if(prev.sig!==sig){ prev.sig=sig; refs.state.innerHTML=stageLineHTML(st); refs.state.style.color=color; }
+    setText(refs.posted,'posted', c.posted);
+    if(view!=='list'){ setText(refs.confirmed,'confirmed', c.confirmed); setText(refs.unconf,'unconf', c.unconfirmed); }
+    if(prev.failed!==c.failed){ prev.failed=c.failed; refs.failed.textContent=c.failed;
+      refs.failed.style.color=c.failed?'var(--bad)':'inherit'; }
+    setText(refs.avg,'avg', fmtDur(tg.total.avg));
+    setText(refs.last,'last', a.last_post_ts?ago(a.last_post_ts):'—');
+    setHTML(refs.stageAvg,'stageavg',
+      `stage avg — prepare ${fmtDur(tg.prepare.avg)} · publish ${fmtDur(tg.publish.avg)} · verify ${fmtDur(tg.verify.avg)}`);
+    setText(refs.recSum,'recsum', `recent posts (${(a.recent||[]).length})`);
+    setHTML(refs.recBody,'recbody', recentRowsHTML(a));
+    setText(refs.logSum,'logsum', `log (last ${(a.log||[]).length} lines)`);
+    setText(refs.logPre,'logtext', (a.log||[]).join('\n')||'(empty)');
+  }
+  update(a);
+  return {root, update, view};
 }
 
-function listRowHTML(a){
-  const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)', c=a.counts, tg=a.timings;
-  const key='row:'+a.account, open=openKeys.has(key)?' open':'';
-  return `<details class="lrow" data-key="${key}"${open}>
-    <summary>
-      <span class="dot" style="background:${a.alive?'var(--accent)':'var(--bad)'}"></span>
-      <span class="lname">@${esc(a.account)} <span class="mini">${esc(a.device)}</span></span>
-      <span class="lstate" style="color:${color}">${stageLineHTML(st)}</span>
-      <span class="lstat"><b style="color:var(--accent)">${c.posted}</b><br><span class="mini">posted</span></span>
-      <span class="lstat"><b style="color:${c.failed?'var(--bad)':'inherit'}">${c.failed}</b><br><span class="mini">failed</span></span>
-      <span class="lstat"><b>${fmtDur(tg.total.avg)}</b><br><span class="mini">avg</span></span>
-      <span class="lstat mini">${a.last_post_ts?ago(a.last_post_ts):'—'}<br><span class="mini">last</span></span>
-      <span class="chev">▸</span>
-    </summary>
-    <div class="ldetail">${deviceDetail(a)}</div>
-  </details>`;
-}
+const devNodes=new Map();    // account -> {root, update, view} — persistent nodes
+let builtView=null;          // which view the #devs wrapper is currently built for
 
-function renderDevs(d){
+function ensureWrapper(view){
   const el=$('#devs');
-  if(!d.accounts.length){ el.innerHTML='<div class="muted">No devices in data/device_accounts.json</div>'; return; }
-  document.querySelectorAll('#viewtoggle button').forEach(b=>
-    b.classList.toggle('on', b.dataset.view===VIEW));
-  if(VIEW==='list'){
+  let container = view==='list'? el.querySelector('.devlist') : el.querySelector('.devgrid');
+  if(builtView===view && container) return container;
+  // view changed / first build / coming back from an empty state → rebuild
+  // wrapper. Node cache stays valid only within the same view layout.
+  if(builtView!==view) devNodes.clear();
+  if(view==='list'){
     el.innerHTML='<div class="lhead">'+
       '<span></span><span>account / device</span><span>status</span>'+
       '<span class="lstat">posted</span><span class="lstat">failed</span>'+
       '<span class="lstat">avg</span><span class="lstat">last</span><span></span></div>'+
-      '<div class="devlist">'+d.accounts.map(listRowHTML).join('')+'</div>';
+      '<div class="devlist"></div>';
+    container=el.querySelector('.devlist');
   } else {
-    el.innerHTML='<div class="devgrid">'+d.accounts.map(cardHTML).join('')+'</div>';
+    el.innerHTML='<div class="devgrid"></div>';
+    container=el.querySelector('.devgrid');
   }
-  // restore + track open state of every collapsible so a refresh never closes it
-  el.querySelectorAll('details[data-key]').forEach(dt=>{
-    if(openKeys.has(dt.dataset.key)) dt.open=true;
-    dt.addEventListener('toggle', ()=>{
-      if(dt.open) openKeys.add(dt.dataset.key); else openKeys.delete(dt.dataset.key);
+  builtView=view;
+  return container;
+}
+
+function renderDevs(d){
+  const el=$('#devs'), pager=$('#pager');
+  document.querySelectorAll('#viewtoggle button').forEach(b=>
+    b.classList.toggle('on', b.dataset.view===VIEW));
+  $('#fSizeWrap').style.display = VIEW==='list' ? '' : 'none';
+
+  if(!d.accounts.length){
+    el.innerHTML='<div class="muted">No devices in data/device_accounts.json</div>';
+    builtView=null; devNodes.clear(); pager.innerHTML=''; $('#devcount').textContent=''; return;
+  }
+  // page size: list = selector (default 10); cards = exactly TWO rows of cards.
+  const size = VIEW==='cards' ? cardsPerRow()*2 : (CTRL.size>0?CTRL.size:1e9);
+  const rows=processAccounts(d.accounts);
+  const pages=Math.max(1, Math.ceil(rows.length/size));
+  if(CTRL.page>pages) CTRL.page=pages;
+  if(CTRL.page<1) CTRL.page=1;
+  const start=(CTRL.page-1)*size;
+  const slice=rows.slice(start, start+size);
+
+  $('#devcount').textContent = rows.length===d.accounts.length
+    ? `(${d.accounts.length})` : `(${rows.length} of ${d.accounts.length})`;
+
+  if(slice.length===0){
+    el.innerHTML='<div class="muted">No devices match the current filter</div>';
+    builtView=null;   // wrapper destroyed; rebuild on next non-empty render
+  } else {
+    const container=ensureWrapper(VIEW);
+    // reuse a persistent node per account; only changed leaves are rewritten.
+    const ordered=slice.map(a=>{
+      let n=devNodes.get(a.account);
+      if(!n || n.view!==VIEW){ n=buildDevNode(VIEW, a); devNodes.set(a.account, n); }
+      else { n.update(a); }
+      return n.root;
     });
-  });
+    // replaceChildren moves existing nodes into the new order WITHOUT recreating
+    // them — open <details> and scroll positions are preserved.
+    container.replaceChildren(...ordered);
+  }
+
+  // pager (stateless; safe to rebuild)
+  if(pages<=1){ pager.innerHTML=''; }
+  else {
+    pager.innerHTML =
+      `<button id="pPrev" ${CTRL.page<=1?'disabled':''}>← prev</button>`+
+      `<span>page ${CTRL.page} / ${pages} · showing ${start+1}–${start+slice.length} of ${rows.length}</span>`+
+      `<button id="pNext" ${CTRL.page>=pages?'disabled':''}>next →</button>`;
+    const pv=$('#pPrev'), nx=$('#pNext');
+    if(pv) pv.onclick=()=>{ CTRL.page--; renderDevs(LAST); };
+    if(nx) nx.onclick=()=>{ CTRL.page++; renderDevs(LAST); };
+  }
 }
 
 function renderPosts(d){
@@ -751,6 +941,22 @@ document.querySelectorAll('#viewtoggle button').forEach(b=>b.addEventListener('c
   VIEW=b.dataset.view; localStorage.setItem('fleetView',VIEW);
   if(LAST) renderDevs(LAST);
 }));
+
+// init control widgets from persisted state
+$('#fSort').value=CTRL.sort; $('#fSize').value=String(CTRL.size); $('#fDir').textContent=CTRL.dir==='asc'?'▲':'▼';
+const reRender=()=>{ if(LAST) renderDevs(LAST); };
+$('#fSearch').addEventListener('input', e=>{ CTRL.search=e.target.value; CTRL.page=1; reRender(); });
+$('#fState').addEventListener('change', e=>{ CTRL.state=e.target.value; CTRL.page=1; reRender(); });
+$('#fAlive').addEventListener('change', e=>{ CTRL.alive=e.target.value; CTRL.page=1; reRender(); });
+$('#fSort').addEventListener('change', e=>{ CTRL.sort=e.target.value; CTRL.page=1;
+  localStorage.setItem('fleetSort',CTRL.sort); reRender(); });
+$('#fSize').addEventListener('change', e=>{ CTRL.size=parseInt(e.target.value,10); CTRL.page=1;
+  localStorage.setItem('fleetSize',String(CTRL.size)); reRender(); });
+$('#fDir').addEventListener('click', ()=>{ CTRL.dir=CTRL.dir==='asc'?'desc':'asc';
+  $('#fDir').textContent=CTRL.dir==='asc'?'▲':'▼'; localStorage.setItem('fleetDir',CTRL.dir); reRender(); });
+// cards view = two rows: re-paginate when the column count can change
+let _rsz; window.addEventListener('resize', ()=>{ clearTimeout(_rsz);
+  _rsz=setTimeout(()=>{ if(LAST && VIEW==='cards') renderDevs(LAST); }, 150); });
 
 async function refresh(){
   try{
