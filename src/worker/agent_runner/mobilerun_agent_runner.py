@@ -397,6 +397,26 @@ def _default_agent_factory(request: AgentFactoryRequest) -> _AgentHandle:
             except Exception:
                 logger.debug("could not apply override %s", key)
 
+    # Humanize device I/O (anti-detection, operator spec): character-by-character
+    # caption typing with a per-device base delay + jitter, and a randomized
+    # [7,15]s delay between agent actions. The agent sleeps ``after_sleep_action``
+    # after every action; we set it to a sentinel that the patched asyncio.sleep
+    # turns into a fresh random delay per action. Best-effort.
+    import os as _os
+    if _os.environ.get("HUMANIZE", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            from src.worker.agent_runner.humanize import (
+                ACTION_DELAY_SENTINEL,
+                apply_humanization,
+            )
+
+            config.agent.after_sleep_action = ACTION_DELAY_SENTINEL
+            apply_humanization()
+        except Exception:
+            logger.debug("humanize: not applied")
+    else:
+        logger.info("humanize: DISABLED via HUMANIZE=0")
+
     post_result_model = request.output_model or _post_result_pydantic_model()
     agent_kwargs: dict[str, Any] = dict(
         goal=request.goal,

@@ -48,6 +48,11 @@ post_loop_*.log
 
 # Run artifacts / local backups (never commit)
 trajectories/
+data/
+.claude/
+.tools/
 *.bak
 *.bak-*
+*.out
+*.err
 *.out

@@ -475,6 +475,32 @@ INDEX_HTML = r"""<!doctype html>
   .bar{height:8px;border-radius:4px;background:var(--panel2);overflow:hidden;display:flex}
   .bar i{display:block;height:100%}
   .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px}
+  /* compact list view */
+  .devlist{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)}
+  .lrow{border-bottom:1px solid var(--line)}
+  .lrow:last-child{border-bottom:none}
+  .lrow>summary{list-style:none;cursor:pointer;display:grid;align-items:center;gap:10px;
+    grid-template-columns:14px minmax(120px,1.4fr) minmax(120px,1fr) 70px 70px 64px 70px 18px;
+    padding:9px 14px;user-select:none}
+  .lrow>summary::-webkit-details-marker{display:none}
+  .lrow>summary:hover{background:var(--panel2)}
+  .lrow[open]>summary{background:var(--panel2);border-bottom:1px solid var(--line)}
+  .lrow .lname{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lrow .lstat{text-align:right;font-variant-numeric:tabular-nums}
+  .lrow .lstat b{font-size:15px}
+  .lrow .lstate{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+  .lrow .chev{color:var(--muted);transition:transform .15s;text-align:center}
+  .lrow[open] .chev{transform:rotate(90deg)}
+  .lrow .ldetail{padding:6px 14px 14px;background:var(--bg)}
+  .lhead{display:grid;gap:10px;
+    grid-template-columns:14px minmax(120px,1.4fr) minmax(120px,1fr) 70px 70px 64px 70px 18px;
+    padding:6px 14px;font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
+  .lhead .lstat{text-align:right}
+  .viewtoggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;
+    margin-left:10px;vertical-align:middle}
+  .viewtoggle button{background:var(--panel);color:var(--muted);border:none;padding:4px 12px;
+    font:inherit;font-size:12px;cursor:pointer}
+  .viewtoggle button.on{background:var(--info);color:#0d1117;font-weight:600}
   .dev{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .dev .top{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
   .dev .top .name{font-weight:650}
@@ -511,8 +537,13 @@ INDEX_HTML = r"""<!doctype html>
   <h2>Stage timing — what to optimise</h2>
   <div id="stages"></div>
 
-  <h2>Devices</h2>
-  <div class="devgrid" id="devs"></div>
+  <h2>Devices
+    <span class="viewtoggle" id="viewtoggle">
+      <button data-view="cards">▦ Cards</button>
+      <button data-view="list">☰ List</button>
+    </span>
+  </h2>
+  <div id="devs"></div>
 
   <div class="grid2">
     <div>
@@ -590,49 +621,100 @@ function renderStages(d){
    <div class="mini" style="margin-top:6px">Based on ${ss.total.n} completed posts this session. The widest bar / highest share is the best optimisation target.</div>`;
 }
 
+let VIEW = localStorage.getItem('fleetView') || 'cards';
+const openKeys = new Set();   // detail keys kept open across refreshes
+
+function stageLineHTML(st){
+  const liveStage = st.state==='working' && st.live_since;
+  let s = esc(st.label||'');
+  if(liveStage) s += ` <span class="spin">⏱</span><span data-live="${st.live_since}"></span>`;
+  else if(st.until) s += ` <span class="muted">(${until(st.until)})</span>`;
+  else if(st.since) s += ` <span class="muted">· ${ago(st.since)}</span>`;
+  return s;
+}
+
+// shared detail body (recent posts + stage avgs + logs), reused by both views
+function deviceDetail(a){
+  const tg=a.timings;
+  const recent = (a.recent||[]).slice().reverse().map(r=>{
+    const link = r.url? `<a href="${esc(r.url)}" target="_blank">link</a>` : '<span class="muted">no link</span>';
+    const vc = r.verdict==='SUCCESS'?'var(--accent)':'var(--warn)';
+    return `<tr><td>${esc(r.name||'—')}</td>
+      <td><span class="tag" style="color:${vc};border-color:${vc}">${esc(r.verdict||'')}</span></td>
+      <td class="right">${fmtDur(r.total)}</td><td class="right">${ago(r.ts)}</td>
+      <td class="right">${link}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted">no posts yet</td></tr>';
+  return `<div class="mini">stage avg — prepare ${fmtDur(tg.prepare.avg)} · publish ${fmtDur(tg.publish.avg)} · verify ${fmtDur(tg.verify.avg)}</div>
+    <details data-key="rec:${esc(a.account)}"><summary>recent posts (${(a.recent||[]).length})</summary>
+      <table style="margin-top:6px"><tbody>${recent}</tbody></table>
+    </details>
+    <details data-key="log:${esc(a.account)}"><summary>log (last ${(a.log||[]).length} lines)</summary>
+      <pre class="log">${esc((a.log||[]).join('\n'))||'(empty)'}</pre>
+    </details>`;
+}
+
+function cardHTML(a){
+  const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)', c=a.counts, tg=a.timings;
+  return `<div class="dev">
+    <div class="top">
+      <span class="dot" style="background:${a.alive?'var(--accent)':'var(--bad)'}"></span>
+      <span class="name">@${esc(a.account)}</span>
+      <span class="grow"></span>
+      <span class="pill mini">${esc(a.device)}${a.pid?(' · pid '+a.pid):''}</span>
+    </div>
+    <div class="body">
+      <div style="color:${color};font-weight:600;margin-bottom:8px">${stageLineHTML(st)}</div>
+      <div class="stat-row">
+        <div><b style="color:var(--accent)">${c.posted}</b> <span class="mini">posted</span></div>
+        <div><b>${c.confirmed}</b> <span class="mini">confirmed</span></div>
+        <div><b style="color:var(--warn)">${c.unconfirmed}</b> <span class="mini">unconf.</span></div>
+        <div><b style="color:${c.failed?'var(--bad)':'inherit'}">${c.failed}</b> <span class="mini">failed</span></div>
+        <div><b>${fmtDur(tg.total.avg)}</b> <span class="mini">avg</span></div>
+      </div>
+      ${deviceDetail(a)}
+    </div>
+  </div>`;
+}
+
+function listRowHTML(a){
+  const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)', c=a.counts, tg=a.timings;
+  const key='row:'+a.account, open=openKeys.has(key)?' open':'';
+  return `<details class="lrow" data-key="${key}"${open}>
+    <summary>
+      <span class="dot" style="background:${a.alive?'var(--accent)':'var(--bad)'}"></span>
+      <span class="lname">@${esc(a.account)} <span class="mini">${esc(a.device)}</span></span>
+      <span class="lstate" style="color:${color}">${stageLineHTML(st)}</span>
+      <span class="lstat"><b style="color:var(--accent)">${c.posted}</b><br><span class="mini">posted</span></span>
+      <span class="lstat"><b style="color:${c.failed?'var(--bad)':'inherit'}">${c.failed}</b><br><span class="mini">failed</span></span>
+      <span class="lstat"><b>${fmtDur(tg.total.avg)}</b><br><span class="mini">avg</span></span>
+      <span class="lstat mini">${a.last_post_ts?ago(a.last_post_ts):'—'}<br><span class="mini">last</span></span>
+      <span class="chev">▸</span>
+    </summary>
+    <div class="ldetail">${deviceDetail(a)}</div>
+  </details>`;
+}
+
 function renderDevs(d){
-  $('#devs').innerHTML = d.accounts.map(a=>{
-    const st=a.status||{}, color=STATE_COLOR[st.state]||'var(--muted)';
-    const liveStage = st.state==='working' && st.live_since;
-    let stageLine = esc(st.label||'');
-    if(liveStage) stageLine += ` <span class="spin">⏱</span><span data-live="${st.live_since}"></span>`;
-    else if(st.until) stageLine += ` <span class="muted">(${until(st.until)})</span>`;
-    else if(st.since) stageLine += ` <span class="muted">· ${ago(st.since)}</span>`;
-    const c=a.counts, tg=a.timings;
-    const recent = (a.recent||[]).slice().reverse().map(r=>{
-      const link = r.url? `<a href="${esc(r.url)}" target="_blank">link</a>` : '<span class="muted">no link</span>';
-      const vc = r.verdict==='SUCCESS'?'var(--accent)':'var(--warn)';
-      return `<tr><td>${esc(r.name||'—')}</td>
-        <td><span class="tag" style="color:${vc};border-color:${vc}">${esc(r.verdict||'')}</span></td>
-        <td class="right">${fmtDur(r.total)}</td><td class="right">${ago(r.ts)}</td>
-        <td class="right">${link}</td></tr>`;
-    }).join('') || '<tr><td colspan="5" class="muted">no posts yet</td></tr>';
-    return `<div class="dev">
-      <div class="top">
-        <span class="dot" style="background:${a.alive?'var(--accent)':'var(--bad)'}"></span>
-        <span class="name">@${esc(a.account)}</span>
-        <span class="grow"></span>
-        <span class="pill mini">${esc(a.device)}${a.pid?(' · pid '+a.pid):''}</span>
-      </div>
-      <div class="body">
-        <div style="color:${color};font-weight:600;margin-bottom:8px">${stageLine}</div>
-        <div class="stat-row">
-          <div><b style="color:var(--accent)">${c.posted}</b> <span class="mini">posted</span></div>
-          <div><b>${c.confirmed}</b> <span class="mini">confirmed</span></div>
-          <div><b style="color:var(--warn)">${c.unconfirmed}</b> <span class="mini">unconf.</span></div>
-          <div><b style="color:${c.failed?'var(--bad)':'inherit'}">${c.failed}</b> <span class="mini">failed</span></div>
-          <div><b>${fmtDur(tg.total.avg)}</b> <span class="mini">avg</span></div>
-        </div>
-        <div class="mini">stage avg — prepare ${fmtDur(tg.prepare.avg)} · publish ${fmtDur(tg.publish.avg)} · verify ${fmtDur(tg.verify.avg)}</div>
-        <details><summary>recent posts (${(a.recent||[]).length})</summary>
-          <table style="margin-top:6px"><tbody>${recent}</tbody></table>
-        </details>
-        <details><summary>log (last ${a.log.length} lines)</summary>
-          <pre class="log">${esc((a.log||[]).join('\n'))||'(empty)'}</pre>
-        </details>
-      </div>
-    </div>`;
-  }).join('') || '<div class="muted">No devices in data/device_accounts.json</div>';
+  const el=$('#devs');
+  if(!d.accounts.length){ el.innerHTML='<div class="muted">No devices in data/device_accounts.json</div>'; return; }
+  document.querySelectorAll('#viewtoggle button').forEach(b=>
+    b.classList.toggle('on', b.dataset.view===VIEW));
+  if(VIEW==='list'){
+    el.innerHTML='<div class="lhead">'+
+      '<span></span><span>account / device</span><span>status</span>'+
+      '<span class="lstat">posted</span><span class="lstat">failed</span>'+
+      '<span class="lstat">avg</span><span class="lstat">last</span><span></span></div>'+
+      '<div class="devlist">'+d.accounts.map(listRowHTML).join('')+'</div>';
+  } else {
+    el.innerHTML='<div class="devgrid">'+d.accounts.map(cardHTML).join('')+'</div>';
+  }
+  // restore + track open state of every collapsible so a refresh never closes it
+  el.querySelectorAll('details[data-key]').forEach(dt=>{
+    if(openKeys.has(dt.dataset.key)) dt.open=true;
+    dt.addEventListener('toggle', ()=>{
+      if(dt.open) openKeys.add(dt.dataset.key); else openKeys.delete(dt.dataset.key);
+    });
+  });
 }
 
 function renderPosts(d){
@@ -664,10 +746,17 @@ function tickLive(){
   });
 }
 
+let LAST=null;
+document.querySelectorAll('#viewtoggle button').forEach(b=>b.addEventListener('click',()=>{
+  VIEW=b.dataset.view; localStorage.setItem('fleetView',VIEW);
+  if(LAST) renderDevs(LAST);
+}));
+
 async function refresh(){
   try{
     const r=await fetch('/api/state'); const d=await r.json();
     if(d.error){ $('#fleetState').textContent='error: '+d.error; return; }
+    LAST=d;
     const f=d.fleet;
     $('#fleetState').innerHTML = f.stopped
       ? '<span class="dot" style="background:var(--bad)"></span>supervisor stopped'

@@ -375,8 +375,17 @@ async def _confirm_post(
     The other route is still used as a fallback so a single flaky route never
     fails an actually-live post.
     """
-    routes = ["dashboard", "reels"] if preferred_verify_path == "dashboard" else ["reels", "dashboard"]
-    logger.info("post_trial: verify route order %s (learned=%s)", routes, preferred_verify_path)
+    # Reels-only by default: the deterministic capture is the reliable, fast
+    # confirmation. The LLM dashboard route is slow (≫10 min once humanized
+    # action delays apply) and flaky, so it is OFF unless explicitly re-enabled
+    # via VERIFY_INCLUDE_DASHBOARD=1.
+    include_dashboard = os.environ.get("VERIFY_INCLUDE_DASHBOARD", "0").strip().lower() in ("1", "true", "yes")
+    if include_dashboard:
+        routes = ["dashboard", "reels"] if preferred_verify_path == "dashboard" else ["reels", "dashboard"]
+    else:
+        routes = ["reels"]
+    logger.info("post_trial: verify route order %s (learned=%s, dashboard=%s)",
+                routes, preferred_verify_path, include_dashboard)
 
     # Operator C1: one short initial settle before the first confirmation attempt
     # (the reel needs a moment to appear), then quick retries inside each route.
@@ -431,6 +440,9 @@ async def post_and_track(
             "hashtags": [],
             "expected_username": account,
             "mobile_ui_executor": "mobilerun_agent",
+            # Slow VN->RU link to S3: give the download generous headroom so a
+            # large (median ~18 MB) video does not hit a spurious timeout->INFRA.
+            "video_download_timeout": int(os.environ.get("VIDEO_DOWNLOAD_TIMEOUT", "600")),
             # Self-learning: if this account has a known-good Trial Reels entry
             # path, the goal tells the agent to try it first.
             "preferred_trial_path": preferred_path,

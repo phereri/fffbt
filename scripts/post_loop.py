@@ -166,17 +166,22 @@ def recover_device() -> bool:
     except Exception as e:
         log(f"RECOVER reboot command failed: {e}")
         return False
-    # wait for adb 'device' + boot_completed (max ~6 min)
-    for _ in range(72):
+    # WiFi adb devices do NOT auto-reconnect after a reboot — call
+    # `adb connect <ip>` every 5s until the device reappears, up to 5 min.
+    deadline = time.time() + 300
+    back = False
+    while time.time() < deadline:
         time.sleep(5)
         try:
+            subprocess.run([ADB, "connect", DEVICE], capture_output=True, text=True, timeout=12)
             st = subprocess.run([ADB, "-s", DEVICE, "get-state"], capture_output=True, text=True, timeout=15)
             if st.stdout.strip() == "device":
+                back = True
                 break
         except Exception:
             pass
-    else:
-        log("RECOVER device did not come back online")
+    if not back:
+        log("RECOVER device did not reconnect within 5 min")
         return False
     for _ in range(48):
         try:

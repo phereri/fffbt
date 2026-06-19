@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -39,6 +40,9 @@ PIDS_FILE = ROOT / "data" / "fleet_pids.json"
 FLEET_LOG = os.environ.get("FLEET_LOG", str(ROOT / "post_fleet.log"))
 VENV_PY = os.environ.get("LOOP_PY", str(ROOT / ".venv" / "Scripts" / "python.exe"))
 POLL_SECS = int(os.environ.get("FLEET_POLL_SECS", "15"))
+# Stagger the per-device starts so they don't all hit the network/LLM at once.
+STAGGER_MIN_S = int(os.environ.get("FLEET_STAGGER_MIN", "20"))
+STAGGER_MAX_S = int(os.environ.get("FLEET_STAGGER_MAX", "40"))
 
 _children: list[subprocess.Popen] = []
 
@@ -103,9 +107,10 @@ def main() -> int:
         except Exception:
             pass  # SIGTERM handler not settable on some platforms
 
-    log(f"FLEET START devices={list(devices.keys())}")
+    log(f"FLEET START devices={list(devices.keys())} stagger={STAGGER_MIN_S}-{STAGGER_MAX_S}s")
     fleet_events.emit("fleet_start", devices=devices, pid=os.getpid())
-    for serial, account in devices.items():
+    items = list(devices.items())
+    for i, (serial, account) in enumerate(items):
         per_log = ROOT / f"post_loop_{_safe_account(account)}.log"
         env = dict(
             os.environ,
@@ -123,11 +128,16 @@ def main() -> int:
         log(f"FLEET spawned account={account} device={serial} pid={p.pid} log={per_log.name}")
         fleet_events.emit("fleet_spawned", account=account, device=serial,
                           pid=p.pid, log=per_log.name)
-
-    PIDS_FILE.write_text(
-        json.dumps({p.pid: dev for p, dev in zip(_children, devices.keys())}, indent=2),
-        encoding="utf-8",
-    )
+        # Update the pid map incrementally so the dashboard sees devices ramp up.
+        PIDS_FILE.write_text(
+            json.dumps({c.pid: s for c, (s, _a) in zip(_children, items)}, indent=2),
+            encoding="utf-8",
+        )
+        # Stagger: small random gap before launching the next device (not after the last).
+        if i < len(items) - 1:
+            gap = random.randint(STAGGER_MIN_S, STAGGER_MAX_S)
+            log(f"FLEET stagger {gap}s before next device")
+            time.sleep(gap)
 
     # Supervise: report each child's exit. We do NOT auto-restart — a clean
     # LOOP STOP is an escalation the operator asked to surface, and self-healing
