@@ -511,6 +511,20 @@ async def _dismiss_blockers(serial, nodes, traj=None) -> bool:
             print("  [warn] 'automated behavior' notice -> Dismiss")
             await tap(serial, _jxy(dismiss), "automated-behavior warn (Dismiss)", human=False)
             return True
+    # "Save your login info?" dialog (offered right after a login / app open). It is
+    # NOT a checkpoint -- it just stalls navigation on an unknown screen, which makes
+    # Path A bail and fall through to the alt path (and falsely flag accounts whose
+    # alt composer lacks a Trial toggle). Decline with "Not now" to keep moving; we
+    # never want to persist creds on the device.
+    save_login = _by_text(nodes, "Save your login info") or _by_text(nodes, "save the login info for")
+    if save_login:
+        not_now = _by_text(nodes, "Not now", exact=True) or _by_text(nodes, "Not now")
+        if not_now:
+            if traj:
+                traj.log("save_login_dismiss", note="Save your login info? dialog", on="Not now")
+            print("  [save-login] 'Save your login info?' -> Not now")
+            await tap(serial, _jxy(not_now), "save-login dialog (Not now)", human=False)
+            return True
     return False
 
 
