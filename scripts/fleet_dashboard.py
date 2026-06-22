@@ -1061,7 +1061,7 @@ def _s3_sync_loop() -> None:
         with _s3_sync_lock:
             _s3_sync_state["running"] = True
         try:
-            res = s3_sync.sync_once()
+            res = s3_sync.sync_once(max_age_days=s3_sync.MAX_AGE_DAYS)
             now = time.time()
             with _s3_sync_lock:
                 _s3_sync_state.update(
@@ -1071,6 +1071,7 @@ def _s3_sync_loop() -> None:
                     runs=_s3_sync_state["runs"] + 1, running=False,
                 )
             print(f"[s3-sync] +{res.inserted} new ({res.skipped} existing, "
+                  f"{res.skipped_old} too old (>{s3_sync.MAX_AGE_DAYS}d), "
                   f"{res.folders} folders, {res.folders_skipped} no-meta)", flush=True)
         except Exception as e:
             with _s3_sync_lock:

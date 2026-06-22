@@ -165,3 +165,32 @@ class TestSyncOnce:
         assert res.inserted == 0
         # insert was called only with an empty list; no delete path exists at all
         assert deleted_calls == [[]]
+
+    def test_age_gate_drops_old_and_undated(self):
+        from datetime import date
+        s3 = _FakeS3([_folder(
+            "Mix",
+            ["VID_20260620_a.mp4",   # 3 days old -> kept
+             "VID_20260601_b.mp4",   # 22 days old -> dropped
+             "nodate_c.mp4"],        # no date -> dropped
+            platform=["Instagram"], category="trend",
+        )])
+        captured: list[dict] = []
+        res = s3_sync.sync_once(
+            s3=s3, fetch_existing=lambda: set(),
+            insert=lambda rows: captured.extend(rows) or len(rows),
+            id_factory=_ids(), max_age_days=7, today=date(2026, 6, 23),
+        )
+        assert res.inserted == 1
+        assert res.skipped_old == 2
+        assert [r["name"] for r in captured] == ["VID_20260620_a.mp4"]
+
+    def test_age_gate_off_by_default_keeps_undated(self):
+        # Without max_age_days every candidate (even undated) is inserted.
+        s3 = _FakeS3([_folder("X", ["nodate.mp4"], platform=["Instagram"], category="trend")])
+        res = s3_sync.sync_once(
+            s3=s3, fetch_existing=lambda: set(),
+            insert=lambda rows: len(rows), id_factory=_ids(),
+        )
+        assert res.inserted == 1
+        assert res.skipped_old == 0

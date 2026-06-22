@@ -26,10 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Callable, Iterable
 
 from src.runner.s3_source import FermaS3, VideoFolder
@@ -42,6 +44,25 @@ _COLUMNS = ("id", "name", "platform", "category", "type", "status", "link_drive"
 
 _INSERT_CHUNK = 500
 
+# Skip videos whose VID_YYYYMMDD filename date is older than this many days. The
+# dashboard daemon passes this; 0 / unset disables the gate. Keeps stale objects
+# lingering in the bucket out of the postable backlog.
+MAX_AGE_DAYS = int(os.environ.get("S3_SYNC_MAX_AGE_DAYS", "7") or "0")
+
+_DATE_RE = re.compile(r"(\d{8})")
+
+
+def _name_date(name: str | None) -> date | None:
+    """First 8-digit run in a filename ('VID_20260616_..' -> 2026-06-16), or None."""
+    m = _DATE_RE.search(name or "")
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except ValueError:
+        return None
+
 
 @dataclass
 class SyncResult:
@@ -52,6 +73,7 @@ class SyncResult:
     candidates: int = 0
     inserted: int = 0
     skipped: int = 0                  # candidates already present in the DB
+    skipped_old: int = 0              # candidates dropped by the age gate
     skipped_folder_ids: list[str] = field(default_factory=list)
 
 
@@ -171,17 +193,35 @@ def sync_once(
     fetch_existing: Callable[[], set[tuple[str, str]]] = fetch_existing_pairs,
     insert: Callable[[list[dict]], int] = insert_rows,
     id_factory: Callable[[], str] = _new_id,
+    max_age_days: int | None = None,
+    today: date | None = None,
 ) -> SyncResult:
     """Run one S3 -> DB pass. Insert-only; never deletes.
 
     ``s3``, ``fetch_existing`` and ``insert`` are injectable so this can be
-    exercised without boto3 or a live database.
+    exercised without boto3 or a live database. When ``max_age_days`` is a
+    positive int, candidates whose filename date is older than that many days
+    (relative to ``today``, default the real today) are dropped before insert;
+    candidates with no parseable date are treated as too old and dropped too.
+    ``max_age_days=None`` (default) disables the gate.
     """
     s3 = s3 or FermaS3.from_env()
     folders = [s3.get_folder(name) for name in s3.list_folders()]
     candidates, skipped_folders = build_candidates(
         folders, s3.config.bucket, id_factory=id_factory
     )
+
+    skipped_old = 0
+    if max_age_days and max_age_days > 0:
+        cutoff = (today or date.today()) - timedelta(days=int(max_age_days))
+        fresh: list[dict] = []
+        for row in candidates:
+            d = _name_date(row.get("name"))
+            if d is None or d < cutoff:
+                skipped_old += 1
+                continue
+            fresh.append(row)
+        candidates = fresh
 
     existing = fetch_existing()
     seen: set[tuple[str, str]] = set()
@@ -200,6 +240,7 @@ def sync_once(
         candidates=len(candidates),
         inserted=inserted,
         skipped=len(candidates) - len(new_rows),
+        skipped_old=skipped_old,
         skipped_folder_ids=skipped_folders,
     )
 

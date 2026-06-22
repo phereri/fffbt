@@ -62,6 +62,11 @@ STATUS_CLAIMED = "posting"  # set the instant we reserve a row
 STATUS_VERIFYING = "verify"  # set after publish, while confirming (matches live data)
 STATUS_DONE = "posted"      # set after verification succeeds
 PLATFORM = "Instagram"
+
+# Only post videos no older than this many days (by the VID_YYYYMMDD date in the
+# filename). 0 / unset disables the gate. Keeps the fleet off stale content even
+# if old objects linger in the bucket / DB.
+MAX_AGE_DAYS = int(os.environ.get("POST_MAX_AGE_DAYS", "7") or "0")
 CAPTION_MAX_LEN = 2200  # Instagram's hard caption limit; captions are posted in full
 # ===========================================================================
 
@@ -138,16 +143,29 @@ def _lit(value: str | None) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def claim_one(category: str, order: str = "asc") -> dict | None:
+def claim_one(category: str, order: str = "asc", max_age_days: int | None = None) -> dict | None:
     """Atomically flip one matching 'new' row to 'posting' and return it.
 
     A single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) makes the
     claim race-safe against other agents: each concurrent claim locks a
     different row, and the status pre-check guarantees exactly one winner.
     ``order`` picks oldest-first ("asc", default) or newest-first ("desc") by
-    created_at. Always status = 'new'.
+    created_at. Always status = 'new'. When ``max_age_days`` > 0 a row is only
+    eligible if the VID_YYYYMMDD date in its filename is within that many days of
+    today; rows whose name carries no parseable date are treated as too old and
+    skipped (we never want to post unknown-age / stale content).
     """
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
+    if max_age_days is None:
+        max_age_days = MAX_AGE_DAYS
+    age_clause = ""
+    if max_age_days and max_age_days > 0:
+        # First 8-digit run in the name is the YYYYMMDD shoot date; NULL (no date)
+        # fails the comparison and the row is skipped.
+        age_clause = (
+            f"\n              AND to_date(substring(name from '[0-9]{{8}}'), 'YYYYMMDD') "
+            f">= current_date - interval '{int(max_age_days)} days'"
+        )
     sql = f"""
         UPDATE fffbt.videos v
         SET status = {_lit(STATUS_CLAIMED)}, updated_at = now()
@@ -155,7 +173,7 @@ def claim_one(category: str, order: str = "asc") -> dict | None:
             SELECT id FROM fffbt.videos
             WHERE status = {_lit(STATUS_NEW)}
               AND category = {_lit(category)}
-              AND platform = {_lit(PLATFORM)}
+              AND platform = {_lit(PLATFORM)}{age_clause}
             ORDER BY created_at {direction}
             LIMIT 1
             FOR UPDATE SKIP LOCKED
