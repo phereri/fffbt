@@ -138,13 +138,16 @@ def _lit(value: str | None) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def claim_one(category: str) -> dict | None:
+def claim_one(category: str, order: str = "asc") -> dict | None:
     """Atomically flip one matching 'new' row to 'posting' and return it.
 
     A single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) makes the
     claim race-safe against other agents: each concurrent claim locks a
     different row, and the status pre-check guarantees exactly one winner.
+    ``order`` picks oldest-first ("asc", default) or newest-first ("desc") by
+    created_at. Always status = 'new'.
     """
+    direction = "DESC" if str(order).lower() == "desc" else "ASC"
     sql = f"""
         UPDATE fffbt.videos v
         SET status = {_lit(STATUS_CLAIMED)}, updated_at = now()
@@ -153,7 +156,7 @@ def claim_one(category: str) -> dict | None:
             WHERE status = {_lit(STATUS_NEW)}
               AND category = {_lit(category)}
               AND platform = {_lit(PLATFORM)}
-            ORDER BY created_at ASC
+            ORDER BY created_at {direction}
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )

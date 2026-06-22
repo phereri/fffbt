@@ -29,6 +29,7 @@ import json
 import os
 import random
 import selectors
+import subprocess
 import sys
 import time
 
@@ -54,6 +55,12 @@ _DENY_CURLY = "Don’t allow"
 HUMANIZE = os.environ.get("HUMANIZE", "1").strip().lower() not in ("0", "false", "no", "")
 ACTION_MIN = float(os.environ.get("ACTION_DELAY_MIN", "7"))
 ACTION_MAX = float(os.environ.get("ACTION_DELAY_MAX", "15"))
+# Per-character caption typing cadence (humanized): a per-run base delay chosen
+# once in [CHAR_MIN, CHAR_MAX] (this "typist's" speed) plus +/- CHAR_JITTER per
+# keystroke. Seconds.
+CHAR_MIN = float(os.environ.get("CHAR_DELAY_MIN", "0.620"))
+CHAR_MAX = float(os.environ.get("CHAR_DELAY_MAX", "1.040"))
+CHAR_JITTER = float(os.environ.get("CHAR_JITTER", "0.020"))
 TRAJ_ROOT = os.path.join("trajectories", "scripted")
 
 
@@ -69,11 +76,139 @@ async def read_ui(serial: str):
     return _parse_portal_state(raw)
 
 
+# ---------------------------------------------------------------------------
+# Accessibility-service health + auto-recovery
+# Every screen read goes through the Mobilerun Portal a11y service. When it drops
+# (killed under memory pressure, or enabled-but-not-bound after a reboot) the Portal
+# returns no a11y_tree and the WHOLE flow goes blind: challenge checks, navigation
+# and link capture all read empty. We detect that and rebind the service.
+# ---------------------------------------------------------------------------
+PORTAL_STATE_URI = "content://com.mobilerun.portal/state"
+ACC_SERVICE = "com.mobilerun.portal/com.mobilerun.portal.service.MobilerunAccessibilityService"
+
+
+def _adb_bin() -> str:
+    return os.environ.get("ADB_PATH", "adb")
+
+
+def _adb_dev(serial, *args, timeout=30):
+    return subprocess.run([_adb_bin(), "-s", serial, *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _adb_global(*args, timeout=30):
+    return subprocess.run([_adb_bin(), *args], capture_output=True, text=True, timeout=timeout)
+
+
+async def a11y_ok(serial: str) -> bool:
+    """True iff the Portal returns a BOUND accessibility tree (status success).
+    A False here means every UI read will come back empty -> recover before acting."""
+    try:
+        raw = await shell(serial, f"content query --uri {PORTAL_STATE_URI}", timeout=20)
+    except Exception:
+        return False
+    return ("a11y_tree" in raw) and ('"status":"success"' in raw.replace(" ", ""))
+
+
+async def recover_accessibility(serial: str, traj=None, *, reconnect_timeout: int = 300) -> bool:
+    """Re-enable the Mobilerun a11y service after it has dropped, then verify.
+
+    Per the standing runbook: toggle the secure accessibility setting, REBOOT, and
+    -- because WiFi-adb devices do NOT auto-reconnect after a reboot -- reconnect
+    with ``adb connect`` after 20s and then every 10s for up to 5 minutes. Finally
+    wait for the Portal to rebind and confirm the a11y tree is readable again.
+    Returns True iff a11y works afterwards (only then is it safe to continue)."""
+    def _log(ev, **kw):
+        try:
+            if traj:
+                traj.log(ev, **kw)
+        except Exception:
+            pass
+        print(f"  [a11y-recover] {serial} {ev}" + (f" {kw}" if kw else ""))
+
+    _log("a11y_recover_start")
+
+    def _toggle():
+        # delete + re-add the enabled-services list and flip the master switch:
+        # this rebinds the Mobilerun accessibility service cleanly.
+        _adb_dev(serial, "shell", "settings", "delete", "secure",
+                 "enabled_accessibility_services", timeout=15)
+        _adb_dev(serial, "shell", "settings", "put", "secure", "accessibility_enabled", "0", timeout=15)
+        time.sleep(1)
+        _adb_dev(serial, "shell", "settings", "put", "secure",
+                 "enabled_accessibility_services", ACC_SERVICE, timeout=15)
+        _adb_dev(serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1", timeout=15)
+    try:
+        await asyncio.to_thread(_toggle)
+    except Exception as e:
+        _log("a11y_toggle_error", error=str(e))
+
+    try:                                                # reboot to force a clean rebind
+        await asyncio.to_thread(lambda: _adb_dev(serial, "reboot", timeout=20))
+    except Exception as e:
+        _log("a11y_reboot_error", error=str(e))
+
+    # reconnect: wait 20s, then `adb connect` every 10s up to 5 min. `get-state`
+    # alone hangs on a rebooting WiFi-adb device, so always `connect` first.
+    _log("a11y_reconnect_wait", seconds=20)
+    await asyncio.sleep(20)
+    booted = False
+    deadline = time.monotonic() + reconnect_timeout
+    while time.monotonic() < deadline:
+        try:
+            await asyncio.to_thread(lambda: _adb_global("connect", serial, timeout=10))
+            st = await asyncio.to_thread(lambda: _adb_dev(serial, "get-state", timeout=10))
+            if (st.stdout or "").strip() == "device":
+                bc = await asyncio.to_thread(
+                    lambda: _adb_dev(serial, "shell", "getprop", "sys.boot_completed", timeout=10))
+                if (bc.stdout or "").strip() == "1":
+                    booted = True
+                    break
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+    if not booted:
+        _log("a11y_recover_no_reconnect")
+        return False
+
+    # let the Portal rebind, then verify (binding lags a few seconds after boot)
+    _log("a11y_reconnect_ok")
+    await asyncio.sleep(25)
+    for _ in range(8):
+        if await a11y_ok(serial):
+            _log("a11y_recover_ok")
+            return True
+        await asyncio.sleep(5)
+    _log("a11y_recover_still_down")
+    return False
+
+
 def _center(n):
     if not n:
         return None
     b = parse_bounds(n.get("bounds"))
     return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2) if b else None
+
+
+def _jxy(target):
+    """A human-ish tap point — NEVER the same pixel twice. For a UI node, a random
+    point biased (Gaussian) toward the centre of its bounds but kept well inside it;
+    for a raw (x, y) point, a few px of jitter. Returns None if there's no target."""
+    if target is None:
+        return None
+    if isinstance(target, dict):                       # a UI node -> jitter in bounds
+        b = parse_bounds(target.get("bounds"))
+        if not b:
+            return None
+        cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        w, h = max(1, b[2] - b[0]), max(1, b[3] - b[1])
+        x = cx + random.gauss(0, w * 0.16)             # ~central 60% of the element
+        y = cy + random.gauss(0, h * 0.16)
+        x = min(b[2] - 2, max(b[0] + 2, x))            # clamp inside -> never misfire
+        y = min(b[3] - 2, max(b[1] + 2, y))
+        return (int(x), int(y))
+    x, y = target                                      # a raw point -> small jitter
+    return (int(x + random.gauss(0, 4)), int(y + random.gauss(0, 4)))
 
 
 def _by_rid(nodes, suffix):
@@ -137,11 +272,39 @@ def _clean_reel_url(text):
 # Ordered specific -> general; detect_screen returns the first match.
 # ---------------------------------------------------------------------------
 def _first_gallery_thumb(nodes):
+    # the FIRST media tile that is NOT the "Open camera" cell — that cell opens the
+    # camera, not a video. (The camera tile uses a different rid, but also guard by text.)
     cands = [n for n in nodes
-             if node_resource_id(n).endswith("gallery_grid_item_thumbnail") and parse_bounds(n.get("bounds"))]
+             if node_resource_id(n).endswith("gallery_grid_item_thumbnail")
+             and parse_bounds(n.get("bounds"))
+             and "camera" not in (node_text(n) + str(n.get("content_desc") or "")).lower()]
     if cands:
         return min(cands, key=lambda n: (lambda b: (b[1], b[0]))(parse_bounds(n["bounds"])))
     return _by_text(nodes, "Video thumbnail")
+
+
+async def _select_videos_folder(serial, traj=None):
+    """In the media picker, switch the album dropdown from 'Recents' to 'Videos' so the
+    grid shows ONLY videos. This prevents a stray screenshot/photo (which can sort
+    ahead of the pushed video in the mixed 'Recents' view) from being picked as the
+    reel. No-op if already on Videos or if the control isn't present."""
+    nodes = await read_ui(serial)
+    dd = _by_rid(nodes, "gallery_folder_menu_tv") or _by_text(nodes, "Recents")
+    if not dd:
+        return
+    if "video" in node_text(dd).strip().lower():            # already filtered to Videos
+        return
+    await tap(serial, _jxy(dd), "album dropdown", human=False)
+    await asyncio.sleep(1.0)
+    nodes = await read_ui(serial)
+    vids = _by_text(nodes, "Videos", exact=True) or _by_text(nodes, "Videos")
+    if vids:
+        if traj:
+            traj.log("gallery_filter", folder="Videos")
+        await tap(serial, _jxy(vids), "Videos folder", human=False)
+        await asyncio.sleep(1.2)
+    elif traj:
+        traj.log("gallery_filter_missing", note="no 'Videos' entry in album dropdown")
 
 
 SCREENS = {
@@ -170,6 +333,49 @@ def detect_screen(nodes) -> str:
         except Exception:
             pass
     return "unknown"
+
+
+# Login challenge / checkpoint / block detection. Hitting any of these means we
+# must STOP for this device immediately — never keep tapping (that can escalate a
+# checkpoint into a hard lock). Markers are matched against all node text +
+# content-desc (case-insensitive). Tuned from the real .50 screen ("Confirm
+# you're human to use your account, …") plus the AppCard hard-stop conditions.
+class HardStop(Exception):
+    def __init__(self, reason: str, marker: str = ""):
+        self.reason = reason
+        self.marker = marker
+        super().__init__(f"{reason}: {marker}")
+
+
+CHALLENGE_MARKERS = (
+    "confirm you're human", "confirm you’re human", "confirm it's you", "confirm it’s you",
+    "confirm your identity", "help us confirm", "verify it's you", "verify it’s you",
+    "we detected unusual", "unusual activity", "suspicious login attempt",
+    "enter the code", "we sent a code", "enter security code", "two-factor",
+    "your account has been disabled", "account has been disabled",
+    "we suspended your account", "account suspended", "your account is suspended",
+    "we restrict certain activity", "action blocked",
+    "we limit how often", "you're temporarily blocked", "temporarily blocked",
+    "tell us if this was you", "was it you",
+)
+# NOTE: a bare "try again later" is intentionally NOT a marker — it is a generic
+# transient/error/connectivity message (e.g. "Something went wrong. Try again
+# later.") that caused FALSE blocks. Real action-blocks also carry a stronger marker
+# above ("we restrict certain activity" / "action blocked"), so they're still caught.
+
+
+def _hard_stop_reason(nodes) -> tuple[str, str] | None:
+    """Return (reason, marker) if a login/checkpoint/block screen is present."""
+    # logged out — require the sign-up affordance too, so a stray "Log in" link
+    # elsewhere is not mistaken for the logged-out screen.
+    if _by_text(nodes, "Log in", exact=True) and (_by_text(nodes, "Sign up", exact=True)
+                                                   or _by_text(nodes, "Create new account")):
+        return "logged_out", "Log in / Sign up"
+    blob = " ".join((node_text(n) or "") for n in nodes).lower()
+    for m in CHALLENGE_MARKERS:
+        if m in blob:
+            return "login_challenge", m
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +430,19 @@ class Traj:
 
 
 async def tap(serial, xy, label="", *, human=True):
+    # ``xy`` is already a concrete (jittered) point from _jxy(...). Tap as a real
+    # touch gesture, not an injected `input tap`: a down->up with a small random
+    # hold and 1-3 px of drift so it registers with a duration like a finger, not a
+    # synthetic zero-time click.
     if not xy:
         print(f"  [skip] {label}: no target")
         return False
-    await shell(serial, f"input tap {int(xy[0])} {int(xy[1])}", timeout=10)
+    x, y = int(xy[0]), int(xy[1])
+    x2, y2 = x + int(round(random.gauss(0, 1.6))), y + int(round(random.gauss(0, 1.6)))
+    hold = random.randint(45, 120)                      # ms — human press duration
+    await shell(serial, f"input touchscreen swipe {x} {y} {x2} {y2} {hold}", timeout=10)
     d = _action_delay() if human else SETTLE
-    print(f"  tapped {label} at {xy}" + (f"  (+{d:.1f}s)" if (human and HUMANIZE) else ""))
+    print(f"  tapped {label} at ({x},{y})" + (f"  (+{d:.1f}s)" if (human and HUMANIZE) else ""))
     await asyncio.sleep(d)
     return True
 
@@ -266,14 +479,14 @@ async def _dismiss_blockers(serial, nodes, traj=None) -> bool:
         if traj:
             traj.log("permission_deny", message=(node_text(msg)[:60] if msg else ""), on=_label(deny))
         print(f"  [permission] {node_text(msg) if msg else 'prompt'} -> Don't allow")
-        await tap(serial, _center(deny), "Don't allow (permission)", human=False)
+        await tap(serial, _jxy(deny), "Don't allow (permission)", human=False)
         return True
     nux = _by_rid(nodes, "clips_download_privacy_nux_button")
     if nux:
         if traj:
             traj.log("nux_dismiss", on="clips_download_privacy_nux/Continue")
         print("  [nux] download-privacy -> Continue")
-        await tap(serial, _center(nux), "download-privacy NUX (Continue)", human=False)
+        await tap(serial, _jxy(nux), "download-privacy NUX (Continue)", human=False)
         return True
     # IG design-system headline interstitial, e.g. "Trial reels need more time to
     # get views" (shows on the trials list during capture) -> primary action
@@ -284,8 +497,20 @@ async def _dismiss_blockers(serial, nodes, traj=None) -> bool:
         if traj:
             traj.log("interstitial_dismiss", headline=(node_text(head)[:60] if head else ""), on=_label(hl))
         print(f"  [interstitial] {node_text(head) if head else 'igds headline'} -> {_label(hl)}")
-        await tap(serial, _center(hl), "igds headline primary action", human=False)
+        await tap(serial, _jxy(hl), "igds headline primary action", human=False)
         return True
+    # Soft "We suspect automated behavior on your account…" notice (NOT a real block /
+    # checkpoint — it carries a plain Dismiss and lets you keep going). Tapping Dismiss
+    # clears it so navigation proceeds instead of stalling on an unknown screen.
+    warn = _by_text(nodes, "suspect automated behavior") or _by_text(nodes, "automated behavior on your account")
+    if warn:
+        dismiss = _by_text(nodes, "Dismiss", exact=True) or _by_text(nodes, "Dismiss")
+        if dismiss:
+            if traj:
+                traj.log("warn_dismiss", note="automated-behavior notice", on="Dismiss")
+            print("  [warn] 'automated behavior' notice -> Dismiss")
+            await tap(serial, _jxy(dismiss), "automated-behavior warn (Dismiss)", human=False)
+            return True
     return False
 
 
@@ -320,6 +545,10 @@ async def _navigate(serial, traj, *, step, find, target, tries=4, human=True):
     attempt = 0
     while attempt < tries:
         nodes = await read_ui(serial)
+        hs = _hard_stop_reason(nodes)
+        if hs:
+            traj.deviation(f"hard_stop/{step}", nodes, note=f"{hs[0]}: {hs[1]}")
+            raise HardStop(*hs)
         cur = detect_screen(nodes)
         if target(nodes):
             traj.log("step_ok", step=step, attempt=attempt, screen=cur)
@@ -334,7 +563,7 @@ async def _navigate(serial, traj, *, step, find, target, tries=4, human=True):
             continue
         xy = _center(el)
         traj.log("step_tap", step=step, attempt=attempt, screen=cur, xy=list(xy) if xy else None, on=_label(el))
-        await tap(serial, xy, step, human=human)
+        await tap(serial, _jxy(el), step, human=human)
         attempt += 1
     nodes = await read_ui(serial)
     if target(nodes):
@@ -359,7 +588,7 @@ async def _reach_trials_list(serial, traj, *, human=True, tries=6):
             xy = _center(tr)
             traj.log("step_tap", step="trials_list", attempt=attempt, screen=detect_screen(nodes),
                      xy=list(xy) if xy else None, on="Trial reels")
-            await tap(serial, xy, "Trial reels", human=human)
+            await tap(serial, _jxy(tr), "Trial reels", human=human)
             nodes = await read_ui(serial)
             if _by_rid(nodes, "trials_list"):
                 traj.log("step_ok", step="trials_list", attempt=attempt, screen="trials_list")
@@ -373,25 +602,113 @@ async def _reach_trials_list(serial, traj, *, human=True, tries=6):
     return False, nodes
 
 
-async def _enter_caption(serial, caption):
+async def _caption_insert(serial, text, *, clear):
+    """Insert text into the focused field via the Portal keyboard content provider
+    (base64 -> shell-safe + emoji-safe). clear=True replaces the field content."""
+    b64 = base64.b64encode(text.encode("utf-8")).decode()
+    await shell(
+        serial,
+        f'content insert --uri "content://com.mobilerun.portal/keyboard/input" '
+        f'--bind base64_text:s:"{b64}" --bind clear:s:"{"true" if clear else "false"}"',
+        timeout=20,
+    )
+
+
+def _grapheme_clusters(s):
+    """Split a string into user-perceived characters (grapheme clusters) so EMOJI
+    are never broken apart: flags (two regional indicators), ZWJ sequences
+    (e.g. family / profession emoji), skin-tone modifiers, variation selectors,
+    keycaps, and combining marks each stay as ONE unit. Without this, iterating
+    code points would split e.g. the Curacao flag into two letter-boxes."""
+    def is_ri(c):
+        return 0x1F1E6 <= ord(c) <= 0x1F1FF
+    def is_ext(c):
+        o = ord(c)
+        return (c in ("️", "︎", "⃣")    # VS16/VS15, combining keycap
+                or 0x1F3FB <= o <= 0x1F3FF             # skin-tone modifiers
+                or 0x0300 <= o <= 0x036F               # combining diacritics
+                or 0xE0020 <= o <= 0xE007F)            # tag chars (subdivision flags)
+    out, i, n = [], 0, len(s)
+    while i < n:
+        cl = s[i]
+        i += 1
+        if is_ri(cl) and i < n and is_ri(s[i]):        # regional-indicator flag = 2 RIs
+            cl += s[i]
+            i += 1
+        while i < n:                                   # absorb extenders + ZWJ-joined runs
+            if is_ext(s[i]):
+                cl += s[i]
+                i += 1
+            elif s[i] == "‍" and i + 1 < n:       # ZWJ joins the following glyph
+                cl += s[i] + s[i + 1]
+                i += 2
+            else:
+                break
+        out.append(cl)
+    return out
+
+
+async def _type_caption_humanized(serial, caption, traj=None):
+    """Type the caption ONE GRAPHEME AT A TIME (emoji-safe) with a human cadence:
+    a per-run base delay in [CHAR_MIN, CHAR_MAX] (this typist's speed), plus
+    +/- CHAR_JITTER per keystroke. The first unit clears the field; the rest
+    append. Each emoji is inserted whole, so it can never be dropped or split."""
+    units = _grapheme_clusters(caption)
+    base = random.uniform(CHAR_MIN, CHAR_MAX)
+    emoji = sum(1 for u in units if any(ord(c) > 0x2100 for c in u))
+    if traj:
+        traj.log("type_per_char", units=len(units), chars=len(caption),
+                 emoji=emoji, base_ms=round(base * 1000))
+    print(f"  typing {len(units)} graphemes ({emoji} emoji) per-unit "
+          f"(base {base * 1000:.0f}ms +/-{CHAR_JITTER * 1000:.0f}ms)")
+    for i, u in enumerate(units):
+        await _caption_insert(serial, u, clear=(i == 0))
+        await asyncio.sleep(max(0.03, base + random.uniform(-CHAR_JITTER, CHAR_JITTER)))
+
+
+def _full_caption_landed(txt, caption) -> bool:
+    """True only if the WHOLE caption is present (guards against a partial type)."""
+    if not txt or "write a caption" in txt.lower():
+        return False
+    cap = caption.strip()
+    tail = cap[-12:].strip()
+    return (bool(tail) and tail in txt) or len(txt) >= len(cap) - 2
+
+
+async def _enter_caption(serial, caption, traj=None):
     nodes = await read_ui(serial)
     fld = _by_rid(nodes, "caption_input_text_view")
     if not fld:
         return False, "caption field not found"
-    await tap(serial, _center(fld), "caption field (focus)")
-    b64 = base64.b64encode(caption.encode("utf-8")).decode()
-    await shell(
-        serial,
-        f'content insert --uri "content://com.mobilerun.portal/keyboard/input" '
-        f'--bind base64_text:s:"{b64}" --bind clear:s:"false"',
-        timeout=20,
-    )
-    await asyncio.sleep(1.5)
+    await tap(serial, _jxy(fld), "caption field (focus)")
+
+    if HUMANIZE:
+        await _type_caption_humanized(serial, caption, traj)
+    else:
+        await _caption_insert(serial, caption, clear=False)
+    await asyncio.sleep(1.2)
+
     nodes = await read_ui(serial)
     fld = _by_rid(nodes, "caption_input_text_view")
     txt = node_text(fld) if fld else ""
-    landed = bool(txt) and "write a caption" not in txt.lower()
-    return landed, (txt[:40] if txt else "(empty)")
+    landed = _full_caption_landed(txt, caption)
+
+    # Correctness guarantee (the hard rule): a real publish must carry the EXACT
+    # caption. If per-char typing did not land the whole thing (dropped keystroke,
+    # or the a11y text is truncated so we cannot confirm), replace it in one shot
+    # with the full caption and accept on a non-placeholder field.
+    if not landed:
+        if traj:
+            traj.log("caption_fallback_oneshot", field_len=len(txt), want_len=len(caption))
+        print(f"  [caption] per-char incomplete (field {len(txt)} vs {len(caption)}) -> one-shot insert")
+        await _caption_insert(serial, caption, clear=True)
+        await asyncio.sleep(1.2)
+        nodes = await read_ui(serial)
+        fld = _by_rid(nodes, "caption_input_text_view")
+        txt = node_text(fld) if fld else ""
+        landed = bool(txt) and "write a caption" not in txt.lower()
+
+    return landed, (f"{len(txt)}ch: {txt[:36]}" if txt else "(empty)")
 
 
 async def _ensure_adb_keyboard(serial, traj=None):
@@ -438,6 +755,189 @@ def _fail(traj, stage, detail=""):
     return {"ok": False, "stage": stage, "detail": detail, "traj": traj.dir, "deviations": traj.deviations}
 
 
+class TrialUnavailable(Exception):
+    """Raised when NEITHER known path to a trial reel is available on this account
+    (no dashboard 'Trial reels' AND no 'Trial' toggle in the reel composer). The
+    device should STOP posting -- the account simply can't make trial reels."""
+    def __init__(self, detail: str = ""):
+        self.detail = detail or "trial reels not enabled"
+        super().__init__(self.detail)
+
+
+# --- alt path helpers: the reel composer's Audience/Trial toggle -----------------
+def _row_subtitle(nodes, title_text):
+    """The inline_subtitle on the same row as a given title (e.g. Audience->Trial)."""
+    t = _by_text(nodes, title_text, exact=True)
+    if not t:
+        return None
+    ty = (parse_bounds(t["bounds"]) or [0, 0, 0, 0])[1]
+    for n in nodes:
+        if node_resource_id(n).endswith("/inline_subtitle"):
+            b = parse_bounds(n.get("bounds"))
+            if b and abs(b[1] - ty) < 60:
+                return node_text(n).strip()
+    return None
+
+
+def _trial_audience_on(nodes) -> bool:
+    """True once the composer's Audience row reads 'Trial' (toggle confirmed on)."""
+    return (_row_subtitle(nodes, "Audience") or "").lower() == "trial"
+
+
+def _trial_toggle_node(nodes):
+    """The 'Trial' ToggleButton: rid endswith /toggle on the same row as title 'Trial'."""
+    t = _by_text(nodes, "Trial", exact=True)
+    if not t:
+        return None
+    ty = (parse_bounds(t["bounds"]) or [0, 0, 0, 0])[1]
+    for n in nodes:
+        if node_resource_id(n).endswith("/toggle") and parse_bounds(n.get("bounds")):
+            if abs(parse_bounds(n["bounds"])[1] - ty) < 90:
+                return n
+    return None
+
+
+async def _enable_trial_toggle(serial, traj) -> bool:
+    """Scroll the reel composer to the Audience/Trial row and ENABLE the Trial
+    toggle. Tapping it opens a one-time info sheet -> dismiss with 'Close'. Returns
+    True once the Audience row reads 'Trial'; False if there is NO Trial toggle
+    (account ineligible) so the caller can stop."""
+    for _ in range(6):
+        nodes = await read_ui(serial)
+        if _trial_audience_on(nodes):
+            return True
+        tg = _trial_toggle_node(nodes)
+        if tg:
+            await tap(serial, _jxy(tg), "Trial toggle", human=False)
+            await asyncio.sleep(1.2)
+            nodes = await read_ui(serial)
+            close = (_by_rid(nodes, "bb_primary_action_container")
+                     or _by_text(nodes, "Close", exact=True))
+            if close:
+                traj.log("trial_info_sheet_close")
+                await tap(serial, _jxy(close), "Close trial info", human=False)
+                await asyncio.sleep(1.0)
+                nodes = await read_ui(serial)
+            return _trial_audience_on(nodes)
+        await _swipe_up(serial)               # toggle is below the fold -> scroll down
+    return False
+
+
+async def _alt_share(serial, traj) -> None:
+    """Share from the create-reel composer: its button is labelled 'Next' and leads
+    to an 'About Reels' sheet whose 'Share' actually publishes."""
+    for attempt in range(6):
+        nodes = await read_ui(serial)
+        if _by_rid(nodes, "trials_list") or _by_text(nodes, "Your reel was shared"):
+            return
+        nux = _by_rid(nodes, "clips_nux_sheet_share_button")
+        if nux:
+            traj.log("alt_share", step="about_reels_share", attempt=attempt)
+            await tap(serial, _jxy(nux), "About Reels -> Share", human=False)
+            await asyncio.sleep(2.5)
+            continue
+        sb = _by_rid(nodes, "share_button")
+        if sb:
+            traj.log("alt_share", step="composer_next", attempt=attempt)
+            await tap(serial, _jxy(sb), "composer Next", human=False)
+            await asyncio.sleep(2.5)
+            continue
+        return
+
+
+async def _publish_via_create_reel(serial, caption, traj, *, no_share=False) -> dict:
+    """FALLBACK trial path (used when Path A's dashboard 'Trial reels' is absent):
+    Profile -> '+' (Create New) -> 'Create new reel' -> gallery -> editor -> composer
+    -> caption -> ENABLE the Trial toggle (this is what makes it a trial reel AND the
+    eligibility test) -> Share. Raises TrialUnavailable if the composer has no Trial
+    toggle (the account simply can't make trial reels)."""
+    traj.log("altpath_start")
+    # Path A may have left us deep (e.g. on the Professional dashboard). Reset to a
+    # clean IG state so the profile + "Create New" (+) are reliably reachable; the
+    # gallery video persists across this (it lives in the device gallery, not IG).
+    await _open_clean(serial, traj)
+    await _navigate(
+        serial, traj, step="alt/profile",
+        find=lambda ns: _by_text(ns, "Profile", min_y=1550),
+        target=lambda ns: bool(_by_text(ns, "Create New") or _by_rid(ns, "profile_tab_layout")),
+        human=False)
+
+    nodes = await read_ui(serial)
+    cn = _by_text(nodes, "Create New", exact=True) or _by_text(nodes, "Create New")
+    if not cn:
+        traj.deviation("alt/create_new", nodes, note="no 'Create New' (+) on profile")
+        raise TrialUnavailable("no create-new button on profile")
+    traj.log("step_tap", step="alt/create_new", on="Create New")
+    await tap(serial, _jxy(cn), "Create New (+)", human=False)
+
+    ok, _ = await _navigate(
+        serial, traj, step="alt/create_reel",
+        find=lambda ns: _by_text(ns, "Create new reel"),
+        target=lambda ns: bool(_first_gallery_thumb(ns) or _by_rid(ns, "gallery_recycler_view")
+                               or _by_text(ns, "Start new video")),
+        tries=5, human=False)
+    nodes = await read_ui(serial)
+    snv = _by_text(ns := nodes, "Start new video")
+    if snv:                                            # leftover draft prompt
+        traj.log("step_tap", step="alt/start_new_video", on="Start new video")
+        await tap(serial, _jxy(snv), "Start new video", human=False)
+        await asyncio.sleep(2.0)
+
+    ok, _ = await _navigate(
+        serial, traj, step="alt/gallery", find=lambda ns: None,
+        target=lambda ns: bool(_first_gallery_thumb(ns)), tries=5, human=False)
+    await _select_videos_folder(serial, traj)            # Videos-only -> no stray photo
+    nodes = await read_ui(serial)
+    thumb = _first_gallery_thumb(nodes)
+    if not thumb:
+        traj.deviation("alt/pick_video", nodes, note="no gallery thumbnail (alt)")
+        return _fail(traj, "alt/pick_video")
+    traj.log("step_tap", step="alt/pick_video", on=_label(thumb))
+    await tap(serial, _jxy(thumb), "newest video (alt)", human=False)
+
+    ok, _ = await _navigate(
+        serial, traj, step="alt/next_editor",
+        find=lambda ns: (_by_rid(ns, "clips_right_action_button")
+                         or _by_rid(ns, "drawer_next_button_layout")
+                         or _by_text(ns, "Next", exact=True)),
+        target=lambda ns: bool(_by_rid(ns, "caption_input_text_view")), tries=6, human=False)
+    if not ok:
+        return _fail(traj, "alt/composer")
+
+    landed, capinfo = await _enter_caption(serial, caption, traj)
+    traj.log("alt_caption", landed=landed, info=capinfo)
+    if not landed:
+        traj.deviation("alt/caption", await read_ui(serial), note=f"caption did not land: {capinfo}")
+        return _fail(traj, "alt/caption", detail=capinfo)
+    await _hide_ime(serial)
+
+    trial_on = await _enable_trial_toggle(serial, traj)
+    traj.log("alt_trial_toggle", on=trial_on)
+    if not trial_on:
+        traj.deviation("alt/trial_toggle", await read_ui(serial),
+                       note="composer has no Trial toggle -> trial reels not enabled")
+        raise TrialUnavailable("composer has no Trial toggle")
+
+    if no_share:
+        traj.log("alt_dry_run_stop")
+        print("  [dry-run] alt path: caption + Trial toggle on; STOPPING before Share")
+        return {"ok": True, "stage": "alt-dry-run", "detail": "trial enabled; stopped before Share",
+                "traj": traj.dir, "deviations": traj.deviations}
+
+    await _hide_ime(serial)
+    await _alt_share(serial, traj)
+    nodes = await read_ui(serial)
+    published = bool(_by_rid(nodes, "trials_list") or _by_text(nodes, "Your reel was shared")
+                     or not (_by_rid(nodes, "share_button") or _by_rid(nodes, "caption_input_text_view")
+                             or _by_rid(nodes, "clips_nux_sheet_share_button")))
+    traj.log("alt_publish_result", ok=published, screen=detect_screen(nodes))
+    if not published:
+        traj.deviation("alt/share", nodes, note="alt Share did not register")
+        return _fail(traj, "alt/share")
+    return {"ok": True, "stage": "alt-share", "detail": "trial reel shared via create-reel path",
+            "traj": traj.dir, "deviations": traj.deviations}
+
+
 # ---------------------------------------------------------------------------
 # PUBLISH (Path A, instrumented)
 # ---------------------------------------------------------------------------
@@ -447,13 +947,18 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
     await _open_clean(serial, traj)
     await _ensure_adb_keyboard(serial, traj)  # overlay-less IME so Share isn't covered
 
+    # Path A: Profile -> Professional dashboard -> 'Trial reels' -> Create trial reel.
+    # If ANY step to the trial-reels list fails, the dashboard route isn't available
+    # on this account -> fall back to the create-reel + Trial-toggle path (which also
+    # decides, via the toggle's presence, whether trial reels are enabled at all).
     ok, _ = await _navigate(
         serial, traj, step="profile",
         find=lambda ns: _by_text(ns, "Profile", min_y=1550),
         target=lambda ns: bool(_by_text(ns, "Professional dashboard") or _by_rid(ns, "trials_list")),
     )
     if not ok:
-        return _fail(traj, "profile")
+        traj.log("pathA_unavailable", at="profile")
+        return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
 
     ok, _ = await _navigate(
         serial, traj, step="professional_dashboard",
@@ -461,11 +966,13 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
         target=lambda ns: bool(_by_text(ns, "Your tools") or _by_rid(ns, "trials_list")),
     )
     if not ok:
-        return _fail(traj, "professional_dashboard")
+        traj.log("pathA_unavailable", at="professional_dashboard")
+        return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
 
     ok, _ = await _reach_trials_list(serial, traj)
     if not ok:
-        return _fail(traj, "trials_list")
+        traj.log("pathA_unavailable", at="trials_list")
+        return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
 
     ok, _ = await _navigate(
         serial, traj, step="create_trial_reel",
@@ -479,14 +986,16 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
     if not ok:
         return _fail(traj, "gallery")
 
-    # pick newest gallery video (top-left tile)
+    # filter to Videos (Path A's "Create trial reel" gallery is mixed images+videos, so
+    # a stray screenshot can sort first), then pick the newest video tile.
+    await _select_videos_folder(serial, traj)
     nodes = await read_ui(serial)
     thumb = _first_gallery_thumb(nodes)
     if not thumb:
         traj.deviation("pick_video", nodes, note="no gallery thumbnail")
         return _fail(traj, "pick_video")
     traj.log("step_tap", step="pick_video", xy=list(_center(thumb)), on=_label(thumb))
-    await tap(serial, _center(thumb), "newest video")
+    await tap(serial, _jxy(thumb), "newest video")
 
     ok, _ = await _navigate(
         serial, traj, step="next_editor",
@@ -499,8 +1008,8 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
     if not ok:
         return _fail(traj, "composer")
 
-    # caption (real text, pasted whole via Portal keyboard)
-    landed, capinfo = await _enter_caption(serial, caption)
+    # caption (real text; per-char humanized typing, one-shot fallback for safety)
+    landed, capinfo = await _enter_caption(serial, caption, traj)
     traj.log("caption", landed=landed, info=capinfo)
     print(f"  caption landed={landed} ({capinfo})")
     if not landed:
@@ -534,7 +1043,7 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
         if not sb:
             break
         traj.log("step_tap", step="share", attempt=attempt, screen=detect_screen(nodes), xy=list(_center(sb)))
-        await tap(serial, _center(sb), "Share")
+        await tap(serial, _jxy(sb), "Share")
 
     nodes = await read_ui(serial)
     published = bool(_by_rid(nodes, "trials_list")
@@ -571,7 +1080,7 @@ async def _copy_link_from_trials_list(serial, traj) -> str | None:
         return None
     tb = parse_bounds(tl["bounds"])
     col_w = (tb[2] - tb[0]) // 3
-    await tap(serial, (tb[0] + col_w // 2, tb[1] + col_w // 2), "newest trial tile", human=False)
+    await tap(serial, _jxy((tb[0] + col_w // 2, tb[1] + col_w // 2)), "newest trial tile", human=False)
 
     opened = False
     for _ in range(4):
@@ -580,15 +1089,15 @@ async def _copy_link_from_trials_list(serial, traj) -> str | None:
             opened = True
             break
         sb = _by_rid(nodes, "direct_share_button") or _by_rid(nodes, "share_button")
-        await tap(serial, _center(sb), "Share (tile)", human=False)
+        await tap(serial, _jxy(sb), "Share (tile)", human=False)
     if not opened:
         traj.deviation("capture/share_sheet", await read_ui(serial), note="share sheet did not open")
         return None
 
     nodes = await read_ui(serial)
-    await tap(serial, _center(_by_text(nodes, "Copy link")), "Copy link", human=False)
+    await tap(serial, _jxy(_by_text(nodes, "Copy link")), "Copy link", human=False)
     nodes = await read_ui(serial)
-    await tap(serial, _center(_by_rid(nodes, "search_edit_text")), "search box (focus)", human=False)
+    await tap(serial, _jxy(_by_rid(nodes, "search_edit_text")), "search box (focus)", human=False)
     await shell(serial, "input keyevent 279", timeout=10)
     await asyncio.sleep(0.8)
     nodes = await read_ui(serial)
@@ -669,7 +1178,11 @@ async def main():
     no_share = "--no-share" in sys.argv
     serial = args[0]
     caption = args[1] if len(args) > 1 else "(no caption)"
-    res = await publish(serial, caption, no_share=no_share)
+    try:
+        res = await publish(serial, caption, no_share=no_share)
+    except HardStop as e:
+        print(f"\n[HARD STOP] {serial}: {e.reason} ({e.marker}) — run stopped for this device")
+        return 4
     print("\nRESULT:", res)
     if not res.get("ok"):
         await _dump_screen(serial)
