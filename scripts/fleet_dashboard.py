@@ -45,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.runner import fleet_events  # noqa: E402
+from src.runner import s3_sync  # noqa: E402
 from scripts import proxy_manager, proxy_vn  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,16 @@ FLEET_LOG = ROOT / "post_fleet.log"
 HOST = os.environ.get("FLEET_DASH_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FLEET_DASH_PORT", "8765"))
 LOG_TAIL_LINES = int(os.environ.get("FLEET_DASH_LOG_LINES", "40"))
+
+# S3 -> fffbt.videos sync (insert-only). A background daemon started in main()
+# pulls new objects from the Ferma bucket into the DB every S3_SYNC_INTERVAL.
+S3_SYNC = os.environ.get("S3_SYNC", "1").strip().lower() not in ("0", "false", "no", "")
+S3_SYNC_INTERVAL = int(os.environ.get("S3_SYNC_INTERVAL", "300"))   # 5 minutes
+_s3_sync_lock = threading.Lock()
+_s3_sync_state: dict = {
+    "last_run": None, "last_ok": None, "last_error": None,
+    "last_inserted": 0, "inserted_total": 0, "runs": 0, "running": False,
+}
 
 POSTED_VERDICTS = {"SUCCESS", "PUBLISHED_UNCONFIRMED"}
 FAIL_VERDICTS = {"FAILED", "ERROR"}
@@ -419,6 +430,7 @@ def build_state() -> dict:
         "feed": list(reversed(feed)),
         "fleet_log": _tail(FLEET_LOG, 30),
         "backlog": _db_counts(),
+        "s3_sync": _s3_sync_view(),
     }
 
 
@@ -1041,11 +1053,60 @@ def _proxy_autorenew_loop() -> None:
         time.sleep(PROXY_RENEW_INTERVAL)
 
 
+def _s3_sync_loop() -> None:
+    """Background daemon: pull new S3 objects into fffbt.videos every
+    S3_SYNC_INTERVAL. Insert-only — deletions in S3 never touch the DB."""
+    time.sleep(10)                                     # let the dashboard settle first
+    while True:
+        with _s3_sync_lock:
+            _s3_sync_state["running"] = True
+        try:
+            res = s3_sync.sync_once()
+            now = time.time()
+            with _s3_sync_lock:
+                _s3_sync_state.update(
+                    last_run=now, last_ok=now, last_error=None,
+                    last_inserted=res.inserted,
+                    inserted_total=_s3_sync_state["inserted_total"] + res.inserted,
+                    runs=_s3_sync_state["runs"] + 1, running=False,
+                )
+            print(f"[s3-sync] +{res.inserted} new ({res.skipped} existing, "
+                  f"{res.folders} folders, {res.folders_skipped} no-meta)", flush=True)
+        except Exception as e:
+            with _s3_sync_lock:
+                _s3_sync_state.update(last_run=time.time(), last_error=str(e), running=False)
+            print(f"[s3-sync] error: {e}", flush=True)
+        time.sleep(S3_SYNC_INTERVAL)
+
+
+def _s3_sync_view() -> dict:
+    """Sync status for the dashboard: online flag + age since last success."""
+    with _s3_sync_lock:
+        s = dict(_s3_sync_state)
+    last_ok = s["last_ok"]
+    age = (time.time() - last_ok) if last_ok else None
+    # "online" = a successful pass within the last ~2 intervals (tolerates one miss).
+    online = age is not None and age < S3_SYNC_INTERVAL * 2 + 60
+    return {
+        "enabled": S3_SYNC,
+        "online": online,
+        "age_sec": int(age) if age is not None else None,
+        "interval_sec": S3_SYNC_INTERVAL,
+        "running": s["running"],
+        "last_error": s["last_error"],
+        "last_inserted": s["last_inserted"],
+        "inserted_total": s["inserted_total"],
+        "runs": s["runs"],
+    }
+
+
 def main() -> int:
     _load_env()
     _load_tasks()
     if PROXY_AUTORENEW:
         threading.Thread(target=_proxy_autorenew_loop, daemon=True).start()
+    if S3_SYNC:
+        threading.Thread(target=_s3_sync_loop, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
     print(f"fleet dashboard on {url}  (events={fleet_events._DEFAULT_PATH})", flush=True)
@@ -1248,6 +1309,7 @@ INDEX_HTML = r"""<!doctype html>
   </span>
   <span id="fleetState" class="pill">…</span>
   <span class="grow"></span>
+  <span class="muted" id="s3sync" title="S3 → fffbt.videos sync"></span>
   <span class="muted" id="clock"></span>
   <span class="muted" id="refresh">⟳</span>
 </header>
@@ -1782,6 +1844,19 @@ async function refresh(){
          ? `<span class="dot" style="background:var(--accent)"></span>running · ${f.devices_active}/${f.devices_total} active`
          : '<span class="dot" style="background:var(--warn)"></span>idle');
     $('#clock').textContent='session since '+(f.session_start? f.session_start.replace('T',' ').replace('Z','') : '—');
+    const sy=d.s3_sync;
+    if(sy && sy.enabled){
+      if(sy.last_error){
+        $('#s3sync').innerHTML='<span class="dot" style="background:var(--bad)"></span>S3 sync error';
+        $('#s3sync').title='S3 → fffbt.videos sync error: '+sy.last_error;
+      }else{
+        const color = sy.online ? 'var(--accent)' : 'var(--warn)';
+        const age = (sy.age_sec==null) ? 'no sync yet' : 'synced '+fmtDur(sy.age_sec)+' ago';
+        $('#s3sync').innerHTML='<span class="dot" style="background:'+color+'"></span>S3 sync · '+age;
+        $('#s3sync').title=`S3 → fffbt.videos · ${sy.online?'online':'stale'} · `
+          +`${sy.runs} runs · +${sy.inserted_total} rows total`;
+      }
+    }else{ $('#s3sync').textContent=''; }
     renderCards(d); renderStages(d); renderDevs(d); renderPosts(d); renderFeed(d);
     $('#refresh').textContent='⟳ '+new Date().toLocaleTimeString();
   }catch(e){ $('#fleetState').textContent='fetch failed'; }
