@@ -347,6 +347,15 @@ class HardStop(Exception):
         super().__init__(f"{reason}: {marker}")
 
 
+class TrialLimit(Exception):
+    """IG's "You've reached the limit — you've shared the maximum number of trial
+    reels allowed" interstitial. The account is trial-rate-limited (not blocked);
+    we tap OK and take the device out of the posting loop."""
+    def __init__(self, headline: str = ""):
+        self.headline = headline
+        super().__init__(headline or "trial reels limit reached")
+
+
 CHALLENGE_MARKERS = (
     "confirm you're human", "confirm you’re human", "confirm it's you", "confirm it’s you",
     "confirm your identity", "help us confirm", "verify it's you", "verify it’s you",
@@ -494,6 +503,20 @@ async def _dismiss_blockers(serial, nodes, traj=None) -> bool:
     hl = _by_rid(nodes, "igds_headline_primary_action_button")
     if hl:
         head = _by_rid(nodes, "igds_headline_headline")
+        body = _by_rid(nodes, "igds_headline_body")
+        htext = (node_text(head) if head else "").lower()
+        btext = (node_text(body) if body else "").lower()
+        # "You've reached the limit -- you've shared the maximum number of trial
+        # reels allowed". A trial-reels RATE LIMIT (not a block): tap OK to clear
+        # it, then raise so the device leaves the posting loop.
+        is_limit = ("reached the limit" in htext or "maximum number of trial reels" in btext
+                    or ("trial reels" in btext and "limit" in (htext + btext)))
+        if is_limit:
+            if traj:
+                traj.log("trial_limit", headline=node_text(head)[:80] if head else "", on=_label(hl))
+            print(f"  [trial-limit] {node_text(head) if head else 'limit reached'} -> OK, stopping device")
+            await tap(serial, _jxy(hl), "trial-limit OK", human=False)
+            raise TrialLimit(node_text(head) if head else "")
         if traj:
             traj.log("interstitial_dismiss", headline=(node_text(head)[:60] if head else ""), on=_label(hl))
         print(f"  [interstitial] {node_text(head) if head else 'igds headline'} -> {_label(hl)}")

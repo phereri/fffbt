@@ -39,7 +39,7 @@ from scripts.post_trial import (
 from scripts.download_gate import DownloadGate
 from scripts.router_proxy import check_proxy, serial_to_ip
 from scripts.publish_trial import (
-    HardStop, Traj, TrialUnavailable, _hard_stop_reason, _open_clean, a11y_ok,
+    HardStop, Traj, TrialLimit, TrialUnavailable, _hard_stop_reason, _open_clean, a11y_ok,
     capture_link, publish, read_ui, recover_accessibility,
 )
 from src.runner import fleet_events
@@ -343,6 +343,24 @@ async def _drive(args: argparse.Namespace) -> int:
                           verdict="TRIAL_UNAVAILABLE", rc=6, success=False, published=False,
                           code="trial_unavailable", error=e.detail)
         return 6
+
+    except TrialLimit as e:
+        # IG trial-reels rate limit reached ("You've reached the limit"). OK was
+        # already tapped; the video was NOT posted -> release it for a healthy
+        # account, and STOP this device (it can't post more trial reels for now).
+        try:
+            set_status(vid, STATUS_NEW)
+        except Exception:
+            pass
+        try:
+            traj.log("trial_limit", headline=e.headline)
+        except Exception:
+            pass
+        print(f"[TRIAL_LIMIT] {device} {account}: {e.headline or 'limit reached'} -> stopping device; traj={traj.dir}")
+        fleet_events.emit("result", account=account, device=device, video_id=vid, name=name,
+                          verdict="TRIAL_LIMIT", rc=8, success=False, published=False,
+                          code="trial_limit", error=e.headline)
+        return 8
 
     except Exception as e:
         try:

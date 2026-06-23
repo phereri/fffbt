@@ -193,6 +193,9 @@ async def _run_device(device: str, ns: argparse.Namespace, delay: float) -> tupl
         elif rc == 6:                         # trial reels not enabled on this account
             print(f"[{device}] TRIAL_UNAVAILABLE (trial reels not enabled) — stopping device")
             break
+        elif rc == 8:                         # IG trial-reels rate limit reached
+            print(f"[{device}] TRIAL_LIMIT (max trial reels reached) — stopping device")
+            break
         elif rc == 7:                         # proxy down / no connectivity
             print(f"[{device}] PROXY_DOWN (proxy not working) — stopping device")
             break
@@ -238,7 +241,7 @@ async def _main_async(ns: argparse.Namespace) -> int:
         device, rc = r
         verdict = {0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS",
                    4: "BLOCKED (login challenge)", 5: "A11Y_DOWN",
-                   6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN"}.get(rc, "FAILED")
+                   6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT"}.get(rc, "FAILED")
         print(f"  {device:24} rc={rc}  {verdict}")
         worst = max(worst, 0 if rc in (0, 3) else rc)
     return worst
