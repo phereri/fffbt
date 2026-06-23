@@ -255,8 +255,11 @@ async def _drive(args: argparse.Namespace) -> int:
             print("[FAIL] publish did not reach a published state -> rolled back to new")
             return 1
 
-        # published — flip to verify with published_at BEFORE the link wait
-        set_status(vid, STATUS_VERIFYING, published_at="now")
+        # published — flip to verify with published_at BEFORE the link wait. Record
+        # the EXACT caption we posted (posted_caption): it uniquely identifies this
+        # reel later (the base caption repeats across videos), so a future
+        # link recovery can match a reel to its row without guessing.
+        set_status(vid, STATUS_VERIFYING, published_at="now", posted_caption=caption)
         fleet_events.emit("published", account=account, device=device, video_id=vid, name=name)
         print("published -> status=verify")
 
