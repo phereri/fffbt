@@ -57,7 +57,7 @@ def _account_for(serial: str) -> str | None:
 
 
 async def _capture_link(device: str, traj: Traj, *, attempts: int, delay: int,
-                        reject: set | None = None) -> tuple[str | None, str | None]:
+                        reject: set | None = None, expect: str | None = None) -> tuple[str | None, str | None]:
     """Capture the live reel link via MULTIPLE routes, retrying (IG exposes the
     link after a beat). Returns (url, route_that_worked).
 
@@ -71,7 +71,7 @@ async def _capture_link(device: str, traj: Traj, *, attempts: int, delay: int,
     reject = reject or set()
     recovered = False
     for i in range(attempts):
-        url, route = await capture_link(device, traj, reject=reject)
+        url, route = await capture_link(device, traj, reject=reject, expect=expect)
         if url and "instagram.com/reel/" in url and url not in reject:
             return url, route
         # blind capture -> if a11y is down, recover once (post is live; never re-publish)
@@ -269,7 +269,8 @@ async def _drive(args: argparse.Namespace) -> int:
         fleet_events.emit("stage_start", account=account, device=device, stage="verify")
         t0 = time.monotonic()
         url, route = await _capture_link(device, traj, attempts=args.url_attempts,
-                                         delay=args.url_retry_delay, reject=known_links)
+                                         delay=args.url_retry_delay, reject=known_links,
+                                         expect=caption)
         verify_s = time.monotonic() - t0
         fleet_events.emit("stage_done", account=account, device=device, stage="verify",
                           seconds=round(verify_s, 1), ok=bool(url))
@@ -374,8 +375,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--order", choices=("asc", "desc"), default="asc",
                    help="claim oldest-first (asc) or newest-first (desc)")
     p.add_argument("--url-ttl", type=int, default=3600)
-    p.add_argument("--url-attempts", type=int, default=4)
-    p.add_argument("--url-retry-delay", type=int, default=30)
+    p.add_argument("--url-attempts", type=int, default=5)     # wait+retry up to 5x
+    p.add_argument("--url-retry-delay", type=int, default=30)  # 30s between attempts
     p.add_argument("--no-share", action="store_true",
                    help="dry-run: validate flow up to (not including) Share, release row")
     return p

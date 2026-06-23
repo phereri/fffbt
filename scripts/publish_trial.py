@@ -1075,8 +1075,54 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
 # ---------------------------------------------------------------------------
 # LINK CAPTURE (multi-route, instrumented)
 # ---------------------------------------------------------------------------
-async def _copy_link_once(serial, traj) -> str | None:
-    """Open the top-left ('newest') trial tile and copy its reel link, once."""
+def _caption_key(text: str) -> str:
+    """Normalise a caption to lowercase alphanumeric words so the comparison
+    survives curly apostrophes, emoji and UI truncation ('… more') rendering
+    differences between the posted text and the on-reel a11y text."""
+    t = (text or "").lower()
+    return " ".join("".join(c if (c.isalnum() or c == " ") else " " for c in t).split())
+
+
+def _caption_matches(reel_cap: str, expect: str):
+    """True/False if the on-reel caption is clearly the same/different post as the
+    one we posted; None when there isn't enough text to judge (don't block on it).
+    Compares a normalised prefix so a truncated on-reel caption still matches."""
+    a, b = _caption_key(reel_cap), _caption_key(expect)
+    if not a or not b:
+        return None
+    n = min(len(a), len(b), 30)
+    if n < 12:                       # too short to be a reliable fingerprint
+        return None
+    return a[:n] == b[:n]
+
+
+def _reel_caption(nodes) -> str:
+    """The caption text shown in the reel player (the real text lives in a child
+    of clips_caption_component, not on the component node itself)."""
+    comp = _by_rid(nodes, "clips_caption_component")
+    if not comp:
+        return ""
+    cb = parse_bounds(comp.get("bounds"))
+    if not cb:
+        return ""
+    best = ""
+    for n in nodes:
+        b = parse_bounds(n.get("bounds"))
+        if not b:
+            continue
+        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        if not (cb[0] - 5 <= cx <= cb[2] + 5 and cb[1] - 5 <= cy <= cb[3] + 5):
+            continue
+        t = node_text(n)
+        if t and t != "clips_caption_component" and len(t) > len(best):
+            best = t
+    return best
+
+
+async def _copy_link_once(serial, traj) -> tuple[str | None, str]:
+    """Open the top-left ('newest') trial tile and copy its reel link, once.
+    Returns (url, reel_caption) so the caller can confirm it's our just-posted
+    reel by caption."""
     nodes = await read_ui(serial)
     # an interstitial ("Trial reels need more time to get views") can cover the
     # list right after arrival — clear it before looking for the tile.
@@ -1092,22 +1138,31 @@ async def _copy_link_once(serial, traj) -> str | None:
     tl = _by_rid(nodes, "trials_list")
     if not tl:
         traj.deviation("capture/tile", nodes, note="trials_list missing for tile open")
-        return None
+        return None, ""
     tb = parse_bounds(tl["bounds"])
     col_w = (tb[2] - tb[0]) // 3
     await tap(serial, _jxy((tb[0] + col_w // 2, tb[1] + col_w // 2)), "newest trial tile", human=False)
+    await asyncio.sleep(1.2)
+
+    # read the caption in the reel player BEFORE opening the share sheet
+    nodes = await read_ui(serial)
+    caption = _reel_caption(nodes)
 
     opened = False
     for _ in range(4):
-        nodes = await read_ui(serial)
         if _by_text(nodes, "Copy link") or _by_rid(nodes, "search_edit_text"):
             opened = True
             break
         sb = _by_rid(nodes, "direct_share_button") or _by_rid(nodes, "share_button")
+        if not sb:
+            await asyncio.sleep(0.6)
+            nodes = await read_ui(serial)
+            continue
         await tap(serial, _jxy(sb), "Share (tile)", human=False)
+        nodes = await read_ui(serial)
     if not opened:
         traj.deviation("capture/share_sheet", await read_ui(serial), note="share sheet did not open")
-        return None
+        return None, caption
 
     nodes = await read_ui(serial)
     await tap(serial, _jxy(_by_text(nodes, "Copy link")), "Copy link", human=False)
@@ -1123,25 +1178,33 @@ async def _copy_link_once(serial, traj) -> str | None:
             url = _clean_reel_url(node_text(n))
             if url:
                 break
-    return url
+    return url, caption
 
 
-async def _copy_link_from_trials_list(serial, traj, reject=None) -> str | None:
-    """Copy the newest trial reel's link, REJECTING any link already known for
-    this account (``reject``). The just-posted reel can lag behind the top tile,
-    so a rejected (stale) link triggers a back-out + pull-to-refresh and retry —
-    we only return a genuinely NEW link, else None (better empty than a dup)."""
+async def _copy_link_from_trials_list(serial, traj, reject=None, expect=None) -> str | None:
+    """Copy the newest trial reel's link, but only ACCEPT it when it is genuinely
+    our just-posted reel: the link must be new (not in ``reject``) and, when
+    ``expect`` (the caption we posted) is given, the reel's on-screen caption must
+    match it. A stale/foreign reel (new post not surfaced yet) triggers a
+    pull-to-refresh and retry; if it still hasn't appeared we return None so the
+    caller can wait and re-navigate."""
     reject = reject or set()
-    for attempt in range(4):
-        url = await _copy_link_once(serial, traj)
-        if url and url not in reject:
+    for attempt in range(3):
+        url, caption = await _copy_link_once(serial, traj)
+        cap_ok = _caption_matches(caption, expect) if expect else None
+        is_new = bool(url and url not in reject)
+        if is_new and cap_ok is not False:
             if attempt:
-                traj.log("capture_new_after_refresh", url=url, attempt=attempt)
+                traj.log("capture_new_after_refresh", url=url, attempt=attempt, cap_ok=cap_ok)
             return url
         if url and url in reject:
             traj.log("capture_reject_known", url=url, attempt=attempt,
                      note="top tile is a previously-saved reel; refreshing")
             print(f"  [capture] top tile link already saved ({url}) -> refresh & retry")
+        elif cap_ok is False:
+            traj.log("capture_caption_mismatch", url=url, attempt=attempt,
+                     reel_cap=_caption_key(caption)[:50], note="top reel is not our post yet")
+            print("  [capture] top reel caption != our post -> not appeared yet, refresh & retry")
         else:
             traj.log("capture_no_url", attempt=attempt)
         # back out of the reel/share sheet to the list, then pull-to-refresh
@@ -1156,12 +1219,15 @@ async def _copy_link_from_trials_list(serial, traj, reject=None) -> str | None:
     return None
 
 
-async def capture_link(serial, traj: "Traj | None" = None, reject=None) -> tuple[str | None, str | None]:
+async def capture_link(serial, traj: "Traj | None" = None, reject=None,
+                       expect=None) -> tuple[str | None, str | None]:
     """Capture the newest Trial reel's public link via multiple routes.
     Returns (url, route) or (None, None). Each route logs its outcome. ``reject``
     is the set of links already saved for this account: a route that can only
     produce a rejected (stale) link is treated as a miss, so we never return a
-    link that would duplicate an existing post."""
+    link that would duplicate an existing post. ``expect`` is the caption we just
+    posted -- when given, the dashboard route only accepts a reel whose on-screen
+    caption matches it (positively identifying our just-posted reel)."""
     traj = traj or Traj(serial, tag="capture")
     reject = reject or set()
 
@@ -1184,7 +1250,7 @@ async def capture_link(serial, traj: "Traj | None" = None, reject=None) -> tuple
             )
             ok, _ = await _reach_trials_list(serial, traj, human=False)
             if ok:
-                url = await _copy_link_from_trials_list(serial, traj, reject=reject)
+                url = await _copy_link_from_trials_list(serial, traj, reject=reject, expect=expect)
                 if url and url not in reject:
                     traj.log("capture_route_ok", route="dashboard", url=url)
                     return url, "dashboard"
