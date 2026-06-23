@@ -64,6 +64,11 @@ CHAR_JITTER = float(os.environ.get("CHAR_JITTER", "0.020"))
 TRAJ_ROOT = os.path.join("trajectories", "scripted")
 
 
+# Set per run (in publish()/capture_link()) so tap() can record each humanized
+# inter-action delay into the active trajectory without threading traj everywhere.
+_active_traj = None
+
+
 def _action_delay() -> float:
     return random.uniform(ACTION_MIN, ACTION_MAX) if HUMANIZE else SETTLE
 
@@ -451,6 +456,11 @@ async def tap(serial, xy, label="", *, human=True):
     hold = random.randint(80, 180)                      # ms — human press duration
     await shell(serial, f"input touchscreen swipe {x} {y} {x2} {y2} {hold}", timeout=10)
     d = _action_delay() if human else SETTLE
+    if human and _active_traj is not None:               # record the inter-action wait
+        try:
+            _active_traj.log("action_delay", on=label, seconds=round(d, 2), humanized=HUMANIZE)
+        except Exception:
+            pass
     print(f"  tapped {label} at ({x},{y})" + (f"  (+{d:.1f}s)" if (human and HUMANIZE) else ""))
     await asyncio.sleep(d)
     return True
@@ -1108,7 +1118,9 @@ async def _publish_via_create_reel(serial, caption, traj, *, no_share=False) -> 
 # PUBLISH (Path A, instrumented)
 # ---------------------------------------------------------------------------
 async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "Traj | None" = None) -> dict:
+    global _active_traj
     traj = traj or Traj(serial, tag="publish")
+    _active_traj = traj
     traj.log("publish_start", caption_len=len(caption), humanize=HUMANIZE, no_share=no_share)
     await _open_clean(serial, traj)
     await _ensure_adb_keyboard(serial, traj)  # overlay-less IME so Share isn't covered
@@ -1365,7 +1377,9 @@ async def capture_link(serial, traj: "Traj | None" = None, reject=None,
     link that would duplicate an existing post. ``expect`` is the caption we just
     posted -- when given, the dashboard route only accepts a reel whose on-screen
     caption matches it (positively identifying our just-posted reel)."""
+    global _active_traj
     traj = traj or Traj(serial, tag="capture")
+    _active_traj = traj
     reject = reject or set()
 
     # Route 1 -- Professional dashboard -> Trial reels -> trials_list
