@@ -53,8 +53,8 @@ ADB_KEYBOARD = "com.genfarmer.uiautomator/.AdbKeyboard"
 _DENY_CURLY = "Don’t allow"
 
 HUMANIZE = os.environ.get("HUMANIZE", "1").strip().lower() not in ("0", "false", "no", "")
-ACTION_MIN = float(os.environ.get("ACTION_DELAY_MIN", "7"))
-ACTION_MAX = float(os.environ.get("ACTION_DELAY_MAX", "15"))
+ACTION_MIN = float(os.environ.get("ACTION_DELAY_MIN", "15"))
+ACTION_MAX = float(os.environ.get("ACTION_DELAY_MAX", "30"))
 # Per-character caption typing cadence (humanized): a per-run base delay chosen
 # once in [CHAR_MIN, CHAR_MAX] (this "typist's" speed) plus +/- CHAR_JITTER per
 # keystroke. Seconds.
@@ -448,7 +448,7 @@ async def tap(serial, xy, label="", *, human=True):
         return False
     x, y = int(xy[0]), int(xy[1])
     x2, y2 = x + int(round(random.gauss(0, 1.6))), y + int(round(random.gauss(0, 1.6)))
-    hold = random.randint(45, 120)                      # ms — human press duration
+    hold = random.randint(80, 180)                      # ms — human press duration
     await shell(serial, f"input touchscreen swipe {x} {y} {x2} {y2} {hold}", timeout=10)
     d = _action_delay() if human else SETTLE
     print(f"  tapped {label} at ({x},{y})" + (f"  (+{d:.1f}s)" if (human and HUMANIZE) else ""))
@@ -456,13 +456,24 @@ async def tap(serial, xy, label="", *, human=True):
     return True
 
 
+async def _smooth_swipe(serial, x1, y1, x2, y2, dur=None):
+    """A slow, finger-like scroll: a touchscreen gesture with a randomized longer
+    duration (~0.7-1.0s) and a few px of endpoint jitter, so it reads as a human
+    swipe rather than a fast synthetic flick."""
+    if dur is None:
+        dur = random.randint(700, 980)
+    def jx(v):
+        return v + int(round(random.gauss(0, 6)))
+    await shell(serial, f"input touchscreen swipe {jx(x1)} {y1} {jx(x2)} {y2} {dur}", timeout=10)
+
+
 async def _swipe_up(serial):
-    await shell(serial, "input swipe 540 1400 540 700 350", timeout=10)
+    await _smooth_swipe(serial, 540, 1400, 540, 700)
     await asyncio.sleep(SETTLE)
 
 
 async def _swipe_down(serial):
-    await shell(serial, "input swipe 540 700 540 1500 350", timeout=10)
+    await _smooth_swipe(serial, 540, 700, 540, 1500)
     await asyncio.sleep(2.0)
 
 
@@ -490,6 +501,35 @@ async def _dismiss_blockers(serial, nodes, traj=None) -> bool:
         print(f"  [permission] {node_text(msg) if msg else 'prompt'} -> Don't allow")
         await tap(serial, _jxy(deny), "Don't allow (permission)", human=False)
         return True
+    # App-level location-permission prompt (seen on .95/.190): IG shows a screen
+    # asking to use location with a "Continue" button; tapping it brings the
+    # SYSTEM grant dialog, which the deny block above answers "Don't allow" on the
+    # next read. Scope to a location-worded prompt so "Continue" can NEVER fire on
+    # a real target screen (and never on the rid-based download-privacy NUX).
+    if not _by_rid(nodes, "clips_download_privacy_nux_button"):
+        loc_cont = _by_text(nodes, "Continue", exact=True)
+        loc_sig = (_by_text(nodes, "your location") or _by_text(nodes, "location services")
+                   or _by_text(nodes, "access your location") or _by_text(nodes, "use your location")
+                   or _by_text(nodes, "your device’s location") or _by_text(nodes, "your device's location"))
+        if loc_cont and loc_sig:
+            if traj:
+                traj.log("location_continue", on=_label(loc_cont))
+            print("  [location] location prompt -> Continue (then Don't allow)")
+            await tap(serial, _jxy(loc_cont), "location prompt (Continue)", human=False)
+            return True
+    # Follow-up permission / education screen after the location flow -> "Skip".
+    # Gate on it NOT being a real posting screen so a legitimate step (composer,
+    # gallery, editor, share, trials list) can never be skipped by accident.
+    if not (_by_rid(nodes, "caption_input_text_view") or _by_rid(nodes, "gallery_recycler_view")
+            or _by_rid(nodes, "share_button") or _by_rid(nodes, "trials_list")
+            or _by_rid(nodes, "clips_right_action_button")):
+        skip = _by_text(nodes, "Skip", exact=True)
+        if skip:
+            if traj:
+                traj.log("permission_skip", on=_label(skip))
+            print("  [location] follow-up permission screen -> Skip")
+            await tap(serial, _jxy(skip), "permission (Skip)", human=False)
+            return True
     nux = _by_rid(nodes, "clips_download_privacy_nux_button")
     if nux:
         if traj:
@@ -637,6 +677,95 @@ async def _reach_trials_list(serial, traj, *, human=True, tries=6):
         return True, nodes
     traj.deviation("trials_list", nodes, note="Trial reels row not found / list not reached")
     return False, nodes
+
+
+def _on_best_practices(nodes) -> bool:
+    """True when the screen's action bar title is 'Best practices' (the dedicated
+    Best-practices screen, distinct from the dashboard which only links to it)."""
+    t = _by_rid(nodes, "action_bar_title")
+    return bool(t and "best practices" in node_text(t).lower())
+
+
+async def _reach_trials_list_via_best_practices(serial, traj, *, human=False) -> bool:
+    """Third path to the trials list (when the dashboard 'Trial reels' row route
+    fails): Profile -> Professional dashboard -> 'Best practices' -> 'Trial reels'
+    tab -> scroll to the 'Go to trial reels' button -> trials_list."""
+    traj.log("bp_path_start")
+    await _open_clean(serial, traj)
+    ok, _ = await _navigate(
+        serial, traj, step="bp/profile",
+        find=lambda ns: _by_text(ns, "Profile", min_y=1550),
+        target=lambda ns: bool(_by_text(ns, "Professional dashboard") or _by_rid(ns, "trials_list")),
+        human=human)
+    if not ok:
+        return False
+    ok, _ = await _navigate(
+        serial, traj, step="bp/dashboard",
+        find=lambda ns: _by_text(ns, "Professional dashboard"),
+        target=lambda ns: bool(_by_text(ns, "Your tools") or _by_text(ns, "Best practices")
+                               or _by_rid(ns, "trials_list")),
+        human=human)
+    if not ok:
+        return False
+    # Open the dedicated Best-practices screen (tap the 'Best practices' link on the
+    # dashboard; arrival = action bar title 'Best practices').
+    ok, _ = await _navigate(
+        serial, traj, step="bp/open",
+        find=lambda ns: _by_text(ns, "Best practices"),
+        target=lambda ns: _on_best_practices(ns) or bool(_by_text(ns, "Go to trial reels")),
+        human=human)
+    if not ok:
+        return False
+    # Switch to the 'Trial reels' best-practices tab if the button isn't already shown.
+    nodes = await read_ui(serial)
+    if not _by_text(nodes, "Go to trial reels"):
+        tab = _by_text(nodes, "Trial reels", exact=True) or _by_text(nodes, "Trial reels")
+        if tab:
+            traj.log("bp_trial_reels_tab", on=_label(tab))
+            await tap(serial, _jxy(tab), "Best Practices: Trial reels tab", human=human)
+            await asyncio.sleep(1.5)
+    # Scroll down to the 'Go to trial reels' button and tap it -> trials_list.
+    for attempt in range(8):
+        nodes = await read_ui(serial)
+        btn = _by_text(nodes, "Go to trial reels")
+        if btn:
+            traj.log("bp_go_to_trial_reels", attempt=attempt)
+            await tap(serial, _jxy(btn), "Go to trial reels", human=human)
+            await asyncio.sleep(1.6)
+            nodes = await read_ui(serial)
+            if _by_rid(nodes, "trials_list"):
+                traj.log("step_ok", step="bp/trials_list", screen="trials_list")
+                return True
+            return False
+        if await _dismiss_blockers(serial, nodes, traj):
+            continue
+        await _swipe_up(serial)
+    traj.deviation("bp/go_to_trial_reels", await read_ui(serial), note="'Go to trial reels' not found")
+    return False
+
+
+async def _reach_trials_list_any(serial, traj) -> bool:
+    """Reach the Trial-reels list trying the dashboard paths in order:
+      1) Profile -> Professional dashboard -> 'Trial reels' row;
+      2) Profile -> Professional dashboard -> Best practices -> Trial reels ->
+         'Go to trial reels'.
+    Returns True once on trials_list, else False (caller falls to the alt path)."""
+    ok, _ = await _navigate(
+        serial, traj, step="profile",
+        find=lambda ns: _by_text(ns, "Profile", min_y=1550),
+        target=lambda ns: bool(_by_text(ns, "Professional dashboard") or _by_rid(ns, "trials_list")))
+    if ok:
+        ok, _ = await _navigate(
+            serial, traj, step="professional_dashboard",
+            find=lambda ns: _by_text(ns, "Professional dashboard"),
+            target=lambda ns: bool(_by_text(ns, "Your tools") or _by_rid(ns, "trials_list")))
+    if ok:
+        ok, _ = await _reach_trials_list(serial, traj)
+    if ok:
+        return True
+    # Path 1 (dashboard 'Trial reels' row) unavailable -> try the Best-practices path.
+    traj.log("pathA_unavailable", at="dashboard_row")
+    return await _reach_trials_list_via_best_practices(serial, traj)
 
 
 async def _caption_insert(serial, text, *, clear):
@@ -988,27 +1117,12 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
     # If ANY step to the trial-reels list fails, the dashboard route isn't available
     # on this account -> fall back to the create-reel + Trial-toggle path (which also
     # decides, via the toggle's presence, whether trial reels are enabled at all).
-    ok, _ = await _navigate(
-        serial, traj, step="profile",
-        find=lambda ns: _by_text(ns, "Profile", min_y=1550),
-        target=lambda ns: bool(_by_text(ns, "Professional dashboard") or _by_rid(ns, "trials_list")),
-    )
-    if not ok:
-        traj.log("pathA_unavailable", at="profile")
-        return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
-
-    ok, _ = await _navigate(
-        serial, traj, step="professional_dashboard",
-        find=lambda ns: _by_text(ns, "Professional dashboard"),
-        target=lambda ns: bool(_by_text(ns, "Your tools") or _by_rid(ns, "trials_list")),
-    )
-    if not ok:
-        traj.log("pathA_unavailable", at="professional_dashboard")
-        return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
-
-    ok, _ = await _reach_trials_list(serial, traj)
-    if not ok:
-        traj.log("pathA_unavailable", at="trials_list")
+    # Reach the trials list via the dashboard 'Trial reels' row, and if that route
+    # isn't available, via the Best-practices path (Best practices -> Trial reels ->
+    # 'Go to trial reels'). Only if BOTH dashboard paths fail do we fall back to the
+    # create-reel + Trial-toggle path (which also decides eligibility via the toggle).
+    if not await _reach_trials_list_any(serial, traj):
+        traj.log("pathA_unavailable", at="all_dashboard_paths")
         return await _publish_via_create_reel(serial, caption, traj, no_share=no_share)
 
     ok, _ = await _navigate(
