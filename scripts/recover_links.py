@@ -72,6 +72,19 @@ def affected_accounts() -> list[str]:
     return [r["posted_by"] for r in rows if r.get("posted_by")]
 
 
+def dup_affected_accounts() -> list[str]:
+    """Accounts that actually had a DUPLICATED link (from the dedup backup) -- the
+    real targets of this recovery, vs every account that merely has a blank link."""
+    from collections import Counter
+    backup = ROOT / "data" / "link_dedup_backup.json"
+    if not backup.exists():
+        return []
+    rows = json.loads(backup.read_text(encoding="utf-8"))
+    pairs = Counter((r["posted_by"], r["link_platform"]) for r in rows
+                    if r.get("posted_by") and r.get("link_platform"))
+    return sorted({acc for (acc, _link), n in pairs.items() if n > 1})
+
+
 def set_link(video_id: str, url: str) -> None:
     _mgmt_query(
         f"UPDATE fffbt.videos SET link_platform = {_lit(url)}, updated_at = now() "
@@ -347,69 +360,104 @@ async def _get_reels(account, serial, traj, *, max_reels, use_cache) -> list[dic
 
 
 async def recover_account(account: str, *, apply: bool, enum_only: int, max_reels: int,
-                          use_cache: bool) -> None:
+                          use_cache: bool) -> dict:
+    """Process ONE account; returns a structured result (so concurrent runs can be
+    summarised cleanly instead of interleaving their reports)."""
     serial = resolve_serial(account)
-    print(f"\n=== {account}  device={serial} ===")
+    res: dict = {"account": account, "serial": serial}
     if not serial:
-        print("  [skip] no device bound in device_accounts.json")
-        return
+        res["error"] = "no device bound in device_accounts.json"
+        return res
     traj = Traj(serial, tag=f"recover-{account}")
-    reels = await _get_reels(account, serial, traj, max_reels=max_reels, use_cache=use_cache)
+    try:
+        reels = await _get_reels(account, serial, traj, max_reels=max_reels, use_cache=use_cache)
+    except Exception as e:
+        res["error"] = f"enumerate: {e}"
+        return res
+    res["n_reels"] = len(reels)
     if enum_only:
-        return
+        return res
 
     rows = account_rows(account)
     rep = align(reels, rows)
-    print(f"  rows={rep['n_rows']} reels={rep['n_reels']} anchors={rep['anchors']} "
-          f"stale_link_rows={len(rep['stale_link_rows'])} inversions={len(rep['inversions'])}")
-    if rep["inversions"]:
-        print("  [warn] anchor order vs grid order disagree near:", rep["inversions"][:5])
-    print(f"  CONFIDENT fills: {len(rep['fills'])}   |   left NULL (ambiguous): {len(rep['ambiguous'])}")
-    for f in rep["fills"]:
-        print(f"    row {f['row']:>2} {f['name']:34} {str(f['published_at'])[:16]} -> {f['url']}")
-    if rep["ambiguous"]:
-        amb_groups = {}
-        for a in rep["ambiguous"]:
-            amb_groups.setdefault((a["n_rows"], a["n_reels"]), []).append(a["row"])
-        print("  ambiguous gaps (rows!=reels), left NULL:")
-        for (nr, ne), rws in sorted(amb_groups.items()):
-            print(f"    {nr} rows vs {ne} reels -> rows {rws}")
+    res.update(n_rows=rep["n_rows"], anchors=rep["anchors"], inversions=rep["inversions"],
+               fills=rep["fills"], ambiguous=rep["ambiguous"])
+    if apply:
+        written = 0
+        for f in rep["fills"]:
+            if link_exists(f["url"]):
+                continue
+            set_link(f["id"], f["url"])
+            written += 1
+        res["written"] = written
+    return res
 
-    if not apply:
-        print("  [dry-run] no writes. Re-run with --apply to write the CONFIDENT fills.")
-        return
-    written = 0
-    for f in rep["fills"]:
-        if link_exists(f["url"]):
-            print(f"    [skip] {f['url']} already used -> not writing")
+
+def _print_summary(results: list[dict], apply: bool) -> None:
+    print("\n================== SUMMARY ==================")
+    tot_fill = tot_amb = tot_wrote = 0
+    for r in sorted(results, key=lambda x: x.get("account", "")):
+        if r.get("error"):
+            print(f"\n=== {r['account']} ({r.get('serial')})  ERROR: {r['error']}")
             continue
-        set_link(f["id"], f["url"])
-        written += 1
-    print(f"  wrote {written} links ({len(rep['ambiguous'])} rows left NULL)")
+        fills, amb = r.get("fills", []), r.get("ambiguous", [])
+        tot_fill += len(fills); tot_amb += len(amb); tot_wrote += r.get("written", 0)
+        head = (f"\n=== {r['account']} ({r.get('serial')})  reels={r.get('n_reels')} "
+                f"rows={r.get('n_rows')} anchors={r.get('anchors')} | "
+                f"CONFIDENT={len(fills)} NULL={len(amb)}")
+        if "written" in r:
+            head += f" WROTE={r['written']}"
+        if r.get("inversions"):
+            head += f" (inversions={len(r['inversions'])})"
+        print(head)
+        for f in fills:
+            print(f"    row {f['row']:>2} {f['name']:32} {str(f['published_at'])[:16]} -> {f['url']}")
+    verb = "wrote" if apply else "confident fills (dry-run)"
+    print(f"\nTOTAL {verb}: {tot_wrote if apply else tot_fill} | left NULL: {tot_amb}")
 
 
 async def main_async(args) -> None:
     _load_env()
-    accounts = ([args.account] if args.account else affected_accounts())
-    print(f"accounts to process: {accounts}")
-    for acc in accounts:
-        try:
-            await recover_account(acc, apply=args.apply, enum_only=args.enum_only,
-                                  max_reels=args.max_reels, use_cache=args.use_cache)
-        except Exception as e:
-            print(f"  [error] {acc}: {e}")
+    if args.account:
+        accounts = [args.account]
+    elif args.dup_only:
+        accounts = dup_affected_accounts()
+    else:
+        accounts = affected_accounts()
+    print(f"accounts to process ({len(accounts)}), concurrency={args.concurrency}: {accounts}", flush=True)
+    sem = asyncio.Semaphore(args.concurrency)
+
+    async def _one(acc: str) -> dict:
+        async with sem:
+            print(f"[start] {acc}", flush=True)
+            try:
+                r = await recover_account(acc, apply=args.apply, enum_only=args.enum_only,
+                                          max_reels=args.max_reels, use_cache=args.use_cache)
+            except Exception as e:
+                r = {"account": acc, "error": str(e)}
+            tag = r.get("error") or (f"wrote {r.get('written')}" if "written" in r
+                                     else f"{len(r.get('fills', []))} confident")
+            print(f"[done ] {acc}: {tag}", flush=True)
+            return r
+
+    results = await asyncio.gather(*[_one(a) for a in accounts])
+    _print_summary(results, args.apply)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--account", help="single account username")
-    g.add_argument("--all", action="store_true", help="every affected account")
+    g.add_argument("--all", action="store_true", help="every account with a blank link")
+    g.add_argument("--dup-only", action="store_true",
+                   help="only accounts that had a DUPLICATED link (from the dedup backup)")
     ap.add_argument("--apply", action="store_true", help="write links (default: dry-run)")
     ap.add_argument("--use-cache", action="store_true",
                     help="reuse a saved reels_cache_<account>.json instead of re-driving the device")
     ap.add_argument("--enum-only", type=int, default=0, metavar="N",
                     help="just enumerate reels and cache them (read-only)")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="how many devices to drive at once (each account = one device)")
     ap.add_argument("--max-reels", type=int, default=MAX_REELS)
     args = ap.parse_args()
     asyncio.run(main_async(args))
