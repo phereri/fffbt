@@ -1075,7 +1075,8 @@ async def publish(serial: str, caption: str, *, no_share: bool = False, traj: "T
 # ---------------------------------------------------------------------------
 # LINK CAPTURE (multi-route, instrumented)
 # ---------------------------------------------------------------------------
-async def _copy_link_from_trials_list(serial, traj) -> str | None:
+async def _copy_link_once(serial, traj) -> str | None:
+    """Open the top-left ('newest') trial tile and copy its reel link, once."""
     nodes = await read_ui(serial)
     # an interstitial ("Trial reels need more time to get views") can cover the
     # list right after arrival — clear it before looking for the tile.
@@ -1125,10 +1126,44 @@ async def _copy_link_from_trials_list(serial, traj) -> str | None:
     return url
 
 
-async def capture_link(serial, traj: "Traj | None" = None) -> tuple[str | None, str | None]:
+async def _copy_link_from_trials_list(serial, traj, reject=None) -> str | None:
+    """Copy the newest trial reel's link, REJECTING any link already known for
+    this account (``reject``). The just-posted reel can lag behind the top tile,
+    so a rejected (stale) link triggers a back-out + pull-to-refresh and retry —
+    we only return a genuinely NEW link, else None (better empty than a dup)."""
+    reject = reject or set()
+    for attempt in range(4):
+        url = await _copy_link_once(serial, traj)
+        if url and url not in reject:
+            if attempt:
+                traj.log("capture_new_after_refresh", url=url, attempt=attempt)
+            return url
+        if url and url in reject:
+            traj.log("capture_reject_known", url=url, attempt=attempt,
+                     note="top tile is a previously-saved reel; refreshing")
+            print(f"  [capture] top tile link already saved ({url}) -> refresh & retry")
+        else:
+            traj.log("capture_no_url", attempt=attempt)
+        # back out of the reel/share sheet to the list, then pull-to-refresh
+        await shell(serial, "input keyevent 4", timeout=10)
+        await asyncio.sleep(0.6)
+        await shell(serial, "input keyevent 4", timeout=10)
+        await asyncio.sleep(0.6)
+        nodes = await read_ui(serial)
+        if not _by_rid(nodes, "trials_list"):
+            await _reach_trials_list(serial, traj, human=False)
+        await _swipe_down(serial)
+    return None
+
+
+async def capture_link(serial, traj: "Traj | None" = None, reject=None) -> tuple[str | None, str | None]:
     """Capture the newest Trial reel's public link via multiple routes.
-    Returns (url, route) or (None, None). Each route logs its outcome."""
+    Returns (url, route) or (None, None). Each route logs its outcome. ``reject``
+    is the set of links already saved for this account: a route that can only
+    produce a rejected (stale) link is treated as a miss, so we never return a
+    link that would duplicate an existing post."""
     traj = traj or Traj(serial, tag="capture")
+    reject = reject or set()
 
     # Route 1 -- Professional dashboard -> Trial reels -> trials_list
     traj.log("capture_route_start", route="dashboard")
@@ -1149,8 +1184,8 @@ async def capture_link(serial, traj: "Traj | None" = None) -> tuple[str | None, 
             )
             ok, _ = await _reach_trials_list(serial, traj, human=False)
             if ok:
-                url = await _copy_link_from_trials_list(serial, traj)
-                if url:
+                url = await _copy_link_from_trials_list(serial, traj, reject=reject)
+                if url and url not in reject:
                     traj.log("capture_route_ok", route="dashboard", url=url)
                     return url, "dashboard"
     except Exception as e:
@@ -1162,10 +1197,14 @@ async def capture_link(serial, traj: "Traj | None" = None) -> tuple[str | None, 
     try:
         await _open_clean(serial, traj)
         url = await capture_trial_reel_link(serial, lambda: read_ui(serial))
-        if url:
+        if url and url not in reject:
             traj.log("capture_route_ok", route="reels_tab", url=url)
             return url, "reels_tab"
-        traj.deviation("cap/reels_tab", await read_ui(serial), note="reels-tab route returned no url")
+        if url and url in reject:
+            traj.log("capture_route_reject", route="reels_tab", url=url,
+                     note="reels-tab returned a previously-saved reel")
+        else:
+            traj.deviation("cap/reels_tab", await read_ui(serial), note="reels-tab route returned no url")
     except Exception as e:
         traj.log("capture_route_error", route="reels_tab", error=str(e))
     traj.log("capture_route_fail", route="reels_tab")

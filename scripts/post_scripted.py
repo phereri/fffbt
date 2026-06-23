@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.post_trial import (
     STATUS_DONE, STATUS_NEW, STATUS_VERIFYING,
     _batch_folder, _close_instagram, _load_env, _parse_s3_uri,
-    claim_one, presign, set_status, uniquify_caption,
+    account_links, claim_one, link_exists, presign, set_status, uniquify_caption,
 )
 from scripts.download_gate import DownloadGate
 from scripts.router_proxy import check_proxy, serial_to_ip
@@ -56,17 +56,23 @@ def _account_for(serial: str) -> str | None:
     return (data.get("devices") or {}).get(serial)
 
 
-async def _capture_link(device: str, traj: Traj, *, attempts: int, delay: int) -> tuple[str | None, str | None]:
+async def _capture_link(device: str, traj: Traj, *, attempts: int, delay: int,
+                        reject: set | None = None) -> tuple[str | None, str | None]:
     """Capture the live reel link via MULTIPLE routes, retrying (IG exposes the
     link after a beat). Returns (url, route_that_worked).
+
+    ``reject`` holds links already saved for this account: a capture that only
+    yields a known (stale) link is treated as a miss and retried, so the same
+    top trial tile can never be recorded twice.
 
     The reel is ALREADY published here, so a blank read means the a11y service
     dropped mid-verify (the @nhienlezy115 case) -- recover it once (reboot etc.) and
     keep trying; capture_link re-opens Instagram itself after the reboot."""
+    reject = reject or set()
     recovered = False
     for i in range(attempts):
-        url, route = await capture_link(device, traj)
-        if url and "instagram.com/reel/" in url:
+        url, route = await capture_link(device, traj, reject=reject)
+        if url and "instagram.com/reel/" in url and url not in reject:
             return url, route
         # blind capture -> if a11y is down, recover once (post is live; never re-publish)
         if not recovered:
@@ -254,23 +260,36 @@ async def _drive(args: argparse.Namespace) -> int:
         fleet_events.emit("published", account=account, device=device, video_id=vid, name=name)
         print("published -> status=verify")
 
-        # 4) capture the live reel link
+        # 4) capture the live reel link. Reject links already saved for this
+        # account so we never record the same (stale) top trial tile twice.
+        known_links = account_links(account)
         fleet_events.emit("stage_start", account=account, device=device, stage="verify")
         t0 = time.monotonic()
-        url, route = await _capture_link(device, traj, attempts=args.url_attempts, delay=args.url_retry_delay)
+        url, route = await _capture_link(device, traj, attempts=args.url_attempts,
+                                         delay=args.url_retry_delay, reject=known_links)
         verify_s = time.monotonic() - t0
         fleet_events.emit("stage_done", account=account, device=device, stage="verify",
                           seconds=round(verify_s, 1), ok=bool(url))
 
-        if url:
+        # Final guard: the link must be globally new. link_exists() also keeps the
+        # write off the unique index's toes (a violating UPDATE would error and
+        # wrongly roll the row back to 'new', re-posting a duplicate video).
+        if url and not link_exists(url):
             set_status(vid, STATUS_DONE, link_platform=url, posted_by=account, published_at="now")
             verdict, rc = "SUCCESS", 0
             print(f"[SUCCESS] live link ({route}): {url} -> status=posted")
         else:
-            # live but link not captured: do NOT roll back (would re-post a dup).
+            # Either nothing captured, or only a duplicate surfaced. Do NOT write a
+            # dup link and do NOT roll back (would re-post). Leave it in verify.
+            if url:
+                traj.log("capture_duplicate", url=url, note="captured link already saved -> left empty")
+                fleet_events.emit("dup_link", account=account, device=device,
+                                  video_id=vid, name=name, url=url)
+                print(f"[PUBLISHED_UNCONFIRMED] captured link {url} already exists -> left empty (no dup)")
+            else:
+                print("[PUBLISHED_UNCONFIRMED] reel is live but link not captured; left in verify")
             set_status(vid, STATUS_VERIFYING, posted_by=account, published_at="now")
             verdict, rc = "PUBLISHED_UNCONFIRMED", 2
-            print("[PUBLISHED_UNCONFIRMED] reel is live but link not captured; left in verify")
 
         traj.log("run_result", verdict=verdict, rc=rc, post_url=url, verify_route=route,
                  deviations=traj.deviations,

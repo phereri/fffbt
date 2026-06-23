@@ -198,6 +198,27 @@ def set_status(video_id: str, status: str, **fields: Any) -> None:
     _mgmt_query(sql)
 
 
+def link_exists(url: str) -> bool:
+    """True if any row already carries this exact reel link. Reel URLs are
+    globally unique, so a captured link that already exists means we grabbed the
+    wrong (stale) tile — never write it again as a new post's link."""
+    if not url:
+        return False
+    return bool(_mgmt_query(
+        f"SELECT 1 FROM fffbt.videos WHERE link_platform = {_lit(url)} LIMIT 1;"))
+
+
+def account_links(account: str) -> set[str]:
+    """Every reel link already saved for one account — the capture reject set so
+    a fresh capture must surface a genuinely NEW reel, not the same top tile."""
+    if not account:
+        return set()
+    rows = _mgmt_query(
+        f"SELECT link_platform FROM fffbt.videos "
+        f"WHERE posted_by = {_lit(account)} AND link_platform IS NOT NULL;")
+    return {r["link_platform"] for r in rows if r.get("link_platform")}
+
+
 # ---------------------------------------------------------------------------
 # Video source + caption
 # ---------------------------------------------------------------------------
