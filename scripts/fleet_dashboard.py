@@ -587,6 +587,80 @@ def _device_done_map() -> dict:
     return m
 
 
+_stop_cache: dict = {"ts": 0.0, "data": None}
+
+# rc (device_done exit code / result rc) -> short human label for WHY a device's
+# posting loop ended. Mirrors fleet_scripted's verdict map; rc 0/2 are "posted"
+# outcomes, the rest are terminal stops (incl. rc 8 trial-reel limit).
+_STOP_LABELS = {
+    0: "done", 1: "repeated failures (5x)", 2: "posted (unconfirmed)",
+    3: "no videos available", 4: "blocked (login challenge)", 5: "accessibility down",
+    6: "trial reels not enabled", 7: "proxy down", 8: "trial-reel limit reached",
+}
+_RC_VERDICT = {
+    0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS", 4: "BLOCKED",
+    5: "A11Y_DOWN", 6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT",
+}
+# Verdicts that immediately END the loop and are its true terminal reason -- once
+# seen in a run they must not be overwritten by a later success/"done" outcome.
+_TERMINAL_VERDICTS = {"BLOCKED", "TRIAL_UNAVAILABLE", "PROXY_DOWN", "TRIAL_LIMIT",
+                      "NO_ROWS", "A11Y_DOWN"}
+
+
+def _stop_label(rc) -> str:
+    return _STOP_LABELS.get(rc, f"stopped (rc={rc})" if rc is not None else "stopped")
+
+
+def _device_stop_map() -> dict:
+    """{by_dev, by_acc}: the latest run-ENDING outcome per device/account as
+    {rc, verdict, label, since}. Primary source is the 'device_done' event (its rc
+    IS the loop's exit code -- the most reliable stop reason); 'result' events are a
+    fallback. A later 'claim' clears the entry (the device started a new run, so the
+    old stop reason is stale)."""
+    now = time.time()
+    if _stop_cache["data"] is not None and now - _stop_cache["ts"] < 10:
+        return _stop_cache["data"]
+    by_dev: dict[str, dict] = {}
+    by_acc: dict[str, dict] = {}
+
+    def _put(store, key, ts, rc, verdict, posted=None):
+        if not key:
+            return
+        cur = store.get(key)
+        # A terminal stop verdict is the loop's REAL reason; don't let a later
+        # success-ish outcome bury it. (device_done's rc collapses to 0 once the
+        # device posted at least once, so a posted-then-TRIAL_LIMIT run would
+        # otherwise read as "done"; the same run's terminal 'result' must win.)
+        if cur is not None and cur.get("verdict") in _TERMINAL_VERDICTS and verdict not in _TERMINAL_VERDICTS:
+            return
+        if cur is None or ts >= cur["since"]:
+            lbl = f"done · {posted} posted" if (rc == 0 and posted is not None) else _stop_label(rc)
+            store[key] = {"rc": rc, "verdict": verdict, "label": lbl, "since": ts}
+
+    try:
+        for e in fleet_events.read_events():
+            t = e.get("type")
+            ts = _parse_ts(e.get("ts")) or 0.0
+            dev, acc = e.get("device"), e.get("account")
+            if t == "claim":
+                by_dev.pop(dev, None)
+                by_acc.pop(acc, None)
+                continue
+            if t == "device_done":
+                # last_rc is the real terminal code; rc collapses to 0 if it posted.
+                rc = e.get("last_rc", e.get("rc"))
+                _put(by_dev, dev, ts, rc, _RC_VERDICT.get(rc, "FAILED"), e.get("posted"))
+                _put(by_acc, acc, ts, rc, _RC_VERDICT.get(rc, "FAILED"), e.get("posted"))
+            elif t == "result":
+                _put(by_dev, dev, ts, e.get("rc"), e.get("verdict"))
+                _put(by_acc, acc, ts, e.get("rc"), e.get("verdict"))
+    except Exception:
+        pass
+    res = {"by_dev": by_dev, "by_acc": by_acc}
+    _stop_cache.update(ts=now, data=res)
+    return res
+
+
 def _task_active_devices(task: dict, done: dict | None = None) -> list[str]:
     """Devices of a RUNNING task that haven't finished yet (no device_done since the
     task started). A finished device is released from the task."""
@@ -894,6 +968,7 @@ def control_state() -> dict:
                 busy.setdefault(s, t.get("label") or t.get("action"))
     if devs:
         cm = _challenge_map()
+        sm = _device_stop_map()
         for d in devs:
             cands = [c for c in (cm["by_serial"].get(d["serial"]),
                                  cm["by_account"].get(d.get("account"))) if c]
@@ -902,6 +977,12 @@ def control_state() -> dict:
             d["block_reason"] = latest["reason"] if d["blocked"] else None
             d["block_since"] = latest["ts"] if d["blocked"] else None
             d["busy"] = busy.get(d["serial"])
+            # why the last run ended (TRIAL_LIMIT / TRIAL_UNAVAILABLE / repeated
+            # failures / proxy down / done / ...), for non-blocked active accounts.
+            st = sm["by_dev"].get(d["serial"]) or sm["by_acc"].get(d.get("account"))
+            d["stop_verdict"] = st["verdict"] if st else None
+            d["stop_label"] = st["label"] if st else None
+            d["stop_since"] = st["since"] if st else None
     return {
         "adb_ok": devs is not None,
         "devices": devs or [],
@@ -1265,6 +1346,8 @@ INDEX_HTML = r"""<!doctype html>
   .crow .cacct{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .crow .cser{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
   .crow .cstate{text-align:right;font-size:11px;font-weight:600}
+  .crow .cstop{display:block;font-size:10px;font-weight:400;color:var(--muted);white-space:normal;margin-top:1px;line-height:1.2}
+  .crow .cstop.bad{color:var(--warn)}
   .task{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px}
   .task .thead{display:flex;align-items:center;gap:8px}
   .task .tname{font-weight:650}
@@ -1464,6 +1547,29 @@ INDEX_HTML = r"""<!doctype html>
             <option value="all">all</option>
             <option value="unblocked">unblocked</option>
             <option value="blocked">blocked</option>
+          </select>
+        </label>
+        <label class="mini">sort
+          <select id="ctlSort">
+            <option value="account">account</option>
+            <option value="serial">serial</option>
+            <option value="state">adb state</option>
+            <option value="stop">stop reason</option>
+          </select>
+        </label>
+        <label class="mini">reason
+          <select id="ctlStopFilter">
+            <option value="all">all</option>
+            <option value="none">none (no run)</option>
+            <option value="SUCCESS">done</option>
+            <option value="PUBLISHED_UNCONFIRMED">posted (unconfirmed)</option>
+            <option value="TRIAL_LIMIT">trial-reel limit</option>
+            <option value="TRIAL_UNAVAILABLE">trial reels not enabled</option>
+            <option value="BLOCKED">blocked</option>
+            <option value="A11Y_DOWN">accessibility down</option>
+            <option value="PROXY_DOWN">proxy down</option>
+            <option value="NO_ROWS">no videos</option>
+            <option value="FAILED">repeated failures</option>
           </select>
         </label>
         <span class="grow"></span>
@@ -2023,13 +2129,22 @@ function filteredDevices(){
   const q=($('#ctlSearch').value||'').trim().toLowerCase();
   const ros=$('#ctlRosterOnly').checked;
   const bf=($('#ctlBlockFilter')||{}).value||'all';
-  return all.filter(d=>{
+  const rf=($('#ctlStopFilter')||{}).value||'all';   // filter by last-run stop reason
+  const out=all.filter(d=>{
     if(ros && !d.in_roster) return false;
     if(bf==='blocked' && !d.blocked) return false;
     if(bf==='unblocked' && d.blocked) return false;
+    if(rf==='none' && d.stop_verdict) return false;            // only devices with no recorded run
+    if(rf!=='all' && rf!=='none' && d.stop_verdict!==rf) return false;
     if(q && !((d.account||'').toLowerCase().includes(q) || d.serial.toLowerCase().includes(q))) return false;
     return true;
   });
+  const sk=($('#ctlSort')||{}).value||'account';
+  const keyf=d=> sk==='serial'?(d.serial||'') : sk==='state'?(d.state||'') :
+                 sk==='stop'?(d.blocked?'!blocked':(d.stop_label||'~~~')) : (d.account||'~~~');
+  out.sort((a,b)=> keyf(a).localeCompare(keyf(b),undefined,{numeric:true})
+                   || (a.serial||'').localeCompare(b.serial||'',undefined,{numeric:true}));
+  return out;
 }
 function renderDevicesView(){
   const cont=$('#ctlDevs'), all=CTLLAST?.devices||[], devs=filteredDevices();
@@ -2045,6 +2160,12 @@ function renderDevicesView(){
   cont.innerHTML=head+devs.map(d=>{
     const col=CSTATE_COLOR[d.state]||'var(--muted)';
     const acct=d.account?('@'+esc(d.account)):'<span class="muted">— unbound</span>';
+    // last-run stop reason (TRIAL_LIMIT / trial reels not enabled / repeated failures / …)
+    // shown for non-blocked, not-currently-busy devices so an active account's last
+    // outcome is visible; blocked shows its own ⚠ badge, busy shows the task.
+    const fail=d.stop_verdict && !['SUCCESS','PUBLISHED_UNCONFIRMED'].includes(d.stop_verdict);
+    const sub=(d.stop_label && !d.blocked && !d.busy)
+      ? `<span class="cstop${fail?' bad':''}" title="last run: ${esc(d.stop_verdict||'')} · ${agoEpoch(d.stop_since)}">${esc(d.stop_label)}</span>` : '';
     // BLOCKED always shows (even if the device is still flagged busy in a task), so a
     // real block is never hidden behind the busy badge. A blocked device is selectable.
     const bb=d.blocked?`<span class="bblk" title="${esc(d.block_reason||'login challenge')} · ${agoEpoch(d.block_since)}">⚠ BLOCKED</span> `:'';
@@ -2058,7 +2179,7 @@ function renderDevicesView(){
     const lock = d.busy && !d.blocked;          // blocked -> not locked, can reassign
     return `<label class="crow${lock?' busy':(d.blocked?' blk':'')}">
       <input type="checkbox" data-ser="${esc(d.serial)}" ${selected.has(d.serial)?'checked':''} ${lock?'disabled':''}>
-      <span class="cacct">${acct}</span><span class="cser">${esc(d.serial)}</span>${cell}</label>`;
+      <span class="cacct">${acct}${sub}</span><span class="cser">${esc(d.serial)}</span>${cell}</label>`;
   }).join('');
   cont.querySelectorAll('.crow input[type=checkbox]').forEach(cb=>cb.addEventListener('change',e=>{
     const s=e.target.dataset.ser; e.target.checked?selected.add(s):selected.delete(s); updateSelCount();
@@ -2241,6 +2362,8 @@ $('#tfCmd').addEventListener('change', e=>{ TF.cmd=e.target.value; renderTasks(C
 $('#ctlSearch').addEventListener('input', renderDevicesView);
 $('#ctlRosterOnly').addEventListener('change', renderDevicesView);
 $('#ctlBlockFilter').addEventListener('change', renderDevicesView);
+$('#ctlSort').addEventListener('change', renderDevicesView);
+$('#ctlStopFilter').addEventListener('change', renderDevicesView);
 $('#ctlSelAll').addEventListener('click',e=>{ e.preventDefault();
   filteredDevices().forEach(d=>{ if(!d.busy) selected.add(d.serial); }); renderDevicesView(); });
 $('#ctlSelNone').addEventListener('click',e=>{ e.preventDefault(); selected.clear(); renderDevicesView(); });

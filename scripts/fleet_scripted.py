@@ -215,8 +215,12 @@ async def _run_device(device: str, ns: argparse.Namespace, delay: float) -> tupl
     # this device's loop has ended (done / blocked / trial-unavailable / no-rows /
     # too many fails) -> release it from the task so it's free for other work. The
     # task itself ends when ALL its devices have finished (the process exits).
+    # `rc` collapses to 0 when the device posted at least once (task-summary view);
+    # `last_rc` preserves the REAL terminal code of the final attempt (e.g. 8
+    # TRIAL_LIMIT) so the dashboard can show why the loop actually stopped.
     try:
-        fleet_events.emit("device_done", account=account, device=device, rc=rc, posted=posted)
+        fleet_events.emit("device_done", account=account, device=device,
+                          rc=rc, last_rc=last_rc, posted=posted)
     except Exception:
         pass
     return device, rc
