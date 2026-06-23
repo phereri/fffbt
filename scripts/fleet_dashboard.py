@@ -1134,10 +1134,13 @@ INDEX_HTML = r"""<!doctype html>
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#30363d;
     --fg:#e6edf3; --muted:#8b949e; --accent:#3fb950; --warn:#d29922;
     --bad:#f85149; --info:#58a6ff; --purple:#bc8cff;
+    color-scheme:dark;            /* dark native controls, dropdowns & scrollbars */
   }
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-    background:var(--bg);color:var(--fg)}
+    background:var(--bg);color:var(--fg);
+    -webkit-text-size-adjust:100%;text-size-adjust:100%;
+    -webkit-tap-highlight-color:transparent}
   a{color:var(--info);text-decoration:none} a:hover{text-decoration:underline}
   header{display:flex;align-items:center;gap:16px;padding:14px 20px;
     border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
@@ -1298,6 +1301,132 @@ INDEX_HTML = r"""<!doctype html>
   .crow.blk{background:rgba(248,81,73,.09)}
   .crow.blk:hover{background:rgba(248,81,73,.16)}
   #ctlBlkCount{color:var(--bad);font-weight:600}
+  /* a table that can't shrink scrolls horizontally inside its own box */
+  .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+  /* ===================== MOBILE / NARROW SCREENS ===================== */
+  @media (max-width:700px){
+    .wrap{padding:12px 12px;overflow-x:clip}   /* clip (not hidden) keeps sticky header working */
+    h2{margin:18px 0 8px}
+
+    /* header → compact; tabs become a full-width segmented control on row 2 */
+    header{flex-wrap:wrap;gap:6px 10px;padding:8px 12px}
+    header h1{font-size:15px}
+    header .grow{display:none}
+    #fleetState{order:2;font-size:11px}
+    #refresh{order:3;margin-left:auto}
+    header .tabs{order:5;flex:1 1 100%;margin-left:0}
+    header .tabs button{flex:1;padding:9px 6px;font-size:13px}
+    #s3sync{order:6;font-size:11px}
+    #clock{order:7;font-size:11px}
+
+    /* 16px form text stops iOS auto-zoom on focus + enlarges the tap area */
+    input,select,textarea{font-size:16px !important}
+    .crow input[type=checkbox],.ctl-devbar input[type=checkbox],.hall input{width:20px;height:20px}
+    /* comfortable ~40px tap targets for the small buttons */
+    .dirbtn,.ctl-actbtn,.btn-go,.btn-stop,.pager button,.viewtoggle button{
+      min-height:40px;display:inline-flex;align-items:center;justify-content:center}
+
+    /* summary cards: keep a comfy 2-up */
+    .cards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+    .card .v{font-size:23px}
+
+    /* data tables: tighter, and scroll the wide one instead of overflowing */
+    table{font-size:12px}
+    th,td{padding:6px 6px}
+    #posts{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    #posts table{min-width:480px}
+
+    /* device CARDS: one per row (minmax 420 used to push the page wide) */
+    .devgrid{grid-template-columns:1fr;gap:10px}
+
+    /* device LIST rows: reflow the 8-col grid into a stacked, labelled card */
+    .lhead{display:none}
+    .lrow>summary{display:flex;flex-wrap:wrap;align-items:baseline;
+      gap:3px 12px;padding:10px 12px}
+    .lrow>summary .dot{align-self:center}
+    .lrow>summary .lname{flex:1 1 auto;font-size:14px}
+    .lrow>summary .chev{order:0;margin-left:auto;align-self:center}
+    .lrow>summary .lstate{order:1;flex:1 1 100%;text-align:left;font-size:12.5px}
+    .lrow>summary .lstat{order:2;text-align:left;font-size:11px;color:var(--muted)}
+    .lrow>summary .lstat b{font-size:13px}
+    .lrow>summary .lstat:nth-child(4)::before{content:"posted "}
+    .lrow>summary .lstat:nth-child(5)::before{content:"failed "}
+    .lrow>summary .lstat:nth-child(6)::before{content:"avg "}
+    .lrow>summary .lstat:nth-child(7)::before{content:"last "}
+    .lrow .ldetail{padding:8px 12px 12px}
+
+    /* stats filter bar: full-width search, the rest wraps beneath it */
+    .devctrl input[type=search]{flex:1 1 100%;min-width:0}
+    .devctrl .grow{display:none}
+
+    /* control panel: device rows become 2-line (account over serial, state right) */
+    .ctl-cols{gap:14px}
+    .chead{display:flex;align-items:center;padding:8px 12px}
+    .chead>span{display:none}                  /* keep just the "All" checkbox */
+    .crow{grid-template-columns:26px 1fr auto;
+      grid-template-areas:"ck acct st" "ck ser st";gap:1px 8px;padding:10px 12px}
+    .crow>input[type=checkbox]{grid-area:ck;align-self:center}
+    .crow .cacct{grid-area:acct}
+    .crow .cser{grid-area:ser}
+    .crow .cstate{grid-area:st;align-self:center}
+    .ctl-toolbar{padding:10px 12px;gap:8px 10px}
+    .ctl-devbar input[type=search]{flex:1 1 100%;min-width:0}
+    .ctl-devbar .grow{display:none}
+    .task-filters{flex-wrap:wrap}
+    .task-filters select{flex:1 1 45%}
+
+    /* modal: near full-width and scrollable when taller than the screen */
+    .modal{width:100%;max-width:94vw;max-height:90vh;overflow:auto;padding:18px 16px}
+
+    /* select-device links + "clear finished": real tap targets (were tiny inline anchors) */
+    .ctl-selbtns a,#ctlClear{display:inline-block;padding:7px 8px;min-height:34px;line-height:1.7}
+    /* tap feedback on touch (where :hover never fires) */
+    .crow:active,.lrow>summary:active{background:var(--panel2)}
+    .dirbtn:active,.ctl-actbtn:active,.btn-go:active,.btn-stop:active{filter:brightness(1.12)}
+
+    /* live feed + supervisor log: keep the aligned columns, scroll instead of wrapping to noise */
+    #feed,#fleetlog{white-space:pre;word-break:normal;font-size:10.5px;line-height:1.35;
+      overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+    /* BLOCKED device cell: stack the badge over the state text instead of staggering it */
+    .crow .cstate{display:flex;flex-direction:column;align-items:flex-end;gap:2px;white-space:normal}
+    /* one-line account / serial in the reflowed rows */
+    .crow .cser{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .lrow>summary .lname{min-width:0;overflow:hidden;text-overflow:ellipsis}
+
+    /* device card header: let the "device · pid" pill wrap rather than clip */
+    .dev .top{flex-wrap:wrap}
+    .dev .top .name{min-width:0;overflow:hidden;text-overflow:ellipsis}
+
+    /* detail tables (recent posts): wrap long video filenames rather than clipping them */
+    .ldetail table td,.dev .body table td{word-break:break-word}
+
+    /* number fields fit 16px text + native stepper (delay/cap/stagger can be 3–4 digits) */
+    .modal input[type=number],.ctl-toolbar input[type=number]{width:82px}
+    .modal input[type=radio]{width:18px;height:18px}
+
+    /* toolbars (control actions + proxy buy/renew) pack into tidy full-width rows */
+    .ctl-toolbar .grow{display:none}
+    .ctl-toolbar>label,.ctl-toolbar .btn-go,.ctl-toolbar .dirbtn{flex:1 1 auto}
+
+    /* task cards: let a long label push the stop button onto its own line */
+    .task .thead{flex-wrap:wrap;gap:4px 8px}
+    .task .t-log{font-size:10.5px}
+    /* keep card heights even when the sub-text is long */
+    .card .sub{overflow-wrap:anywhere}
+
+    /* proxy table (9 cols): more room so the two action buttons sit on one line (scrolls in .tscroll) */
+    .pxtable{min-width:760px}
+    .pxtable td:last-child{white-space:nowrap}
+  }
+
+  @media (max-width:400px){
+    .wrap{padding:10px 10px}
+    header h1{font-size:14px}
+    #clock{display:none}            /* least-critical info on the tiniest screens */
+    .card .v{font-size:21px}
+  }
 </style>
 </head>
 <body>
@@ -1477,11 +1606,11 @@ INDEX_HTML = r"""<!doctype html>
     <button id="pxBuy" class="dirbtn">＋ Buy proxies</button>
     <span id="pxMsg" class="mini"></span>
   </div>
-  <table class="pxtable"><thead><tr>
+  <div class="tscroll"><table class="pxtable"><thead><tr>
     <th><input type="checkbox" id="pxAll"/></th>
     <th>device</th><th>account</th><th>proxy</th><th>provider</th>
     <th class="right">expires</th><th>health</th><th>status</th><th></th>
-  </tr></thead><tbody id="pxRows"></tbody></table>
+  </tr></thead><tbody id="pxRows"></tbody></table></div>
 </div>
 
 <script>
