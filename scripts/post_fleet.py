@@ -32,7 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> account_identity
 from src.runner import fleet_events  # noqa: E402
+import account_identity as ai  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 BINDING = ROOT / "data" / "device_accounts.json"
@@ -110,7 +112,20 @@ def main() -> int:
     log(f"FLEET START devices={list(devices.keys())} stagger={STAGGER_MIN_S}-{STAGGER_MAX_S}s")
     fleet_events.emit("fleet_start", devices=devices, pid=os.getpid())
     items = list(devices.items())
+    _spawned: set = set()
+    _pidmap: dict = {}   # pid -> serial, built at spawn so skips never misalign it
     for i, (serial, account) in enumerate(items):
+        # never spawn two loops for one account (the binding is deduped, but guard
+        # anyway); each child also self-guards via account_identity.
+        if account in _spawned:
+            log(f"FLEET skip duplicate account={account} on {serial} (already spawned)")
+            continue
+        try:
+            ai.assert_can_launch(serial, account)   # observe by default
+        except ai.DuplicateAccount as e:
+            log(f"FLEET DUP_BLOCKED account={account} device={serial} canonical={e.canonical} ({e.reason}) — skipping")
+            continue
+        _spawned.add(account)
         per_log = ROOT / f"post_loop_{_safe_account(account)}.log"
         env = dict(
             os.environ,
@@ -125,14 +140,12 @@ def main() -> int:
             cwd=str(ROOT), env=env,
         )
         _children.append(p)
+        _pidmap[p.pid] = serial
         log(f"FLEET spawned account={account} device={serial} pid={p.pid} log={per_log.name}")
         fleet_events.emit("fleet_spawned", account=account, device=serial,
                           pid=p.pid, log=per_log.name)
         # Update the pid map incrementally so the dashboard sees devices ramp up.
-        PIDS_FILE.write_text(
-            json.dumps({c.pid: s for c, (s, _a) in zip(_children, items)}, indent=2),
-            encoding="utf-8",
-        )
+        PIDS_FILE.write_text(json.dumps(_pidmap, indent=2), encoding="utf-8")
         # Stagger: small random gap before launching the next device (not after the last).
         if i < len(items) - 1:
             gap = random.randint(STAGGER_MIN_S, STAGGER_MAX_S)
@@ -142,7 +155,7 @@ def main() -> int:
     # Supervise: report each child's exit. We do NOT auto-restart — a clean
     # LOOP STOP is an escalation the operator asked to surface, and self-healing
     # already lives inside each loop.
-    alive = {p.pid: devices_serial for p, devices_serial in zip(_children, devices.keys())}
+    alive = dict(_pidmap)
     while any(p.poll() is None for p in _children):
         for p in _children:
             if p.pid in alive and p.poll() is not None:

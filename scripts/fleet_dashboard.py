@@ -596,15 +596,17 @@ _STOP_LABELS = {
     0: "done", 1: "repeated failures (5x)", 2: "posted (unconfirmed)",
     3: "no videos available", 4: "blocked (login challenge)", 5: "accessibility down",
     6: "trial reels not enabled", 7: "proxy down", 8: "trial-reel limit reached",
+    9: "duplicate account (blocked)", 10: "account swapped mid-run",
 }
 _RC_VERDICT = {
     0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS", 4: "BLOCKED",
     5: "A11Y_DOWN", 6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT",
+    9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED",
 }
 # Verdicts that immediately END the loop and are its true terminal reason -- once
 # seen in a run they must not be overwritten by a later success/"done" outcome.
 _TERMINAL_VERDICTS = {"BLOCKED", "TRIAL_UNAVAILABLE", "PROXY_DOWN", "TRIAL_LIMIT",
-                      "NO_ROWS", "A11Y_DOWN"}
+                      "NO_ROWS", "A11Y_DOWN", "DUP_BLOCKED", "ACCOUNT_SWAPPED"}
 
 
 def _stop_label(rc) -> str:
@@ -683,6 +685,39 @@ def start_task(action: str, devices: list[str], opts: dict | None = None) -> dic
     clash = [s for s in serials if s in busy]
     if clash:
         raise ValueError(f"already busy in a running task: {', '.join(clash)}")
+    # ACCOUNT-LEVEL dedup for posting actions: never launch an account that is a
+    # duplicate / already running. Observe by default (emits dup_observed, does not
+    # block); raises only when FLEET_DEDUP_ENFORCE=1 in the dashboard's env.
+    if action in ("post", "dryrun"):
+        try:
+            from scripts import account_identity as _ai
+        except Exception:
+            _ai = None
+        if _ai is not None:
+            enforce = _ai._enforce_default()
+            seen_accts: dict = {}
+            kept = []
+            for s in serials:
+                acct = _ai.account_for(s)
+                if not acct:
+                    kept.append(s)
+                    continue
+                if acct in seen_accts:
+                    # same account selected on two devices. ENFORCE: reject the batch.
+                    # OBSERVE: drop the duplicate serial, keep going (never block a
+                    # batch of otherwise-distinct accounts).
+                    if enforce:
+                        raise ValueError(f"account {acct} selected on two devices "
+                                         f"({seen_accts[acct]} and {s}) — pick one")
+                    continue
+                seen_accts[acct] = s
+                try:
+                    _ai.assert_can_launch(s, acct)   # observe: emits, does not raise
+                except _ai.DuplicateAccount as e:
+                    raise ValueError(f"account {acct} on {s} conflicts: "
+                                     f"canonical={e.canonical} ({e.reason})")
+                kept.append(s)
+            serials = kept
     tid = uuid.uuid4().hex[:8]
     CONTROL_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = CONTROL_LOG_DIR / f"{tid}.log"
@@ -957,6 +992,64 @@ def _category_counts() -> list[dict]:
         return []
 
 
+def _dup_map(window_s: int = 3600) -> dict:
+    """Most-recent account-dedup conflict per device & account within the last hour
+    (from dup_observed / dup_blocked events emitted by the guard). Powers the
+    Control-tab conflict chip during the observe rollout."""
+    def _epoch(s):
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+    cutoff = time.time() - window_s
+    by_dev: dict = {}
+    by_acc: dict = {}
+    for e in fleet_events.read_events():
+        typ = e.get("type")
+        if typ not in ("dup_observed", "dup_blocked", "discover"):
+            continue
+        if _epoch(e.get("ts")) < cutoff:
+            continue
+        # a clean (re)discover clears a prior conflict for that device/account
+        if typ == "discover":
+            by_dev.pop(e.get("device"), None)
+            by_acc.pop(e.get("account"), None)
+            continue
+        rec = {"reason": e.get("reason"), "canonical": e.get("canonical"),
+               "conflict": e.get("conflict"), "mode": e.get("mode", "observe"),
+               "since": _epoch(e.get("ts")),   # epoch (agoEpoch expects seconds, not ISO)
+               "blocked": typ == "dup_blocked"}
+        if e.get("device"):
+            by_dev[e["device"]] = rec
+        if e.get("account"):
+            by_acc[e["account"]] = rec
+    return {"by_dev": by_dev, "by_acc": by_acc}
+
+
+def _a11y_map(window_s: int = 86400) -> dict:
+    """Devices whose a11y TREE was last found DOWN by a bind, until a later
+    successful read (a 'discover' event = a11y is serving again) clears it. Powers
+    the Control-tab 'a11y down' chip + reason filter."""
+    def _epoch(s):
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+    cutoff = time.time() - window_s
+    by_dev: dict = {}
+    for e in fleet_events.read_events():
+        dev = e.get("device")
+        if not dev:
+            continue
+        t = e.get("type")
+        if t == "a11y_down":
+            if _epoch(e.get("ts")) >= cutoff:
+                by_dev[dev] = {"since": _epoch(e.get("ts"))}
+        elif t == "discover":          # a successful read => a11y is back up
+            by_dev.pop(dev, None)
+    return {"by_dev": by_dev}
+
+
 def control_state() -> dict:
     devs = list_adb_devices()
     tasks = list_tasks()
@@ -969,6 +1062,8 @@ def control_state() -> dict:
     if devs:
         cm = _challenge_map()
         sm = _device_stop_map()
+        dm = _dup_map()
+        am = _a11y_map()
         for d in devs:
             cands = [c for c in (cm["by_serial"].get(d["serial"]),
                                  cm["by_account"].get(d.get("account"))) if c]
@@ -983,10 +1078,24 @@ def control_state() -> dict:
             d["stop_verdict"] = st["verdict"] if st else None
             d["stop_label"] = st["label"] if st else None
             d["stop_since"] = st["since"] if st else None
+            # account-dedup conflict (observe rollout). Key on the SERIAL only: the
+            # conflict event always carries the losing device, and an account-keyed
+            # fallback would wrongly chip the canonical (winning) device too.
+            du = dm["by_dev"].get(d["serial"])
+            d["dup_reason"] = du["reason"] if du else None
+            d["dup_canonical"] = du["canonical"] if du else None
+            d["dup_blocked"] = bool(du and du["blocked"])
+            d["dup_since"] = du["since"] if du else None
+            # a11y tree down (from the bind) — flagged until a successful re-bind
+            ad = am["by_dev"].get(d["serial"])
+            d["a11y_down"] = bool(ad)
+            d["a11y_since"] = ad["since"] if ad else None
     return {
         "adb_ok": devs is not None,
         "devices": devs or [],
         "blocked_count": sum(1 for d in (devs or []) if d.get("blocked")),
+        "dup_count": sum(1 for d in (devs or []) if d.get("dup_reason")),
+        "a11y_down_count": sum(1 for d in (devs or []) if d.get("a11y_down")),
         "actions": [{"id": k, "label": v["label"], "danger": v.get("danger", False)}
                     for k, v in ACTIONS.items()],
         "categories": _category_counts(),
@@ -1381,6 +1490,10 @@ INDEX_HTML = r"""<!doctype html>
   .pm-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
   .bblk{color:var(--bad);font-size:10px;font-weight:700;border:1px solid var(--bad);
     border-radius:5px;padding:0 5px;white-space:nowrap}
+  .bdup{color:var(--warn);font-size:10px;font-weight:700;border:1px solid var(--warn);
+    border-radius:5px;padding:0 5px;white-space:nowrap;margin-right:4px}
+  .ba11y{color:var(--info);font-size:10px;font-weight:700;border:1px solid var(--info);
+    border-radius:5px;padding:0 5px;white-space:nowrap;margin-right:4px}
   .crow.blk{background:rgba(248,81,73,.09)}
   .crow.blk:hover{background:rgba(248,81,73,.16)}
   #ctlBlkCount{color:var(--bad);font-weight:600}
@@ -2134,8 +2247,13 @@ function filteredDevices(){
     if(ros && !d.in_roster) return false;
     if(bf==='blocked' && !d.blocked) return false;
     if(bf==='unblocked' && d.blocked) return false;
-    if(rf==='none' && d.stop_verdict) return false;            // only devices with no recorded run
-    if(rf!=='all' && rf!=='none' && d.stop_verdict!==rf) return false;
+    if(rf==='A11Y_DOWN'){                                       // unify: bind a11y-down OR posting A11Y_DOWN
+      if(!(d.a11y_down || d.stop_verdict==='A11Y_DOWN')) return false;
+    } else if(rf==='none'){
+      if(d.stop_verdict || d.a11y_down) return false;          // no run AND not a11y-flagged
+    } else if(rf!=='all'){
+      if(d.stop_verdict!==rf) return false;
+    }
     if(q && !((d.account||'').toLowerCase().includes(q) || d.serial.toLowerCase().includes(q))) return false;
     return true;
   });
@@ -2169,12 +2287,16 @@ function renderDevicesView(){
     // BLOCKED always shows (even if the device is still flagged busy in a task), so a
     // real block is never hidden behind the busy badge. A blocked device is selectable.
     const bb=d.blocked?`<span class="bblk" title="${esc(d.block_reason||'login challenge')} · ${agoEpoch(d.block_since)}">⚠ BLOCKED</span> `:'';
+    // account-dedup conflict (observe rollout): ⚠ DUP = observed, ⛔ DUP = blocked
+    const dd=d.dup_reason?`<span class="bdup" title="account dup: ${esc(d.dup_reason)}${d.dup_canonical?(' · canonical '+esc(d.dup_canonical)):''} · ${agoEpoch(d.dup_since)}">${d.dup_blocked?'⛔ DUP':'⚠ DUP'}</span> `:'';
+    // a11y tree down (detected by the bind): device reachable but unreadable -> run a11y recovery, re-bind to clear
+    const ad=d.a11y_down?`<span class="ba11y" title="a11y tree down (bind) · ${agoEpoch(d.a11y_since)} · run a11y recovery, then re-bind">⚠ A11Y</span> `:'';
     let cell;
     if(d.busy && !d.blocked){
       const lab=d.busy.length>18?d.busy.slice(0,18)+'…':d.busy;
-      cell=`<span class="cstate"><span class="bbusy" title="busy: ${esc(d.busy)}">⏳ ${esc(lab)}</span></span>`;
+      cell=`<span class="cstate">${ad}${dd}<span class="bbusy" title="busy: ${esc(d.busy)}">⏳ ${esc(lab)}</span></span>`;
     } else {
-      cell=`<span class="cstate" style="color:${col}">${bb}${esc(d.state)}</span>`;
+      cell=`<span class="cstate" style="color:${col}">${bb}${ad}${dd}${esc(d.state)}</span>`;
     }
     const lock = d.busy && !d.blocked;          // blocked -> not locked, can reassign
     return `<label class="crow${lock?' busy':(d.blocked?' blk':'')}">

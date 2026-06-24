@@ -56,6 +56,19 @@ def _adb_path() -> str:
 
 
 def _cmd_post_one(args: argparse.Namespace) -> int:
+    # account dedup soft guard for the manual single-publish path (observe by
+    # default; FLEET_DEDUP_ENFORCE=1 hard-blocks). Never let it break a publish.
+    if getattr(args, "account", None):
+        try:
+            from scripts import account_identity as _ai
+        except Exception:
+            _ai = None
+        if _ai is not None:
+            try:
+                _ai.assert_can_launch(args.device, args.account)
+            except _ai.DuplicateAccount as e:
+                print(f"[DUP_BLOCKED] {args.account}: canonical={e.canonical} ({e.reason})")
+                return 9
     hashtags = _split_hashtags(args.hashtags)
     result = _run_async(
         post_one(

@@ -34,7 +34,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                       # scripts/  -> whoami
 sys.path.insert(0, os.path.dirname(_HERE))      # repo root -> src, scripts.*
 
-from scripts.post_scripted import _account_for, _drive
+import account_identity as ai
+from scripts.post_scripted import _drive
 from scripts.post_trial import _load_env, _mgmt_query
 from src.runner import fleet_events
 from whoami import _open_profile, resolve_username
@@ -69,10 +70,26 @@ def _count_24h(account: str) -> int | None:
         return None
 
 
+def _mirror_account(user: str, device: str) -> None:
+    """Best-effort: mirror a binding into automation.accounts (Phase-2 store) on a
+    daemon thread so the slow Management-API call never blocks the launch loop."""
+    def _go():
+        try:
+            import account_store
+            account_store.bind_one(user, device)
+        except Exception:
+            pass
+    try:
+        import threading
+        threading.Thread(target=_go, daemon=True).start()
+    except Exception:
+        pass
+
+
 async def _ensure_bound(device: str) -> str | None:
     """If the device is unbound, discover the logged-in account from its profile
     and persist the binding (auto-discover). Returns the account or None."""
-    acct = _account_for(device)
+    acct = ai.account_for(device)
     if acct:
         return acct
     print(f"[{device}] unbound -> running discover account first")
@@ -82,20 +99,67 @@ async def _ensure_bound(device: str) -> str | None:
     except Exception as e:
         print(f"[{device}] discover error: {e}")
         return None
-    if not user:
-        print(f"[{device}] discover: username unreadable (challenge / not logged in) -> skip")
+    if not user or not ai.is_real_username(user):
+        print(f"[{device}] discover: username unreadable / junk ({user!r}) -> skip")
         return None
-    async with _roster_lock:  # serialise the roster write across concurrent devices
-        try:
-            data = json.loads(BINDING.read_text(encoding="utf-8"))
-        except Exception:
-            data = {"devices": {}}
-        data.setdefault("devices", {})[device] = user
-        BINDING.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    # MINT-SAFE bind: emit discover first (so this fresh read out-ranks any stale
+    # twin), then atomically merge under the invariant. If `user` is already
+    # canonical on a DIFFERENT serial, the write won't keep this device — refuse
+    # rather than mint a duplicate.
     try:
         fleet_events.emit("discover", device=device, account=user)
     except Exception:
         pass
+    ai.bust_events_cache()
+    dropped: list = []
+
+    def _mut(devices):
+        devices[device] = user
+        deduped, drp = ai.enforce_invariant(devices, reachable=ai._adb_online())
+        dropped.extend(drp)
+        return deduped
+
+    try:
+        async with _roster_lock:  # serialise within this process; atomic across procs
+            written = await asyncio.to_thread(ai.atomic_update_roster, _mut)
+    except OSError as e:
+        print(f"[{device}] roster write busy ({e}) -> not binding this cycle")
+        return None
+    if written.get(device) != user:
+        # the just-read live device did NOT win canon (an account already canonical
+        # on another serial). ENFORCE: refuse the dup. OBSERVE (default): never break
+        # a real post — this phone IS logged into `user`, so make it canonical (drop
+        # the stale twin, keep injective) and record the conflict.
+        if ai._enforce_default():
+            print(f"[{device}] {user} canonical on another serial -> refusing dup (enforce), stopping")
+            return None
+
+        def _force(devices):
+            for s in [s for s, a in list(devices.items()) if a == user and s != device]:
+                del devices[s]
+            devices[device] = user
+            return devices
+
+        try:
+            async with _roster_lock:
+                await asyncio.to_thread(ai.atomic_update_roster, _force)
+        except OSError as e:
+            print(f"[{device}] roster write busy ({e}) -> skip")
+            return None
+        try:
+            fleet_events.emit("dup_observed", account=user, device=device,
+                              reason="forced_canonical_observe", mode="observe")
+        except Exception:
+            pass
+        _mirror_account(user, device)
+        print(f"[{device}] OBSERVE: bound {user} -> {device} (was canonical elsewhere; stale twin dropped)")
+        return user
+    for acc, ds, keep, reason in dropped:
+        try:
+            fleet_events.emit("canon", account=acc, device=keep, dropped=ds, reason=reason)
+        except Exception:
+            pass
+    _mirror_account(user, device)
     print(f"[{device}] discovered + bound -> {user}")
     return user
 
@@ -142,10 +206,55 @@ async def _run_device(device: str, ns: argparse.Namespace, delay: float) -> tupl
             pass
         return device, 1
 
+    # --- ACCOUNT DEDUP GUARD (observe by default; FLEET_DEDUP_ENFORCE=1 = block) -
+    # The per-account lock is held by THIS long-lived loop owner across the
+    # inter-post sleeps, so a second device can never post for the same account
+    # in the gap. assert/validate are observe-or-enforce per the env flag.
+    try:
+        ai.assert_can_launch(device, account)
+    except ai.DuplicateAccount as e:
+        print(f"[{device}] DUP_BLOCKED {account}: canonical={e.canonical} ({e.reason})")
+        try:
+            fleet_events.emit("device_done", account=account, device=device,
+                              rc=9, last_rc=9, posted=0, reason="dup_blocked")
+        except Exception:
+            pass
+        return device, 9
+    _acct_lock = ai.account_lock(account)
+    try:
+        _acct_lock.__enter__()
+    except ai.DuplicateAccount:
+        print(f"[{device}] DUP_BLOCKED {account}: lock held by a live runner")
+        try:
+            fleet_events.emit("device_done", account=account, device=device,
+                              rc=9, last_rc=9, posted=0, reason="dup_locked")
+        except Exception:
+            pass
+        return device, 9
+    try:
+        ai.validate_canon_under_lock(device, account)
+    except ai.DuplicateAccount as e:
+        _acct_lock.__exit__(None, None, None)
+        print(f"[{device}] DUP_BLOCKED {account}: canon flipped to {e.canonical}")
+        try:
+            fleet_events.emit("device_done", account=account, device=device,
+                              rc=9, last_rc=9, posted=0, reason="dup_canon_flipped")
+        except Exception:
+            pass
+        return device, 9
+
     target = float("inf") if ns.loop else max(1, ns.count)
     posted, fails, last_rc = 0, 0, 1
     t0 = time.monotonic()
     while posted < target:
+        # ACCOUNT SWAP: the operator logged a NEW account onto this phone mid-run
+        # (login-challenge swap). Stop before stamping posted_by with the stale
+        # account; the device re-binds + relaunches under the new one.
+        _cur = ai.account_for(device)
+        if _cur is not None and _cur != account:
+            print(f"[{device}] account swapped {account} -> {_cur} mid-run — stopping")
+            last_rc = 10
+            break
         # GRACEFUL STOP: a stop was requested -> claim no more videos and end the loop.
         # Any post already in flight (incl. verify) finishes; the dashboard unclaims
         # anything left un-posted afterwards.
@@ -210,7 +319,10 @@ async def _run_device(device: str, ns: argparse.Namespace, delay: float) -> tupl
             if await _sleep_or_stop(90):
                 break
 
+    _acct_lock.__exit__(None, None, None)   # release the per-account lock
     rc = 0 if posted else last_rc
+    if last_rc == 10:
+        rc = 10                              # ACCOUNT_SWAPPED is terminal, not success
     print(f"========== END {device} rc={rc} posted={posted} ({time.monotonic() - t0:.0f}s) ==========")
     # this device's loop has ended (done / blocked / trial-unavailable / no-rows /
     # too many fails) -> release it from the task so it's free for other work. The
@@ -245,7 +357,8 @@ async def _main_async(ns: argparse.Namespace) -> int:
         device, rc = r
         verdict = {0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS",
                    4: "BLOCKED (login challenge)", 5: "A11Y_DOWN",
-                   6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT"}.get(rc, "FAILED")
+                   6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT",
+                   9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED"}.get(rc, "FAILED")
         print(f"  {device:24} rc={rc}  {verdict}")
         worst = max(worst, 0 if rc in (0, 3) else rc)
     return worst

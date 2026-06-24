@@ -41,7 +41,9 @@ from typing import Any
 # --- repo imports: ensure repo root is importable so `src...` resolves even
 # when launched as `python scripts/post_trial.py` ---------------------------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> account_identity
 
+import account_identity as ai
 from src.runner import account_memory
 from src.runner import fleet_events
 from src.runner.post_one import _verify_dashboard
@@ -66,7 +68,11 @@ PLATFORM = "Instagram"
 # Only post videos no older than this many days (by the VID_YYYYMMDD date in the
 # filename). 0 / unset disables the gate. Keeps the fleet off stale content even
 # if old objects linger in the bucket / DB.
-MAX_AGE_DAYS = int(os.environ.get("POST_MAX_AGE_DAYS", "7") or "0")
+# Claim-layer age gate is OFF by default: the 7-day age limit lives ONLY at the
+# S3->DB sync (src/runner/s3_sync.py, S3_SYNC_MAX_AGE_DAYS) — once a video is in
+# the DB it is postable regardless of how long it has waited in the 'new' queue.
+# Set POST_MAX_AGE_DAYS>0 to re-enable a claim-time age filter if ever needed.
+MAX_AGE_DAYS = int(os.environ.get("POST_MAX_AGE_DAYS", "0") or "0")
 CAPTION_MAX_LEN = 2200  # Instagram's hard caption limit; captions are posted in full
 # ===========================================================================
 
@@ -150,10 +156,11 @@ def claim_one(category: str, order: str = "asc", max_age_days: int | None = None
     claim race-safe against other agents: each concurrent claim locks a
     different row, and the status pre-check guarantees exactly one winner.
     ``order`` picks oldest-first ("asc", default) or newest-first ("desc") by
-    created_at. Always status = 'new'. When ``max_age_days`` > 0 a row is only
-    eligible if the VID_YYYYMMDD date in its filename is within that many days of
-    today; rows whose name carries no parseable date are treated as too old and
-    skipped (we never want to post unknown-age / stale content).
+    created_at. Always status = 'new'. By default there is NO age filter here — age
+    is enforced only at S3->DB ingest, so anything that reached the DB is postable.
+    Passing ``max_age_days`` > 0 (or POST_MAX_AGE_DAYS) re-adds a claim-time filter:
+    a row is then eligible only if the VID_YYYYMMDD date in its name is within that
+    many days, and undated names are skipped.
     """
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
     if max_age_days is None:
@@ -613,6 +620,17 @@ async def _close_instagram(device: str) -> None:
 
 
 async def _drive(args: argparse.Namespace) -> int:
+    # ACCOUNT DEDUP GUARD (soft pre-check; the hard per-account lock is held by the
+    # loop owner — post_loop/fleet_scripted — not this per-post child). Observe by
+    # default; FLEET_DEDUP_ENFORCE=1 raises before any claim.
+    try:
+        ai.assert_can_launch(args.device, args.account)
+    except ai.DuplicateAccount as e:
+        print(f"[DUP_BLOCKED] {args.account}: canonical={e.canonical} ({e.reason})")
+        fleet_events.emit("result", account=args.account, device=args.device,
+                          verdict="DUP_BLOCKED", rc=9, success=False, published=False,
+                          code="dup_blocked")
+        return 9
     # 1) claim a row
     row = claim_one(args.category)
     if row is None:

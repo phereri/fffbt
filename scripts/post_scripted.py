@@ -30,7 +30,9 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> account_identity
 
+import account_identity as ai
 from scripts.post_trial import (
     STATUS_DONE, STATUS_NEW, STATUS_VERIFYING,
     _batch_folder, _close_instagram, _load_env, _parse_s3_uri,
@@ -49,11 +51,9 @@ from src.worker.steps.video_preparation import VideoPreparationStep
 
 
 def _account_for(serial: str) -> str | None:
-    p = Path("data/device_accounts.json")
-    if not p.exists():
-        return None
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return (data.get("devices") or {}).get(serial)
+    # Delegate to the identity seam (absolute-path read — fixes the old cwd-relative
+    # `Path("data/...")` lookup that silently returned None off-cwd).
+    return ai.account_for(serial)
 
 
 async def _capture_link(device: str, traj: Traj, *, attempts: int, delay: int,
@@ -102,6 +102,16 @@ async def _drive(args: argparse.Namespace) -> int:
     if not account:
         print(f"[ERROR] no account bound to {device} in data/device_accounts.json")
         return 1
+    # ACCOUNT DEDUP GUARD (soft; the hard lock is held by fleet_scripted, the loop
+    # owner that called us). Observe by default; FLEET_DEDUP_ENFORCE=1 raises.
+    try:
+        ai.assert_can_launch(device, account)
+    except ai.DuplicateAccount as e:
+        print(f"[DUP_BLOCKED] {account}: canonical={e.canonical} ({e.reason})")
+        fleet_events.emit("result", account=account, device=device,
+                          verdict="DUP_BLOCKED", rc=9, success=False, published=False,
+                          code="dup_blocked")
+        return 9
     print(f"device={device} account={account} category={args.category}")
     traj = Traj(device, tag=account)
 

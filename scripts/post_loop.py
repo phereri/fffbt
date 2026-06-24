@@ -24,7 +24,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> account_identity
 from src.runner import fleet_events  # noqa: E402
+import account_identity as ai  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = os.environ.get("LOOP_DEVICE", "192.168.4.225:5555")
@@ -216,10 +218,35 @@ def main() -> int:
                       delay_min=MIN_DELAY, delay_max=MAX_DELAY, max_24h=MAX_POSTS_24H,
                       pid=os.getpid())
 
+    # --- ACCOUNT DEDUP GUARD (observe by default; FLEET_DEDUP_ENFORCE=1 = block) -
+    # Hold the per-account lock for THIS process's whole life — released by the OS
+    # on exit. As the long-lived owner of the 15-45 min cadence, this is the lock
+    # that prevents a second device posting for the account between posts.
+    try:
+        ai.assert_can_launch(DEVICE, ACCOUNT)
+        _acct_lock = ai.account_lock(ACCOUNT)
+        _acct_lock.__enter__()                  # kept alive for the process lifetime
+        ai.validate_canon_under_lock(DEVICE, ACCOUNT)
+    except ai.DuplicateAccount as e:
+        log(f"DUP_BLOCKED account={ACCOUNT} canonical={e.canonical} reason={e.reason} — stopping")
+        fleet_events.emit("result", account=ACCOUNT, device=DEVICE,
+                          verdict="DUP_BLOCKED", rc=9, success=False, published=False,
+                          code="dup_blocked", reason=e.reason)
+        return 9
+
     consec_fail = 0
     reboot_times: list[float] = []
 
     while True:
+        # ACCOUNT SWAP: a new login was put on this phone mid-run -> stop cleanly
+        # before claiming/stamping under the stale account.
+        _cur = ai.account_for(DEVICE)
+        if _cur is not None and _cur != ACCOUNT:
+            log(f"ACCOUNT_SWAPPED {ACCOUNT} -> {_cur} mid-run — stopping")
+            fleet_events.emit("result", account=ACCOUNT, device=DEVICE,
+                              verdict="ACCOUNT_SWAPPED", rc=10, success=False,
+                              published=False, code="account_swapped")
+            return 10
         # never exceed the rolling-24h post cap (blocks here until capacity frees)
         wait_for_rate_capacity()
 
