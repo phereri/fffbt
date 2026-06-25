@@ -332,7 +332,13 @@ def _account_block(account: str, device: str, all_events: list[dict],
     }
 
 
+_build_state_cache: dict = {"ts": 0.0, "data": None}
+
+
 def build_state() -> dict:
+    _now = time.time()
+    if _build_state_cache["data"] is not None and _now - _build_state_cache["ts"] < 2.5:
+        return _build_state_cache["data"]
     roster = _read_json(BINDING).get("devices", {}) or {}
     all_events = fleet_events.read_events()
 
@@ -403,7 +409,7 @@ def build_state() -> dict:
             "total": (r.get("timing") or {}).get("total"),
         })
 
-    return {
+    result = {
         "now": fleet_events.now_iso(),
         "fleet": {
             "session_start": session_start_ts,
@@ -432,6 +438,8 @@ def build_state() -> dict:
         "backlog": _db_counts(),
         "s3_sync": _s3_sync_view(),
     }
+    _build_state_cache.update(ts=_now, data=result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1074,7 @@ def control_state() -> dict:
         sm = _device_stop_map()
         dm = _dup_map()
         am = _a11y_map()
+        pmap = {a["account"]: a for a in build_state().get("accounts", [])}
         for d in devs:
             cands = [c for c in (cm["by_serial"].get(d["serial"]),
                                  cm["by_account"].get(d.get("account"))) if c]
@@ -1092,6 +1101,12 @@ def control_state() -> dict:
             ad = am["by_dev"].get(d["serial"])
             d["a11y_down"] = bool(ad)
             d["a11y_since"] = ad["since"] if ad else None
+            # posting status + stats for this account: the row shows status.label
+            # (script execution status), the expanded row renders counts/timings/recent.
+            pb = pmap.get(d.get("account"))
+            d["posting"] = ({"status": pb.get("status"), "counts": pb.get("counts"),
+                             "timings": pb.get("timings"), "recent": pb.get("recent"),
+                             "last_post_ts": pb.get("last_post_ts")} if pb else None)
     return {
         "adb_ok": devs is not None,
         "devices": devs or [],
@@ -1508,6 +1523,17 @@ INDEX_HTML = r"""<!doctype html>
     border-radius:7px;padding:5px 7px;font:inherit;font-size:12px;cursor:pointer}
   .ctl-cols{display:grid;grid-template-columns:1.05fr 1fr;gap:20px}
   @media(max-width:980px){.ctl-cols{grid-template-columns:1fr}}
+  /* collapsible Tasks panel (right side) */
+  .tcol-head{display:flex;align-items:center;gap:8px}
+  .tcol-tog{cursor:pointer;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    color:var(--fg);padding:5px 9px;font-size:12px;font-weight:600;white-space:nowrap}
+  .tcol-tog:hover{background:var(--line)}
+  .ctl-cols.tcol{grid-template-columns:minmax(0,1fr) 40px}
+  .ctl-cols.tcol .tcol-title,.ctl-cols.tcol .tcol-body{display:none}
+  .ctl-cols.tcol .tcol-head{flex-direction:column;height:100%;margin:0}
+  .ctl-cols.tcol .tcol-tog{writing-mode:vertical-rl;transform:rotate(180deg);padding:11px 7px}
+  @media(max-width:980px){.ctl-cols.tcol{grid-template-columns:1fr}
+    .ctl-cols.tcol .tcol-tog{writing-mode:horizontal-tb;transform:none;width:100%}}
   .chead,.crow{display:grid;gap:8px;align-items:center;
     grid-template-columns:56px minmax(100px,1.3fr) minmax(110px,1fr) 86px 32px;padding:8px 12px}
   .hall{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--muted)}
@@ -1528,6 +1554,17 @@ INDEX_HTML = r"""<!doctype html>
   .crow .cstate{text-align:right;font-size:11px;font-weight:600}
   .crow .cstop{display:block;font-size:10px;font-weight:400;color:var(--muted);white-space:normal;margin-top:1px;line-height:1.2}
   .crow .cstop.bad{color:var(--warn)}
+  /* posting status (script execution) sub-line on the device row */
+  .crow .cstat{display:block;font-size:10px;font-weight:500;white-space:normal;margin-top:1px;line-height:1.2}
+  .cstat.st-act{color:var(--accent)} .cstat.st-pause{color:var(--warn)}
+  .cstat.st-done{color:var(--info)} .cstat.st-bad{color:var(--bad)} .cstat.st-mut{color:var(--muted)}
+  /* posting stats inside the expanded row panel */
+  .cpanel-stats{margin:-2px 0 9px;padding-bottom:9px;border-bottom:1px dashed var(--line)}
+  .cpanel-stats .sline{font-size:12px;margin-bottom:3px}
+  .cpanel-stats .sline b{font-weight:650}
+  .cstat-recent{width:100%;border-collapse:collapse;margin-top:5px;font-size:11px}
+  .cstat-recent td{padding:1px 8px 1px 0;vertical-align:top;white-space:nowrap}
+  .cstat-recent td.nm{color:var(--muted);max-width:170px;overflow:hidden;text-overflow:ellipsis}
   /* per-device expand toggle + proxy detail panel */
   .cexpand{justify-self:end;width:26px;height:26px;display:inline-flex;align-items:center;
     justify-content:center;background:transparent;color:var(--muted);border:1px solid var(--line);
@@ -1762,10 +1799,24 @@ INDEX_HTML = r"""<!doctype html>
             <option value="blocked">blocked</option>
           </select>
         </label>
+        <label class="mini">activity
+          <select id="ctlActFilter">
+            <option value="all">all</option>
+            <option value="active">active (running)</option>
+            <option value="idle">idle</option>
+            <option value="done">done</option>
+            <option value="never">never posted</option>
+            <option value="dup">has dup</option>
+          </select>
+        </label>
         <label class="mini">sort
           <select id="ctlSort">
             <option value="account">account</option>
             <option value="serial">serial</option>
+            <option value="status">status</option>
+            <option value="posted">posted ↓</option>
+            <option value="attempts">attempts ↓</option>
+            <option value="lastpost">last post ↓</option>
             <option value="state">adb state</option>
             <option value="stop">stop reason</option>
           </select>
@@ -1797,18 +1848,23 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="devlist" id="ctlDevs"></div>
     </div>
-    <div>
-      <h2>Tasks <a href="#" class="mini" id="ctlClear">— clear finished</a></h2>
-      <div class="task-filters">
-        <select id="tfStatus" title="filter by status">
-          <option value="">all statuses</option>
-          <option value="active">active</option>
-          <option value="success">success</option>
-          <option value="failed">failed</option>
-        </select>
-        <select id="tfCmd" title="filter by command"><option value="">all commands</option></select>
+    <div id="ctlTasksCol">
+      <div class="tcol-head">
+        <button type="button" id="ctlTasksTog" class="tcol-tog" title="collapse / expand the tasks panel">Tasks ›</button>
+        <h2 class="tcol-title" style="margin:0">Tasks <a href="#" class="mini" id="ctlClear">— clear finished</a></h2>
       </div>
-      <div id="ctlTasks"></div>
+      <div class="tcol-body">
+        <div class="task-filters">
+          <select id="tfStatus" title="filter by status">
+            <option value="">all statuses</option>
+            <option value="active">active</option>
+            <option value="success">success</option>
+            <option value="failed">failed</option>
+          </select>
+          <select id="tfCmd" title="filter by command"><option value="">all commands</option></select>
+        </div>
+        <div id="ctlTasks"></div>
+      </div>
     </div>
   </div>
   <div id="postModal" class="modal-bg" style="display:none">
@@ -2324,6 +2380,13 @@ const taskNodes = new Map();       // task id -> {root, update} — persistent n
 const TF = { status:'', cmd:'' };  // task filters
 const CSTATE_COLOR = { device:'var(--accent)', offline:'var(--bad)',
   unauthorized:'var(--warn)', disconnected:'var(--muted)' };
+// posting status state -> css class (script execution status on the device row)
+const STATE_CLS = { working:'st-act', starting:'st-act', recovering:'st-act',
+  sleeping:'st-pause', rate_limited:'st-pause', done:'st-done',
+  stopped:'st-bad', offline:'st-mut', idle:'st-mut', unknown:'st-mut' };
+const agoISO = ts => ts ? agoEpoch(Date.parse(ts)/1000) : '';
+const fmtSec = s => (s==null||s==='')?'—':(s<60?Math.round(s)+'s':Math.round(s/60)+'m');
+const verdShort = v => v==='SUCCESS'?'✓':v==='PUBLISHED_UNCONFIRMED'?'~':v==='FAILED'?'✗':(v||'?');
 const agoEpoch = sec => { if(!sec) return ''; const x=Date.now()/1000-sec;
   if(x<60) return Math.round(x)+'s ago'; if(x<3600) return Math.round(x/60)+'m ago';
   if(x<86400) return Math.round(x/3600)+'h ago'; return Math.round(x/86400)+'d ago'; };
@@ -2349,10 +2412,21 @@ function filteredDevices(){
   const ros=$('#ctlRosterOnly').checked;
   const bf=($('#ctlBlockFilter')||{}).value||'all';
   const rf=($('#ctlStopFilter')||{}).value||'all';   // filter by last-run stop reason
+  const af=($('#ctlActFilter')||{}).value||'all';    // filter by posting activity
   const out=all.filter(d=>{
     if(ros && !d.in_roster) return false;
     if(bf==='blocked' && !d.blocked) return false;
     if(bf==='unblocked' && d.blocked) return false;
+    if(af!=='all'){
+      const stt=d.posting&&d.posting.status&&d.posting.status.state;
+      const active=['working','starting','recovering','sleeping','rate_limited'].includes(stt);
+      const posted=(d.posting&&d.posting.counts&&d.posting.counts.posted)||0;
+      if(af==='active' && !active) return false;
+      if(af==='idle' && active) return false;
+      if(af==='done' && stt!=='done') return false;
+      if(af==='never' && posted>0) return false;
+      if(af==='dup' && !d.dup_reason) return false;
+    }
     if(rf==='A11Y_DOWN'){                                       // unify: bind a11y-down OR posting A11Y_DOWN
       if(!(d.a11y_down || d.stop_verdict==='A11Y_DOWN')) return false;
     } else if(rf==='none'){
@@ -2364,10 +2438,19 @@ function filteredDevices(){
     return true;
   });
   const sk=($('#ctlSort')||{}).value||'account';
-  const keyf=d=> sk==='serial'?(d.serial||'') : sk==='state'?(d.state||'') :
-                 sk==='stop'?(d.blocked?'!blocked':(d.stop_label||'~~~')) : (d.account||'~~~');
-  out.sort((a,b)=> keyf(a).localeCompare(keyf(b),undefined,{numeric:true})
-                   || (a.serial||'').localeCompare(b.serial||'',undefined,{numeric:true}));
+  const NUM={posted:1,attempts:1,lastpost:1};
+  if(NUM[sk]){   // numeric sorts, descending (most posted / most recent first)
+    const nf=d=>{ const c=d.posting&&d.posting.counts;
+      return sk==='posted'?(c?c.posted:-1) : sk==='attempts'?(c?c.attempts:-1)
+           : (d.posting&&d.posting.last_post_ts?Date.parse(d.posting.last_post_ts):0); };
+    out.sort((a,b)=> nf(b)-nf(a) || (a.serial||'').localeCompare(b.serial||'',undefined,{numeric:true}));
+  } else {
+    const keyf=d=> sk==='serial'?(d.serial||'') : sk==='state'?(d.state||'') :
+                   sk==='status'?((d.posting&&d.posting.status&&d.posting.status.label)||'~~~') :
+                   sk==='stop'?(d.blocked?'!blocked':(d.stop_label||'~~~')) : (d.account||'~~~');
+    out.sort((a,b)=> keyf(a).localeCompare(keyf(b),undefined,{numeric:true})
+                     || (a.serial||'').localeCompare(b.serial||'',undefined,{numeric:true}));
+  }
   return out;
 }
 function renderDevicesView(){
@@ -2388,9 +2471,17 @@ function renderDevicesView(){
     // last-run stop reason (TRIAL_LIMIT / trial reels not enabled / repeated failures / …)
     // shown for non-blocked, not-currently-busy devices so an active account's last
     // outcome is visible; blocked shows its own ⚠ badge, busy shows the task.
+    // posting status (script execution status) — the live status the user wants in
+    // the row; falls back to the last-run stop label when there's no posting data.
+    const ps = d.posting && d.posting.status, cnt = (d.posting && d.posting.counts) || {};
     const fail=d.stop_verdict && !['SUCCESS','PUBLISHED_UNCONFIRMED'].includes(d.stop_verdict);
-    const sub=(d.stop_label && !d.blocked && !d.busy)
-      ? `<span class="cstop${fail?' bad':''}" title="last run: ${esc(d.stop_verdict||'')} · ${agoEpoch(d.stop_since)}">${esc(d.stop_label)}</span>` : '';
+    let sub='';
+    if(ps && !d.blocked && !d.busy){
+      const tip = `${esc(ps.state||'')} · posted ${cnt.posted||0}/${cnt.attempts||0} · ✓${cnt.confirmed||0} ✗${cnt.failed||0}${d.posting.last_post_ts?(' · last '+agoISO(d.posting.last_post_ts)):''}`;
+      sub = `<span class="cstat ${STATE_CLS[ps.state]||'st-mut'}" title="${tip}">${esc(ps.label||ps.state||'')}</span>`;
+    } else if(d.stop_label && !d.blocked && !d.busy){
+      sub = `<span class="cstop${fail?' bad':''}" title="last run: ${esc(d.stop_verdict||'')} · ${agoEpoch(d.stop_since)}">${esc(d.stop_label)}</span>`;
+    }
     // BLOCKED always shows (even if the device is still flagged busy in a task), so a
     // real block is never hidden behind the busy badge. A blocked device is selectable.
     const bb=d.blocked?`<span class="bblk" title="${esc(d.block_reason||'login challenge')} · ${agoEpoch(d.block_since)}">⚠ BLOCKED</span> `:'';
@@ -2445,8 +2536,19 @@ async function refreshCtlProxy(){
   finally{ CTLPROXY_BUSY=false; }
 }
 function panelInner(serial){
+  // posting stats for THIS device's account (from /api/control/state d.posting)
+  const dd=((CTLLAST&&CTLLAST.devices)||[]).find(x=>x.serial===serial), p=dd&&dd.posting;
+  let statsHtml='';
+  if(p){
+    const c=p.counts||{}, t=p.timings||{}, tt=t.total||{}, rec=(p.recent||[]).slice(0,6);
+    statsHtml=`<div class="cpanel-stats">`
+      +`<div class="sline"><b>${c.posted||0}</b>/${c.attempts||0} posted · ✓${c.confirmed||0}${c.unconfirmed?(' ~'+c.unconfirmed):''}${c.failed?(' ✗'+c.failed):''}${p.last_post_ts?(' · last '+agoISO(p.last_post_ts)):''}</div>`
+      +(tt.n?`<div class="sline mini muted">avg total ${fmtSec(tt.avg)} · prepare ${fmtSec((t.prepare||{}).avg)} · publish ${fmtSec((t.publish||{}).avg)} · verify ${fmtSec((t.verify||{}).avg)}</div>`:'')
+      +(rec.length?('<table class="cstat-recent">'+rec.map(r=>`<tr><td>${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${verdShort(r.verdict)} reel</a>`:verdShort(r.verdict)}</td><td class="nm">${esc((r.name||'').replace(/\.mp4$/,''))}</td><td class="mini muted">${agoISO(r.ts)}</td><td class="mini muted">${fmtSec(r.total)}</td></tr>`).join('')+'</table>'):'')
+      +`</div>`;
+  }
   const i=CTLPROXY.get(serial), op=pxOp.get(serial)||{}, ip=serial.split(':')[0];
-  if(!CTLPROXY_LOADED) return '<div class="mini muted">loading proxy info…</div>';
+  if(!CTLPROXY_LOADED) return statsHtml+'<div class="mini muted">loading proxy info…</div>';
   const stc=i?(PX_COLOR[i.state]||'var(--muted)'):'var(--muted)';
   const px=(i&&i.proxy)?`${esc(i.proxy.server||'?')}:${esc(i.proxy.port||'')}`:'<span class="muted">none</span>';
   const user=(i&&i.proxy&&i.proxy.username)?esc(i.proxy.username):'<span class="muted">—</span>';
@@ -2462,7 +2564,7 @@ function panelInner(serial){
   const renewBtn=`<button class="dirbtn cpx-renew" data-ser="${esc(serial)}"${(!renewable||busy)?' disabled':''} title="${renewable?'extend this proxy by 1 day (SPENDS money)':'not a managed proxy.vn proxy — cannot renew, use rotate'}">↻ renew</button>`;
   const rotateBtn=`<button class="dirbtn cpx-rotate" data-ser="${esc(serial)}"${busy?' disabled':''} title="buy a fresh proxy and assign it to this device (SPENDS money)">🔁 rotate</button>`;
   const msg=op.msg?`<span class="mini cpx-msg" style="color:${op.err?'var(--bad)':'var(--muted)'}">${esc(op.msg)}</span>`:'';
-  return `<div class="cpanel-grid">
+  return statsHtml+`<div class="cpanel-grid">
     <div><span class="pl">proxy</span>${px}</div>
     <div><span class="pl">user</span>${user}</div>
     <div><span class="pl">provider</span>${prov}</div>
@@ -2709,8 +2811,20 @@ $('#tfCmd').addEventListener('change', e=>{ TF.cmd=e.target.value; renderTasks(C
 $('#ctlSearch').addEventListener('input', renderDevicesView);
 $('#ctlRosterOnly').addEventListener('change', renderDevicesView);
 $('#ctlBlockFilter').addEventListener('change', renderDevicesView);
+$('#ctlActFilter').addEventListener('change', renderDevicesView);
 $('#ctlSort').addEventListener('change', renderDevicesView);
 $('#ctlStopFilter').addEventListener('change', renderDevicesView);
+// collapsible Tasks panel (right side) — state remembered across reloads
+function applyTasksCollapsed(){
+  const col=document.querySelector('.ctl-cols'); if(!col) return;
+  const c=localStorage.getItem('ctlTasksCollapsed')==='1';
+  col.classList.toggle('tcol', c);
+  const t=$('#ctlTasksTog'); if(t) t.textContent = c ? '‹ Tasks' : 'Tasks ›';
+}
+if($('#ctlTasksTog')) $('#ctlTasksTog').addEventListener('click',()=>{
+  const c=localStorage.getItem('ctlTasksCollapsed')==='1';
+  localStorage.setItem('ctlTasksCollapsed', c?'0':'1'); applyTasksCollapsed(); });
+applyTasksCollapsed();
 $('#ctlSelAll').addEventListener('click',e=>{ e.preventDefault();
   filteredDevices().forEach(d=>{ if(!d.busy) selected.add(d.serial); }); renderDevicesView(); });
 $('#ctlSelNone').addEventListener('click',e=>{ e.preventDefault(); selected.clear(); renderDevicesView(); });
