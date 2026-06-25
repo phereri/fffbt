@@ -300,6 +300,20 @@ async def main() -> int:
         except Exception as e:
             print(f"  automation.accounts sync skipped: {e}")
 
+    # Re-point each (re)bound device to its ACCOUNT's recorded proxy (DB -> router),
+    # so a proxy follows its account across an IP move. Outward router action -> opt-in
+    # via DISCOVER_APPLY_PROXY=1 (or run `account_proxy_store.py --apply` manually).
+    if os.environ.get("DISCOVER_APPLY_PROXY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import account_proxy_store
+            touched = [s for s, u in results if u]
+            changes = account_proxy_store.apply_account_proxies(serials=touched)
+            if changes:
+                print(f"  proxy re-applied from DB to {len(changes)} device(s): "
+                      + ", ".join(f"{s}->{hp}" for s, _a, hp in changes[:6]))
+        except Exception as e:
+            print(f"  account-proxy apply skipped: {e}")
+
     print(f"\nroster now {len(deduped)} bindings ({len(added)} new, {len(changed)} changed, "
           f"{len(dropped)} dup dropped, {len(pruned)} stale pruned) -> {BINDING}")
     for s, old, new in changed:

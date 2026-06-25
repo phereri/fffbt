@@ -1291,6 +1291,16 @@ def _proxy_autorenew_loop() -> None:
                       f"{[c['account'] for c in res['candidates']]}", flush=True)
         except Exception as e:
             print(f"[proxy-autorenew] error: {e}", flush=True)
+        # keep the account<->proxy bindings in automation.* fresh (best-effort) so a
+        # proxy stays attached to its ACCOUNT after renewals / re-assignments.
+        try:
+            from scripts import account_proxy_store
+            r = account_proxy_store.sync()
+            if r.get("accounts_bound"):
+                print(f"[proxy-autorenew] account<->proxy synced: "
+                      f"{r.get('accounts_bound')} bound", flush=True)
+        except Exception as e:
+            print(f"[proxy-autorenew] account-proxy sync error: {e}", flush=True)
         time.sleep(PROXY_RENEW_INTERVAL)
 
 
