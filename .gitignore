@@ -49,6 +49,7 @@ post_loop_*.log
 # Run artifacts / local backups (never commit)
 trajectories/
 data/
+graphify-out/
 .claude/
 .tools/
 *.bak
