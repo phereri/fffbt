@@ -78,6 +78,20 @@ ERROR_YELLOW_PCT = 15   # error rate over this -> yellow
 BLOCK_YELLOW_PCT = 20   # blocked share over this -> yellow
 OFFLINE_YELLOW_PCT = 15 # offline share over this -> yellow
 
+# Pace model (capacity-based). темп = active_devices_now * (1 / cadence), where
+# cadence is the MEASURED median interval between two consecutive posts of the
+# same account (not the duration of a single post). This gives a realistic number
+# the instant the fleet starts (cadence comes from history) and tracks the live
+# active count immediately — a dropped account lowers темп without waiting for a
+# 24h average to catch up. The recent window is blended onto the historical prior
+# as today's posts accrue, so the estimate self-corrects toward current reality.
+CAD_MAX_GAP_MIN = 240     # ignore gaps longer than this: overnight / trial-limit sleep, not active cadence
+CAD_RECENT_HR = 6         # "today's run" measurement window
+CAD_PRIOR_DAYS = 7        # historical prior window
+CAD_MIN_SAMPLE = 8        # min gaps before a window's cadence is trusted
+CAD_BLEND_TARGET_N = 40   # recent posts needed to fully trust today over the prior
+CAD_DEFAULT_MIN = 120     # cold-start cadence when there is no history at all
+
 
 # ---------------------------------------------------------------------------
 # .env + tiny utilities (inlined to keep the bot import-light and stdlib-only)
@@ -198,17 +212,49 @@ def _mgmt_query(sql: str, timeout: int = 25) -> list[dict] | None:
         return None
 
 
-_DB_SQL = (
-    "SELECT "
-    "(SELECT count(*) FROM fffbt.videos WHERE platform='Instagram' "
-    " AND status IN ('posted','verify') AND published_at > now() - interval '24 hours') AS posted_24h, "
-    "(SELECT count(*) FROM fffbt.videos WHERE platform='Instagram' "
-    " AND status IN ('posted','verify')) AS total_posted, "
-    "(SELECT max(published_at) FROM fffbt.videos WHERE platform='Instagram' "
-    " AND published_at IS NOT NULL) AS last_published_at, "
-    "(SELECT name FROM fffbt.videos WHERE platform='Instagram' "
-    " AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1) AS last_name"
+_DB_SQL = f"""
+WITH g AS (
+  SELECT published_at AS ts,
+         EXTRACT(EPOCH FROM (published_at - lag(published_at)
+           OVER (PARTITION BY posted_by ORDER BY published_at))) AS gap_s
+  FROM fffbt.videos
+  WHERE platform='Instagram' AND status IN ('posted','verify')
+    AND published_at IS NOT NULL AND posted_by IS NOT NULL
+    AND published_at > now() - interval '{CAD_PRIOR_DAYS} days'
+),
+gg AS (
+  SELECT ts, gap_s FROM g WHERE gap_s > 0 AND gap_s < {CAD_MAX_GAP_MIN * 60}
+),
+cad AS (
+  SELECT
+    percentile_cont(0.25) WITHIN GROUP (ORDER BY gap_s) AS p25_7d,
+    percentile_cont(0.50) WITHIN GROUP (ORDER BY gap_s) AS p50_7d,
+    percentile_cont(0.75) WITHIN GROUP (ORDER BY gap_s) AS p75_7d,
+    count(*) AS n_7d,
+    percentile_cont(0.25) WITHIN GROUP (ORDER BY gap_s)
+      FILTER (WHERE ts > now() - interval '{CAD_RECENT_HR} hours') AS p25_6h,
+    percentile_cont(0.50) WITHIN GROUP (ORDER BY gap_s)
+      FILTER (WHERE ts > now() - interval '{CAD_RECENT_HR} hours') AS p50_6h,
+    percentile_cont(0.75) WITHIN GROUP (ORDER BY gap_s)
+      FILTER (WHERE ts > now() - interval '{CAD_RECENT_HR} hours') AS p75_6h,
+    count(*) FILTER (WHERE ts > now() - interval '{CAD_RECENT_HR} hours') AS n_6h
+  FROM gg
 )
+SELECT
+  (SELECT count(*) FROM fffbt.videos WHERE platform='Instagram'
+     AND status IN ('posted','verify') AND published_at > now() - interval '24 hours') AS posted_24h,
+  (SELECT count(*) FROM fffbt.videos WHERE platform='Instagram'
+     AND status IN ('posted','verify')) AS total_posted,
+  (SELECT count(*) FROM fffbt.videos WHERE platform='Instagram'
+     AND status='new') AS remaining_new,
+  (SELECT max(published_at) FROM fffbt.videos WHERE platform='Instagram'
+     AND published_at IS NOT NULL) AS last_published_at,
+  (SELECT name FROM fffbt.videos WHERE platform='Instagram'
+     AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1) AS last_name,
+  cad.p25_7d, cad.p50_7d, cad.p75_7d, cad.n_7d,
+  cad.p25_6h, cad.p50_6h, cad.p75_6h, cad.n_6h
+FROM cad
+""".strip()
 
 _db_cache: dict = {"ts": 0.0, "data": None}
 
@@ -222,11 +268,25 @@ def db_extras() -> dict | None:
         _db_cache.update(ts=now, data=None)
         return None
     r = rows[0]
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
     out = {
         "posted_24h": int(r.get("posted_24h") or 0),
         "total_posted": int(r.get("total_posted") or 0),
+        "remaining_new": int(r.get("remaining_new") or 0),
         "last_published_at": r.get("last_published_at"),
         "last_name": r.get("last_name"),
+        "cad": {
+            "p25_7d": _f(r.get("p25_7d")), "p50_7d": _f(r.get("p50_7d")),
+            "p75_7d": _f(r.get("p75_7d")), "n_7d": int(r.get("n_7d") or 0),
+            "p25_6h": _f(r.get("p25_6h")), "p50_6h": _f(r.get("p50_6h")),
+            "p75_6h": _f(r.get("p75_6h")), "n_6h": int(r.get("n_6h") or 0),
+        },
     }
     _db_cache.update(ts=now, data=out)
     return out
@@ -338,6 +398,85 @@ def _health(counts: dict, last_post_age_s: float | None, runway_hr: float | None
     return "🟢", "работает"
 
 
+def _blend_cad(p_recent, n_recent, p_prior, n_prior, default_s) -> float:
+    """Cadence (seconds) blending the recent window onto the 7-day prior.
+
+    Weight grows with the number of recent samples, so at fleet startup (no posts
+    yet today) we use the historical prior and get an instant realistic number,
+    then drift toward today's measured cadence as posts accrue. Falls back
+    prior -> default when a window is too thin to trust.
+    """
+    prior = p_prior if (p_prior and n_prior >= CAD_MIN_SAMPLE) else default_s
+    if p_recent and n_recent >= 1:
+        w = min(1.0, n_recent / float(CAD_BLEND_TARGET_N))
+        return prior * (1.0 - w) + p_recent * w
+    return prior
+
+
+def _estimate_pace(active: int, remaining, cad: dict | None) -> dict:
+    """Capacity-based pace: темп = active * (1 / cadence).
+
+    Returns the central rate (posts/hr) plus a runway range in hours derived from
+    the p25..p75 cadence spread (the 15-vs-30-min / wait-time variability). A short
+    gap (p25) = fast rate = shorter runway; a long gap (p75) = slow rate = longer
+    runway.
+    """
+    default_s = CAD_DEFAULT_MIN * 60.0
+    if not cad:
+        c25 = default_s * 0.7
+        c50 = default_s
+        c75 = default_s * 1.5
+        n_recent = 0
+    else:
+        n_recent = cad.get("n_6h") or 0
+        c25 = _blend_cad(cad["p25_6h"], n_recent, cad["p25_7d"], cad["n_7d"], default_s * 0.7)
+        c50 = _blend_cad(cad["p50_6h"], n_recent, cad["p50_7d"], cad["n_7d"], default_s)
+        c75 = _blend_cad(cad["p75_6h"], n_recent, cad["p75_7d"], cad["n_7d"], default_s * 1.5)
+    # Blending two windows can invert the order slightly; keep p25<=p50<=p75.
+    c25, c50, c75 = sorted([c25, c50, c75])
+
+    def rate(cs):  # posts/hour at current active count
+        return active * 3600.0 / cs if (active and cs and cs > 0) else 0.0
+
+    rate_mid, rate_fast, rate_slow = rate(c50), rate(c25), rate(c75)
+
+    def runway(rt):  # hours of backlog at this rate
+        if not remaining or not rt or rt <= 0:  # no backlog / no rate -> undefined
+            return None
+        return remaining / rt
+
+    return {
+        "rate_mid": rate_mid,
+        "runway_mid": runway(rate_mid),
+        "runway_low": runway(rate_fast),    # fast rate -> shortest runway
+        "runway_high": runway(rate_slow),   # slow rate -> longest runway
+        "projected": n_recent < CAD_MIN_SAMPLE,  # ~no data yet today -> pure forecast from history
+    }
+
+
+def _fmt_rate(r) -> str:
+    if not r:
+        return "—"
+    return f"{round(r)}" if r >= 10 else f"{r:.1f}"
+
+
+def _fmt_runway_range(low_h, high_h) -> str:
+    """Render a runway range, picking ч / дн by the high end. Collapses to a single
+    value when both ends round equal; caps at >30 дн."""
+    if low_h is None or high_h is None:
+        return "—"
+    lo, hi = sorted([low_h, high_h])
+    if hi >= 48:
+        lo_d, hi_d = lo / 24.0, hi / 24.0
+        if hi_d > 30:
+            return ">30 дн"
+        if round(lo_d, 1) == round(hi_d, 1):
+            return f"~{hi_d:.1f} дн"
+        return f"{lo_d:.1f}–{hi_d:.1f} дн"
+    lo_h, hi_h = round(lo), round(hi)
+    return f"~{hi_h} ч" if lo_h == hi_h else f"{lo_h}–{hi_h} ч"
+
+
 def build_message() -> str:
     state = _dash_get("/api/state")
     now_local = datetime.now().strftime("%H:%M:%S")
@@ -356,16 +495,19 @@ def build_message() -> str:
     summary = state.get("summary") or {}
     backlog = state.get("backlog") or {}
 
-    remaining = backlog.get("new")
+    # remaining backlog: prefer the authoritative DB count of status='new';
+    # fall back to the dashboard's backlog blob only if the DB query failed.
+    remaining = (extras or {}).get("remaining_new")
+    if remaining is None:
+        remaining = backlog.get("new")
     posted_24h = (extras or {}).get("posted_24h")
     total_posted = (extras or {}).get("total_posted")
     error_rate = summary.get("error_rate") or 0
 
-    # rate (24h average) + runway
-    rate_hr = round(posted_24h / 24.0, 1) if posted_24h is not None else None
-    runway_hr = None
-    if remaining is not None and rate_hr and rate_hr > 0:
-        runway_hr = remaining / rate_hr
+    # capacity-based pace: темп = active_now * (1 / measured cadence), with a runway
+    # range from the cadence spread (see _estimate_pace). The midpoint feeds health.
+    pace = _estimate_pace(counts["active"], remaining, (extras or {}).get("cad"))
+    runway_hr = pace["runway_mid"]
 
     # last-post age (prefer durable DB published_at; fall back to events)
     last_pub = _parse_pg_ts((extras or {}).get("last_published_at")) or _fleet_last_post_ts(state)
@@ -373,13 +515,6 @@ def build_message() -> str:
     shot = _shot_date_from_name((extras or {}).get("last_name"))
 
     emoji, label = _health(counts, last_post_age, runway_hr, error_rate, dash_ok=True)
-
-    def runway_str() -> str:
-        if runway_hr is None:
-            return "—"
-        if runway_hr >= 48:
-            return f"~{runway_hr / 24:.1f} дн"
-        return f"~{round(runway_hr)} ч"
 
     L = []
     L.append("📊 <b>FFFBT — статус выкладки</b>")
@@ -393,13 +528,16 @@ def build_message() -> str:
     L.append("")
     L.append("🎬 <b>Видео в БД</b>")
     L.append(f"   🆕 осталось — <b>{fmt(remaining) if remaining is not None else '—'}</b>")
-    L.append(f"   🕐 запас — <b>{runway_str()}</b>")
+    L.append(f"   🕐 запас — <b>{_fmt_runway_range(pace['runway_low'], pace['runway_high'])}</b>")
     L.append(f"   ⏱ посл. пост — <b>{_ago(last_post_age)}</b>")
     L.append(f"   📅 возраст ролика — <b>{_age_days_str(shot)}</b>")
     L.append("")
     L.append("📈 <b>Статистика</b>")
     L.append(f"   ✅ за 24ч — <b>{fmt(posted_24h) if posted_24h is not None else '—'}</b>")
-    L.append(f"   ⚡ темп — <b>{rate_hr if rate_hr is not None else '—'} /ч</b>")
+    if pace["rate_mid"]:
+        L.append(f"   ⚡ темп — <b>{_fmt_rate(pace['rate_mid'])} /ч</b>{' · прогноз' if pace['projected'] else ''}")
+    else:
+        L.append("   ⚡ темп — <b>—</b>")
     L.append(f"   🗂 всего — <b>{fmt(total_posted) if total_posted is not None else '—'}</b>")
     L.append(f"   ✖️ ошибки — <b>{error_rate} %</b>")
 
