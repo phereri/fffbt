@@ -300,16 +300,22 @@ async def main() -> int:
         except Exception as e:
             print(f"  automation.accounts sync skipped: {e}")
 
-    # Re-point each (re)bound device to its ACCOUNT's recorded proxy (DB -> router),
-    # so a proxy follows its account across an IP move. Outward router action -> opt-in
-    # via DISCOVER_APPLY_PROXY=1 (or run `account_proxy_store.py --apply` manually).
+    # PROXY FOLLOWS THE ACCOUNT: when a device's account is NEW or CHANGED, set the
+    # proxy bound to THAT account in the DB (automation -> router) — the device is
+    # configured for its CURRENT worker, not the previous one. This is the per-device
+    # "configure for work" step of the device-abstraction model. Runs by default for
+    # the changed/added bindings only (precise, minimal outward churn);
+    # DISCOVER_APPLY_PROXY=1 broadens it to reconcile ALL touched devices.
+    # Best-effort + never fails the bind (router assign spends nothing).
+    apply_serials = {s for s, _o, _n in changed} | set(added)
     if os.environ.get("DISCOVER_APPLY_PROXY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        apply_serials |= {s for s, u in results if u}
+    if apply_serials:
         try:
             import account_proxy_store
-            touched = [s for s, u in results if u]
-            changes = account_proxy_store.apply_account_proxies(serials=touched)
+            changes = account_proxy_store.apply_account_proxies(serials=apply_serials)
             if changes:
-                print(f"  proxy re-applied from DB to {len(changes)} device(s): "
+                print(f"  proxy set from DB on {len(changes)} device(s) (account new/changed): "
                       + ", ".join(f"{s}->{hp}" for s, _a, hp in changes[:6]))
         except Exception as e:
             print(f"  account-proxy apply skipped: {e}")
