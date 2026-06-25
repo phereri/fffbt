@@ -286,6 +286,23 @@ def replace_proxy_for_device(device_ip: str, provider: str = DEFAULT_PROVIDER,
             "expires": _epoch_to_iso(p.get("time")), "assign": assign, "check": check}
 
 
+def replace_proxy_for_devices(device_ips: list[str], provider: str = DEFAULT_PROVIDER,
+                              days: int = BUY_DAYS) -> list[dict]:
+    """Rotate (buy + assign a fresh proxy) for each device IP in turn. SPENDS money:
+    one buy per device. Returns one result dict per device (same shape as
+    ``replace_proxy_for_device``)."""
+    out = []
+    for ip in device_ips:
+        ip = (ip or "").split(":", 1)[0]
+        if not ip:
+            continue
+        try:
+            out.append(replace_proxy_for_device(ip, provider, days))
+        except Exception as e:                       # one bad device must not abort the rest
+            out.append({"ok": False, "device_ip": ip, "error": str(e)})
+    return out
+
+
 def replace_broken_inwork(provider: str = DEFAULT_PROVIDER, days: int = BUY_DAYS,
                           limit: int | None = None, dry_run: bool = False) -> dict:
     """Replace the proxy on every in-work device whose proxy isn't working (SPENDS

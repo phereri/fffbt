@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> ac
 
 import account_identity as ai
 from scripts.post_trial import (
-    STATUS_DONE, STATUS_NEW, STATUS_VERIFYING,
+    STATUS_DONE, STATUS_NEW, STATUS_VERIFYING, UniquifyUnavailable,
     _batch_folder, _close_instagram, _load_env, _parse_s3_uri,
     account_links, claim_one, link_exists, presign, set_status, uniquify_caption,
 )
@@ -207,7 +207,9 @@ async def _drive(args: argparse.Namespace) -> int:
         base_caption = (meta.caption if meta and meta.caption else row.get("caption") or "").strip()
         if not base_caption:
             raise RuntimeError(f"no caption in S3 meta for {folder!r} and none on the row")
-        caption = uniquify_caption(base_caption)
+        # Uniquify the caption. If the uniquifier is DOWN (all backends failed) we
+        # must NOT post a non-unique description -> raise -> stop this device (rc 11).
+        caption = uniquify_caption(base_caption, raise_on_unavailable=True)
         print(f"video s3://{bucket}/{key}\n  caption({len(caption)}ch)={caption!r}")
 
         # 2) push the real video to the gallery — through the fleet-wide DOWNLOAD
@@ -371,6 +373,24 @@ async def _drive(args: argparse.Namespace) -> int:
                           verdict="TRIAL_LIMIT", rc=8, success=False, published=False,
                           code="trial_limit", error=e.headline)
         return 8
+
+    except UniquifyUnavailable as e:
+        # the caption uniquifier (ShopAIKey primary + Gemini fallback) is down -> do
+        # NOT post a non-unique description. Release the row and STOP this device; it
+        # resumes once a uniquifier key is healthy again (see the dashboard banner).
+        try:
+            set_status(vid, STATUS_NEW)
+        except Exception:
+            pass
+        try:
+            traj.log("uniquify_down", detail=e.detail, errors=e.errors)
+        except Exception:
+            pass
+        print(f"[UNIQUIFY_DOWN] {device} {account}: {e.reason} -> stopping device; traj={traj.dir}")
+        fleet_events.emit("result", account=account, device=device, video_id=vid, name=name,
+                          verdict="UNIQUIFY_DOWN", rc=11, success=False, published=False,
+                          code="uniquify_down", error=e.reason)
+        return 11
 
     except Exception as e:
         try:

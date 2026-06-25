@@ -311,6 +311,9 @@ async def _run_device(device: str, ns: argparse.Namespace, delay: float) -> tupl
         elif rc == 3:                         # no rows to claim
             print(f"[{device}] no videos available — stopping")
             break
+        elif rc == 11:                        # caption uniquifier down — don't post non-unique
+            print(f"[{device}] UNIQUIFY_DOWN (caption uniquifier unavailable) — stopping device")
+            break
         else:                                 # transient failure -> short retry
             fails += 1
             if fails >= 5:
@@ -358,7 +361,7 @@ async def _main_async(ns: argparse.Namespace) -> int:
         verdict = {0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS",
                    4: "BLOCKED (login challenge)", 5: "A11Y_DOWN",
                    6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT",
-                   9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED"}.get(rc, "FAILED")
+                   9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED", 11: "UNIQUIFY_DOWN"}.get(rc, "FAILED")
         print(f"  {device:24} rc={rc}  {verdict}")
         worst = max(worst, 0 if rc in (0, 3) else rc)
     return worst

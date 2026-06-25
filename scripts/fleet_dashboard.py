@@ -46,7 +46,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.runner import fleet_events  # noqa: E402
 from src.runner import s3_sync  # noqa: E402
-from scripts import proxy_manager, proxy_vn  # noqa: E402
+from scripts import post_trial, proxy_manager, proxy_vn  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 BINDING = ROOT / "data" / "device_accounts.json"
@@ -553,7 +553,7 @@ def _flag_extra(action: str, opts: dict) -> list[str]:
 _done_cache: dict = {"ts": 0.0, "data": None}
 
 
-_TERMINAL_STOP = {"BLOCKED", "TRIAL_UNAVAILABLE", "PROXY_DOWN", "NO_ROWS"}
+_TERMINAL_STOP = {"BLOCKED", "TRIAL_UNAVAILABLE", "PROXY_DOWN", "NO_ROWS", "UNIQUIFY_DOWN"}
 
 
 def _device_done_map() -> dict:
@@ -597,16 +597,18 @@ _STOP_LABELS = {
     3: "no videos available", 4: "blocked (login challenge)", 5: "accessibility down",
     6: "trial reels not enabled", 7: "proxy down", 8: "trial-reel limit reached",
     9: "duplicate account (blocked)", 10: "account swapped mid-run",
+    11: "caption uniquifier down",
 }
 _RC_VERDICT = {
     0: "SUCCESS", 2: "PUBLISHED_UNCONFIRMED", 3: "NO_ROWS", 4: "BLOCKED",
     5: "A11Y_DOWN", 6: "TRIAL_UNAVAILABLE", 7: "PROXY_DOWN", 8: "TRIAL_LIMIT",
-    9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED",
+    9: "DUP_BLOCKED", 10: "ACCOUNT_SWAPPED", 11: "UNIQUIFY_DOWN",
 }
 # Verdicts that immediately END the loop and are its true terminal reason -- once
 # seen in a run they must not be overwritten by a later success/"done" outcome.
 _TERMINAL_VERDICTS = {"BLOCKED", "TRIAL_UNAVAILABLE", "PROXY_DOWN", "TRIAL_LIMIT",
-                      "NO_ROWS", "A11Y_DOWN", "DUP_BLOCKED", "ACCOUNT_SWAPPED"}
+                      "NO_ROWS", "A11Y_DOWN", "DUP_BLOCKED", "ACCOUNT_SWAPPED",
+                      "UNIQUIFY_DOWN"}
 
 
 def _stop_label(rc) -> str:
@@ -1103,6 +1105,34 @@ def control_state() -> dict:
     }
 
 
+# --- caption uniquifier health (top-of-page banner) ------------------------
+_UNIQ_PROBE_TTL = int(os.environ.get("UNIQUIFY_PROBE_TTL", "600"))   # re-probe at most every 10 min
+_uniq_cache: dict = {"ts": 0.0, "data": None}
+_uniq_lock = threading.Lock()
+
+
+def uniquify_state(force: bool = False) -> dict:
+    """Health of the caption uniquifier (ShopAIKey primary + Gemini fallback) for
+    the warning banner. Probes each backend at most once per _UNIQ_PROBE_TTL
+    (cached), enriched with the last real-post outcome. Never raises."""
+    with _uniq_lock:
+        cached, ts = _uniq_cache["data"], _uniq_cache["ts"]
+    if cached is not None and not force and (time.time() - ts) < _UNIQ_PROBE_TTL:
+        return cached
+    try:
+        data = post_trial.uniquify_probe()
+    except Exception as e:
+        data = {"checked_at": time.time(), "configured": None, "providers": [],
+                "primary_ok": None, "fallback_ok": None, "effective": None, "error": str(e)}
+    try:
+        data["last_post"] = post_trial.read_uniquify_status()
+    except Exception:
+        data["last_post"] = None
+    with _uniq_lock:
+        _uniq_cache.update(ts=time.time(), data=data)
+    return data
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -1141,6 +1171,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/proxy/state":
             try:
                 body = json.dumps(proxy_manager.status(), ensure_ascii=False).encode("utf-8")
+            except Exception as e:
+                return self._send(500, json.dumps({"error": str(e)}).encode("utf-8"),
+                                  "application/json; charset=utf-8")
+            return self._send(200, body, "application/json; charset=utf-8")
+        if path == "/api/uniquify/state":
+            try:
+                force = "force=1" in (self.path.split("?", 1)[1] if "?" in self.path else "")
+                body = json.dumps(uniquify_state(force=force), ensure_ascii=False).encode("utf-8")
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}).encode("utf-8"),
                                   "application/json; charset=utf-8")
@@ -1208,13 +1246,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"ok": False, "error": str(e)}).encode("utf-8"),
                                   "application/json; charset=utf-8")
         if path == "/api/proxy/rotate":
-            # body: {device|ip, provider?} — buy a fresh proxy (SPENDS money) and
-            # assign it to the device, replacing whatever it had.
+            # body: {device|ip, provider?}            -> rotate ONE device
+            #   or: {devices|ips:[...], provider?}    -> rotate MANY (one buy each)
+            # Buys a fresh proxy (SPENDS money) and assigns it, replacing whatever it had.
             try:
+                prov = p.get("provider") or "Viettel"
+                raw = p.get("devices") or p.get("ips")
+                if raw:
+                    ips = [str(x).split(":", 1)[0] for x in raw if str(x).strip()]
+                    ips = [ip for ip in ips if ip]
+                    if not ips:
+                        raise ValueError("no devices")
+                    res = proxy_manager.replace_proxy_for_devices(ips, prov)
+                    return self._send(200, json.dumps({
+                        "ok": True, "results": res,
+                        "rotated": sum(1 for r in res if r.get("ok")),
+                    }).encode("utf-8"), "application/json; charset=utf-8")
                 ip = str(p.get("device") or p.get("ip") or "").split(":", 1)[0]
                 if not ip:
                     raise ValueError("no device")
-                res = proxy_manager.replace_proxy_for_device(ip, p.get("provider") or "Viettel")
+                res = proxy_manager.replace_proxy_for_device(ip, prov)
                 return self._send(200, json.dumps({"ok": bool(res.get("ok")), "result": res}).encode("utf-8"),
                                   "application/json; charset=utf-8")
             except Exception as e:
@@ -1338,6 +1389,15 @@ INDEX_HTML = r"""<!doctype html>
   .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
   .grow{flex:1}
   .muted{color:var(--muted)}
+  /* top-of-page health banner (caption uniquifier) — shows under the navbar */
+  .topbanner{padding:10px 20px;font-size:13px;font-weight:500;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .topbanner.warn{background:rgba(210,153,34,.16);color:#f0c674;border-bottom-color:var(--warn)}
+  .topbanner.bad{background:rgba(248,81,73,.16);color:#ff9a93;border-bottom-color:var(--bad)}
+  .topbanner .tb-detail{font-weight:400;color:var(--muted)}
+  .topbanner .tb-recheck{margin-left:auto;cursor:pointer;color:inherit;text-decoration:underline;
+    white-space:nowrap;background:none;border:none;font:inherit;padding:0}
+  .topbanner code{background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px;font-size:12px}
   .wrap{padding:18px 20px;max-width:1500px;margin:0 auto}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
@@ -1439,7 +1499,7 @@ INDEX_HTML = r"""<!doctype html>
   .ctl-cols{display:grid;grid-template-columns:1.05fr 1fr;gap:20px}
   @media(max-width:980px){.ctl-cols{grid-template-columns:1fr}}
   .chead,.crow{display:grid;gap:8px;align-items:center;
-    grid-template-columns:56px minmax(110px,1.3fr) minmax(120px,1fr) 100px;padding:8px 12px}
+    grid-template-columns:56px minmax(100px,1.3fr) minmax(110px,1fr) 86px 32px;padding:8px 12px}
   .hall{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--muted)}
   .hall input{width:15px;height:15px;accent-color:var(--info);cursor:pointer;margin:0}
   .crow.busy{opacity:.55}
@@ -1448,8 +1508,9 @@ INDEX_HTML = r"""<!doctype html>
     border-radius:5px;padding:0 5px;white-space:nowrap}
   .chead{font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);
     border-bottom:1px solid var(--line)}
-  .crow{border-bottom:1px solid var(--line);cursor:pointer}
-  .crow:last-child{border-bottom:none}
+  .cdev{border-bottom:1px solid var(--line)}
+  .cdev:last-child{border-bottom:none}
+  .crow{cursor:pointer}
   .crow:hover{background:var(--panel2)}
   .crow input[type=checkbox]{width:16px;height:16px;accent-color:var(--info);cursor:pointer;margin:0}
   .crow .cacct{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1457,6 +1518,22 @@ INDEX_HTML = r"""<!doctype html>
   .crow .cstate{text-align:right;font-size:11px;font-weight:600}
   .crow .cstop{display:block;font-size:10px;font-weight:400;color:var(--muted);white-space:normal;margin-top:1px;line-height:1.2}
   .crow .cstop.bad{color:var(--warn)}
+  /* per-device expand toggle + proxy detail panel */
+  .cexpand{justify-self:end;width:26px;height:26px;display:inline-flex;align-items:center;
+    justify-content:center;background:transparent;color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;cursor:pointer;font:inherit;font-size:11px;padding:0;line-height:1}
+  .cexpand:hover{background:var(--panel2);color:var(--fg)}
+  .cdev.open .cexpand{color:var(--info);border-color:var(--info)}
+  .cpanel{background:var(--panel2);border-top:1px solid var(--line);padding:10px 14px 12px}
+  .cpanel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));
+    gap:5px 16px;margin-bottom:10px;font-size:12.5px}
+  .cpanel-grid .pl{display:inline-block;min-width:60px;margin-right:6px;color:var(--muted);
+    font-size:10px;text-transform:uppercase;letter-spacing:.03em}
+  .cpanel-act{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .cpanel .cpx-msg{margin-left:2px}
+  .ctl-pxgrp{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .ctl-pxgrp select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:6px 7px;font:inherit;font-size:12.5px}
   .task{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px}
   .task .thead{display:flex;align-items:center;gap:8px}
   .task .tname{font-weight:650}
@@ -1560,12 +1637,13 @@ INDEX_HTML = r"""<!doctype html>
     .ctl-cols{gap:14px}
     .chead{display:flex;align-items:center;padding:8px 12px}
     .chead>span{display:none}                  /* keep just the "All" checkbox */
-    .crow{grid-template-columns:26px 1fr auto;
-      grid-template-areas:"ck acct st" "ck ser st";gap:1px 8px;padding:10px 12px}
+    .crow{grid-template-columns:26px 1fr auto 34px;
+      grid-template-areas:"ck acct st exp" "ck ser st exp";gap:1px 8px;padding:10px 12px}
     .crow>input[type=checkbox]{grid-area:ck;align-self:center}
     .crow .cacct{grid-area:acct}
     .crow .cser{grid-area:ser}
     .crow .cstate{grid-area:st;align-self:center}
+    .crow .cexpand{grid-area:exp;align-self:center;width:30px;height:30px}
     .ctl-toolbar{padding:10px 12px;gap:8px 10px}
     .ctl-devbar input[type=search]{flex:1 1 100%;min-width:0}
     .ctl-devbar .grow{display:none}
@@ -1639,6 +1717,7 @@ INDEX_HTML = r"""<!doctype html>
   <span class="muted" id="clock"></span>
   <span class="muted" id="refresh">⟳</span>
 </header>
+<div id="uniqBanner" class="topbanner" hidden></div>
 <div class="wrap" id="controlView">
   <div class="ctl-toolbar">
     <span class="mini">on&nbsp;selected&nbsp;→</span>
@@ -1648,6 +1727,17 @@ INDEX_HTML = r"""<!doctype html>
     <span class="grow"></span>
     <span id="ctlAdb" class="pill">adb…</span>
     <button id="ctlReload" class="dirbtn">⟳ devices</button>
+  </div>
+  <div class="ctl-toolbar" style="border-top:none;margin-top:-8px;padding-top:8px">
+    <span class="mini">proxy&nbsp;on&nbsp;selected&nbsp;→</span>
+    <span class="ctl-pxgrp">
+      <button id="ctlPxRenew" class="ctl-actbtn" title="renew (extend) the proxy on each selected device — SPENDS money">↻ renew proxy</button>
+      <button id="ctlPxRotate" class="ctl-actbtn danger" title="buy a fresh proxy and assign it to each selected device, replacing the current one — SPENDS money">🔁 rotate proxy</button>
+      <label class="mini">new&nbsp;proxy&nbsp;provider
+        <select id="ctlPxProv"><option>Viettel</option><option>VNPT</option><option>FPT</option></select>
+      </label>
+    </span>
+    <span id="ctlPxMsg" class="mini"></span>
   </div>
   <div class="ctl-cols">
     <div>
@@ -1681,6 +1771,7 @@ INDEX_HTML = r"""<!doctype html>
             <option value="BLOCKED">blocked</option>
             <option value="A11Y_DOWN">accessibility down</option>
             <option value="PROXY_DOWN">proxy down</option>
+            <option value="UNIQUIFY_DOWN">caption uniquifier down</option>
             <option value="NO_ROWS">no videos</option>
             <option value="FAILED">repeated failures</option>
           </select>
@@ -2212,6 +2303,11 @@ async function refresh(){
 }
 // ---- Device control panel (separate view; own data source) ----------------
 const selected = new Set();
+const expanded = new Set();          // serials whose proxy detail panel is open
+const pxOp = new Map();              // serial -> {busy, msg, err} transient proxy-op state
+let CTLPROXY = new Map();            // serial -> proxy item from /api/proxy/state
+let CTLPROXY_LOADED = false;         // first /api/proxy/state fetch has completed
+let CTLPROXY_BUSY = false;           // a /api/proxy/state fetch is in flight
 let CTLLAST = null;
 let CURTAB = localStorage.getItem('fleetTab') || 'control';
 const taskNodes = new Map();       // task id -> {root, update} — persistent nodes
@@ -2228,7 +2324,7 @@ function showTab(tab){
   $('#statsView').style.display   = tab==='stats'?'':'none';
   $('#proxyView').style.display   = tab==='proxy'?'':'none';
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on', b.dataset.tab===tab));
-  if(tab==='control') refreshControl();
+  if(tab==='control'){ refreshControl(); refreshCtlProxy(); }
   if(tab==='proxy') refreshProxy();
 }
 document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>showTab(b.dataset.tab)));
@@ -2269,12 +2365,13 @@ function renderDevicesView(){
   const have=new Set(all.map(d=>d.serial)), byser=new Map(all.map(d=>[d.serial,d]));
   // prune selections that vanished OR became busy (can't select a busy device)
   [...selected].forEach(s=>{ const dd=byser.get(s); if(!have.has(s) || dd?.busy) selected.delete(s); });
+  [...expanded].forEach(s=>{ if(!have.has(s)) expanded.delete(s); });   // drop panels for gone devices
   const blk=CTLLAST?.blocked_count||0;
   $('#ctlDevCount').innerHTML = (devs.length===all.length? `(${all.length})` : `(${devs.length} of ${all.length})`)
     + (blk? ` · <span id="ctlBlkCount">⚠ ${blk} blocked</span>` : '');
   if(!devs.length){ cont.innerHTML='<div class="muted" style="padding:12px">no devices match</div>'; updateSelCount(); return; }
   const head='<div class="chead"><label class="hall"><input type="checkbox" id="ctlAllCk"> All</label>'
-    +'<span>account</span><span>serial</span><span style="text-align:right">adb / state</span></div>';
+    +'<span>account</span><span>serial</span><span style="text-align:right">adb / state</span><span></span></div>';
   cont.innerHTML=head+devs.map(d=>{
     const col=CSTATE_COLOR[d.state]||'var(--muted)';
     const acct=d.account?('@'+esc(d.account)):'<span class="muted">— unbound</span>';
@@ -2299,13 +2396,18 @@ function renderDevicesView(){
       cell=`<span class="cstate" style="color:${col}">${bb}${ad}${dd}${esc(d.state)}</span>`;
     }
     const lock = d.busy && !d.blocked;          // blocked -> not locked, can reassign
-    return `<label class="crow${lock?' busy':(d.blocked?' blk':'')}">
-      <input type="checkbox" data-ser="${esc(d.serial)}" ${selected.has(d.serial)?'checked':''} ${lock?'disabled':''}>
-      <span class="cacct">${acct}${sub}</span><span class="cser">${esc(d.serial)}</span>${cell}</label>`;
+    const open = expanded.has(d.serial);
+    return `<div class="cdev${open?' open':''}" data-ser="${esc(d.serial)}">
+      <div class="crow${lock?' busy':(d.blocked?' blk':'')}">
+        <input type="checkbox" class="crow-ck" data-ser="${esc(d.serial)}" ${selected.has(d.serial)?'checked':''} ${lock?'disabled':''}>
+        <span class="cacct">${acct}${sub}</span><span class="cser">${esc(d.serial)}</span>${cell}
+        <button class="cexpand" type="button" data-ser="${esc(d.serial)}" aria-expanded="${open?'true':'false'}" title="proxy details">${open?'▾':'▸'}</button>
+      </div>
+      <div class="cpanel" data-ser="${esc(d.serial)}"${open?'':' hidden'}>${open?panelInner(d.serial):''}</div>
+    </div>`;
   }).join('');
-  cont.querySelectorAll('.crow input[type=checkbox]').forEach(cb=>cb.addEventListener('change',e=>{
-    const s=e.target.dataset.ser; e.target.checked?selected.add(s):selected.delete(s); updateSelCount();
-  }));
+  // checkbox + expand + panel buttons + whole-row selection are handled by the
+  // delegated listeners on #ctlDevs (bound once in the init block below).
   // header "All" -> toggle all SELECTABLE (non-busy) devices in the current filter
   const allck=$('#ctlAllCk');
   if(allck){
@@ -2320,6 +2422,119 @@ function renderDevicesView(){
     });
   }
   updateSelCount();
+}
+// ---- per-device proxy detail panel (Control tab) --------------------------
+async function refreshCtlProxy(){
+  if(CTLPROXY_BUSY) return; CTLPROXY_BUSY=true;
+  try{
+    const d=await (await fetch('/api/proxy/state')).json();
+    const m=new Map(); (d.items||[]).forEach(it=>{ if(it.device) m.set(it.device,it); });
+    CTLPROXY=m; CTLPROXY_LOADED=true;
+    expanded.forEach(s=>paintPanel(s));        // refresh any open panels in place
+  }catch(e){ /* keep last-known map on a flaky fetch */ }
+  finally{ CTLPROXY_BUSY=false; }
+}
+function panelInner(serial){
+  const i=CTLPROXY.get(serial), op=pxOp.get(serial)||{}, ip=serial.split(':')[0];
+  if(!CTLPROXY_LOADED) return '<div class="mini muted">loading proxy info…</div>';
+  const stc=i?(PX_COLOR[i.state]||'var(--muted)'):'var(--muted)';
+  const px=(i&&i.proxy)?`${esc(i.proxy.server||'?')}:${esc(i.proxy.port||'')}`:'<span class="muted">none</span>';
+  const user=(i&&i.proxy&&i.proxy.username)?esc(i.proxy.username):'<span class="muted">—</span>';
+  const prov=(i&&i.provider)?esc(i.provider):'<span class="muted">—</span>';
+  const left=i?fmtLeft(i.hours_left):'—';
+  const expd=(i&&i.expires_at)?` <span class="mini muted">(${esc(i.expires_at)})</span>`:'';
+  const hw=(i&&i.health)?i.health.working:null;
+  const health=hw===true?`<span style="color:var(--accent)">✓ ${esc(i.health.latency_ms||'')}ms</span>`
+              :hw===false?`<span style="color:var(--bad)">✗ ${esc((i.health&&i.health.error)||'down')}</span>`:'—';
+  const state=i?`<span class="tag" style="color:${stc};border-color:${stc}">${esc(i.state)}</span>`:'<span class="muted">unknown</span>';
+  const blk=(i&&i.blocked)?' <span class="tag" style="color:var(--bad);border-color:var(--bad)">acct BLOCKED</span>':'';
+  const renewable=!!(i&&i.renewable), busy=!!op.busy;
+  const renewBtn=`<button class="dirbtn cpx-renew" data-ser="${esc(serial)}"${(!renewable||busy)?' disabled':''} title="${renewable?'extend this proxy by 1 day (SPENDS money)':'not a managed proxy.vn proxy — cannot renew, use rotate'}">↻ renew</button>`;
+  const rotateBtn=`<button class="dirbtn cpx-rotate" data-ser="${esc(serial)}"${busy?' disabled':''} title="buy a fresh proxy and assign it to this device (SPENDS money)">🔁 rotate</button>`;
+  const msg=op.msg?`<span class="mini cpx-msg" style="color:${op.err?'var(--bad)':'var(--muted)'}">${esc(op.msg)}</span>`:'';
+  return `<div class="cpanel-grid">
+    <div><span class="pl">proxy</span>${px}</div>
+    <div><span class="pl">user</span>${user}</div>
+    <div><span class="pl">provider</span>${prov}</div>
+    <div><span class="pl">expires</span>${left}${expd}</div>
+    <div><span class="pl">health</span>${health}</div>
+    <div><span class="pl">state</span>${state}${blk}</div>
+    <div><span class="pl">ip</span><span class="mini">${esc(ip)}</span></div>
+  </div>
+  <div class="cpanel-act">${renewBtn}${rotateBtn}${msg}</div>`;
+}
+function paintPanel(serial){
+  const cdev=$('#ctlDevs').querySelector(`.cdev[data-ser="${serial.replace(/"/g,'')}"]`); if(!cdev) return;
+  const panel=cdev.querySelector('.cpanel'); if(panel && !panel.hidden) panel.innerHTML=panelInner(serial);
+}
+function setPxOp(serial,o){ if(o) pxOp.set(serial,o); else pxOp.delete(serial); paintPanel(serial); }
+function toggleExpand(serial){
+  const open=!expanded.has(serial);
+  if(open){ expanded.add(serial); if(!CTLPROXY_LOADED) refreshCtlProxy(); } else expanded.delete(serial);
+  const cdev=$('#ctlDevs').querySelector(`.cdev[data-ser="${serial.replace(/"/g,'')}"]`); if(!cdev) return;
+  cdev.classList.toggle('open', open);
+  const panel=cdev.querySelector('.cpanel'), btn=cdev.querySelector('.cexpand');
+  if(open){ panel.innerHTML=panelInner(serial); panel.hidden=false; } else { panel.hidden=true; panel.innerHTML=''; }
+  if(btn){ btn.textContent=open?'▾':'▸'; btn.setAttribute('aria-expanded', open?'true':'false'); }
+}
+async function ctlPxRenewOne(serial){
+  const i=CTLPROXY.get(serial);
+  if(!i || !i.renewable){ alert('No managed (proxy.vn) proxy on this device — nothing to renew. Use rotate to assign a fresh one.'); return; }
+  if(!confirm(`Renew the proxy on ${serial} (+1 day) — this SPENDS money. Continue?`)) return;
+  setPxOp(serial,{busy:true,msg:'renewing…'});
+  try{
+    const r=await (await fetch('/api/proxy/renew',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({items:[{idproxy:i.idproxy,provider:i.provider}]})})).json();
+    const ok=(r.results||[]).some(x=>x.ok);
+    setPxOp(serial,{busy:false,msg:ok?'✓ renewed':'renew failed',err:!ok});
+  }catch(e){ setPxOp(serial,{busy:false,msg:'renew failed',err:true}); }
+  refreshCtlProxy();
+}
+async function ctlPxRotateOne(serial){
+  const ip=serial.split(':')[0], i=CTLPROXY.get(serial);
+  const prov=(i&&i.provider)||$('#ctlPxProv').value;
+  if(!confirm(`Rotate proxy on ${serial}: buy a NEW ${prov} proxy (SPENDS money) and assign it, replacing the current one. Continue?`)) return;
+  setPxOp(serial,{busy:true,msg:'rotating… (buying & assigning)'});
+  try{
+    const r=await (await fetch('/api/proxy/rotate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device:ip,provider:prov})})).json();
+    const res=r.result||{};
+    setPxOp(serial, r.ok ? {busy:false,msg:`✓ ${res.proxy} (working=${res.working})`}
+                        : {busy:false,msg:'rotate error: '+(r.error||res.error||'unknown'),err:true});
+  }catch(e){ setPxOp(serial,{busy:false,msg:'rotate failed',err:true}); }
+  refreshCtlProxy();
+}
+async function ctlBulkRenew(){
+  const items=[], seen=new Set();
+  selected.forEach(s=>{ const i=CTLPROXY.get(s);
+    if(i && i.renewable && !seen.has(i.idproxy)){ seen.add(i.idproxy); items.push({idproxy:i.idproxy, provider:i.provider}); } });
+  if(!items.length){ alert('None of the selected devices have a managed (renewable) proxy.vn proxy. Use "rotate proxy" to assign fresh ones, or open the Proxies tab.'); return; }
+  if(!confirm(`Renew ${items.length} proxy(ies) on the selected device(s) (+1 day) — this SPENDS money. Continue?`)) return;
+  document.querySelectorAll('#ctlPxRenew,#ctlPxRotate').forEach(b=>b.disabled=true);
+  $('#ctlPxMsg').textContent=`renewing ${items.length}…`;
+  try{
+    const r=await (await fetch('/api/proxy/renew',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({items})})).json();
+    const ok=(r.results||[]).filter(x=>x.ok).length;
+    $('#ctlPxMsg').textContent=`renewed ${ok}/${items.length}`;
+  }catch(e){ $('#ctlPxMsg').textContent='renew failed'; }
+  updateSelCount(); refreshCtlProxy();
+}
+async function ctlBulkRotate(){
+  const ips=[...selected].map(s=>s.split(':')[0]).filter(Boolean);
+  if(!ips.length){ alert('Select at least one device first.'); return; }
+  const prov=$('#ctlPxProv').value;
+  if(!confirm(`Rotate proxies on ${ips.length} selected device(s): buy ${ips.length} NEW ${prov} proxy(ies) (SPENDS money) and assign them, replacing the current ones.\nThis can take a while (one buy + health-check each). Continue?`)) return;
+  document.querySelectorAll('#ctlPxRenew,#ctlPxRotate').forEach(b=>b.disabled=true);
+  $('#ctlPxMsg').textContent=`rotating ${ips.length}… (buying & assigning, please wait)`;
+  try{
+    const r=await (await fetch('/api/proxy/rotate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({devices:ips,provider:prov})})).json();
+    if(r.ok){ const work=(r.results||[]).filter(x=>x.ok&&x.working).length;
+      $('#ctlPxMsg').textContent=`rotated ${r.rotated||0}/${ips.length} (${work} verified working)`; }
+    else $('#ctlPxMsg').textContent='rotate error: '+(r.error||'unknown');
+  }catch(e){ $('#ctlPxMsg').textContent='rotate failed'; }
+  updateSelCount(); refreshCtlProxy();
 }
 function taskStatusKey(t){ return t.running?'active':(t.rc===0?'success':'failed'); }
 function filterTasks(tasks){
@@ -2495,6 +2710,31 @@ $('#ctlSelRoster').addEventListener('click',e=>{ e.preventDefault();
   (CTLLAST?.devices||[]).forEach(d=>{ if(d.in_roster && !d.busy) selected.add(d.serial); }); renderDevicesView(); });
 $('#ctlSelBlocked').addEventListener('click',e=>{ e.preventDefault();
   (CTLLAST?.devices||[]).forEach(d=>{ if(d.blocked && !d.busy) selected.add(d.serial); }); renderDevicesView(); });
+// bulk proxy actions on the selected set
+$('#ctlPxRenew').addEventListener('click', ctlBulkRenew);
+$('#ctlPxRotate').addEventListener('click', ctlBulkRotate);
+// delegated handlers on the device list: expand toggle, per-device proxy buttons,
+// row-checkbox + whole-row selection. Bound once — survives innerHTML rebuilds.
+(function(){
+  const el=$('#ctlDevs');
+  el.addEventListener('click', e=>{
+    const exp=e.target.closest('.cexpand'); if(exp){ toggleExpand(exp.dataset.ser); return; }
+    const rn=e.target.closest('.cpx-renew'); if(rn){ ctlPxRenewOne(rn.dataset.ser); return; }
+    const rt=e.target.closest('.cpx-rotate'); if(rt){ ctlPxRotateOne(rt.dataset.ser); return; }
+    if(e.target.closest('.cpanel')) return;                 // other panel clicks: ignore
+    const row=e.target.closest('.crow'); if(!row || row.classList.contains('busy')) return;
+    if(e.target.closest('input[type=checkbox]')) return;    // checkbox toggles itself
+    const cb=row.querySelector('.crow-ck'); if(!cb || cb.disabled) return;
+    cb.checked=!cb.checked;                                  // whole-row click toggles selection
+    const s=cb.dataset.ser; cb.checked?selected.add(s):selected.delete(s); updateSelCount();
+  });
+  el.addEventListener('change', e=>{
+    const cb=e.target.closest('.crow-ck'); if(!cb) return;
+    const s=cb.dataset.ser; cb.checked?selected.add(s):selected.delete(s); updateSelCount();
+  });
+})();
+// keep open panels fresh (expiry/health) without polling when nothing is expanded
+setInterval(()=>{ if(CURTAB==='control' && expanded.size>0) refreshCtlProxy(); }, 15000);
 // ---- Proxy tab ----
 let PXLAST=null;
 const pxSel=new Map();   // idproxy -> provider
@@ -2581,6 +2821,34 @@ $('#pxBuy').addEventListener('click', async ()=>{
   const r=await (await fetch('/api/proxy/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:prov,count,days})})).json();
   $('#pxMsg').textContent=r.ok?`bought ${r.bought}, stored ${r.stored}`:('buy error: '+r.error); refreshProxy(); });
 
+// ---- caption uniquifier health banner (top of page, under navbar) ----
+async function refreshUniq(force){
+  let d; try{ d=await (await fetch('/api/uniquify/state'+(force?'?force=1':''))).json(); }catch(e){ return; }
+  const el=$('#uniqBanner'); if(!el) return;
+  const prov=n=>(d.providers||[]).find(p=>p.name===n)||{};
+  const shop=prov('shopaikey'), gem=prov('gemini');
+  const reason=esc(shop.error||'request rejected');
+  let cls='', html='';
+  if(d.configured===false){
+    cls='bad'; html='⛔ <b>Caption uniquifier is not configured</b> — no API key set. Descriptions are posted <b>without</b> uniquification.';
+  } else if(d.primary_ok===true){
+    el.hidden=true; return;                                  // primary healthy → no banner
+  } else if(d.primary_ok===false && d.fallback_ok===true){
+    cls='warn'; html=`⚠ <b>ShopAIKey caption uniquifier is failing</b> — falling back to <b>Gemini</b> (working), so descriptions are still being uniquified. <span class="tb-detail">ShopAIKey: <code>${reason}</code></span>`;
+  } else if(d.primary_ok===false){
+    cls='bad'; html=`⛔ <b>Caption uniquifier DOWN</b> — ShopAIKey is failing and no working fallback. Descriptions are posted <b>without</b> uniquification. <span class="tb-detail">ShopAIKey: <code>${reason}</code>${gem.error?(' · Gemini: <code>'+esc(gem.error)+'</code>'):''}</span>`;
+  } else if(d.primary_ok===null && d.fallback_ok===true){
+    el.hidden=true; return;                                  // no primary, Gemini serving fine
+  } else if(d.primary_ok===null && d.fallback_ok===false){
+    cls='bad'; html=`⛔ <b>Caption uniquifier DOWN</b> — Gemini is failing. Descriptions are posted <b>without</b> uniquification. <span class="tb-detail">Gemini: <code>${esc(gem.error||'rejected')}</code></span>`;
+  } else { el.hidden=true; return; }
+  el.className='topbanner '+cls;
+  el.innerHTML=html+'<button class="tb-recheck" title="re-probe the keys now">recheck now</button>';
+  el.hidden=false;
+  const rb=el.querySelector('.tb-recheck'); if(rb) rb.onclick=()=>{ rb.textContent='rechecking…'; refreshUniq(true); };
+}
+refreshUniq();
+setInterval(()=>refreshUniq(), 60000);
 showTab(CURTAB);
 setInterval(()=>{ if(CURTAB==='control') refreshControl(); }, 3000);
 setInterval(()=>{ if(CURTAB==='proxy') refreshProxy(); }, 8000);

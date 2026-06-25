@@ -258,53 +258,192 @@ def _last_n_hashtags(text: str, n: int = 5) -> list[str]:
 
 
 def _llm_chat(system: str, user: str, *, model: str, base_url: str, api_key: str,
-              temperature: float = 0.9, timeout: int = 60) -> str:
+              temperature: float = 0.9, timeout: int = 60, max_tokens: int | None = None) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
-    }).encode("utf-8")
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
     req = urllib.request.Request(
-        url, data=body, method="POST",
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"].strip()
+    msg = data["choices"][0]["message"]
+    return (msg.get("content") or "").strip()
 
 
-def uniquify_caption(base: str) -> str:
+def _short_err(e: object, limit: int = 220) -> str:
+    """Compact, log-safe error string. For an HTTPError, include the status code
+    and the upstream error body (where ShopAIKey reports 'Invalid token' / quota)."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"HTTP {e.code}: {body}".strip()[:limit]
+    return (str(e) or e.__class__.__name__)[:limit]
+
+
+# Where the posting path records its last uniquify outcome so the dashboard can
+# surface a banner when the primary (ShopAIKey) key is failing.
+UNIQUIFY_STATUS_PATH = Path(__file__).resolve().parents[1] / "data" / "uniquify_status.json"
+
+
+def _record_uniquify(ok: bool, provider: str | None, *, primary_ok: bool | None = None,
+                     errors: dict | None = None) -> None:
+    """Persist the last uniquify outcome (best-effort, never raises)."""
+    rec = {"ts": time.time(), "ok": bool(ok), "provider": provider,
+           "primary_ok": primary_ok, "errors": errors or {}}
+    try:
+        UNIQUIFY_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        UNIQUIFY_STATUS_PATH.write_text(json.dumps(rec), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_uniquify_status() -> dict | None:
+    """Last recorded uniquify outcome from a real post, or None."""
+    try:
+        return json.loads(UNIQUIFY_STATUS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _uniquify_providers() -> list[dict]:
+    """Ordered uniquifier backends: primary (ShopAIKey) then Gemini fallback.
+    Backends without an API key are omitted. The Gemini fallback uses the
+    operator's Google AI Studio key (UNIQUIFY_FALLBACK_API_KEY / GEMINI_API_KEY /
+    GOOGLE_API_KEY) against Google's OpenAI-compatible endpoint, so it works even
+    when the ShopAIKey balance/token is exhausted."""
+    provs: list[dict] = []
+    primary_key = os.environ.get("OPENAI_API_KEY", "")
+    if primary_key:
+        provs.append({
+            "name": "shopaikey", "api_key": primary_key,
+            "base_url": os.environ.get("UNIQUIFY_BASE_URL", "https://api.shopaikey.com/v1"),
+            "model": os.environ.get("UNIQUIFY_MODEL", "gemini-2.5-flash"),
+        })
+    fb_key = (os.environ.get("UNIQUIFY_FALLBACK_API_KEY")
+              or os.environ.get("GEMINI_API_KEY")
+              or os.environ.get("GOOGLE_API_KEY", ""))
+    if fb_key:
+        provs.append({
+            "name": "gemini", "api_key": fb_key,
+            "base_url": os.environ.get("UNIQUIFY_FALLBACK_BASE_URL",
+                                       "https://generativelanguage.googleapis.com/v1beta/openai"),
+            "model": os.environ.get("UNIQUIFY_FALLBACK_MODEL", "gemini-2.5-flash"),
+        })
+    return provs
+
+
+def uniquify_probe(timeout: int = 12) -> dict:
+    """Cheap 1-token health check of each uniquifier backend (for the dashboard).
+    Never raises. Returns primary_ok / fallback_ok and which backend would serve."""
+    provs = _uniquify_providers()
+    res: dict = {"checked_at": time.time(), "configured": bool(provs), "providers": [],
+                 "primary_ok": None, "fallback_ok": None, "effective": None}
+    for prov in provs:
+        ok, err = False, None
+        try:
+            _llm_chat("You reply with a single word.", "ping", model=prov["model"],
+                      base_url=prov["base_url"], api_key=prov["api_key"],
+                      temperature=0, timeout=timeout, max_tokens=1)
+            ok = True
+        except Exception as e:
+            err = _short_err(e)
+        res["providers"].append({"name": prov["name"], "ok": ok, "error": err})
+        if prov["name"] == "shopaikey":
+            res["primary_ok"] = ok
+        if prov["name"] == "gemini":
+            res["fallback_ok"] = ok
+        if ok and res["effective"] is None:
+            res["effective"] = prov["name"]
+    return res
+
+
+class UniquifyUnavailable(Exception):
+    """No caption-uniquifier backend could be reached (all backends failed, or none
+    is configured). Raised by ``uniquify_caption(..., raise_on_unavailable=True)`` so
+    the scripted poster can STOP a device rather than post a non-unique description."""
+
+    def __init__(self, detail: str, errors: dict | None = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.errors = errors or {}
+
+    @property
+    def reason(self) -> str:
+        """Most useful single line: the primary's error if present, else the detail."""
+        return self.errors.get("shopaikey") or self.detail
+
+
+def uniquify_caption(base: str, *, raise_on_unavailable: bool = False) -> str:
     """Rewrite the caption via the LLM uniquifier; preserve the last 5 hashtags.
 
     Falls back to the original caption (never raises) if the LLM call fails, the
     output is empty, or the final 5 hashtags were not preserved verbatim — a bad
     rewrite must not break or degrade a post.
+
+    With ``raise_on_unavailable=True``, an inability to reach ANY uniquifier backend
+    (all failed, or none configured) raises ``UniquifyUnavailable`` instead of
+    returning the original caption — letting the caller STOP rather than post a
+    non-unique description. Content-validation rejections still fall back to the
+    original (the service is up; only this one rewrite was rejected).
     """
     base = base.strip()
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        logger.warning("uniquify: no OPENAI_API_KEY; posting original caption")
+    provs = _uniquify_providers()
+    if not provs:
+        logger.warning("uniquify: no API key (OPENAI_API_KEY / GOOGLE_API_KEY); posting original caption")
+        _record_uniquify(False, None, errors={"config": "no api key"})
+        if raise_on_unavailable:
+            raise UniquifyUnavailable("no uniquifier API key configured", {"config": "no api key"})
         return base
-    model = os.environ.get("UNIQUIFY_MODEL", "gemini-2.5-flash")
-    base_url = os.environ.get("UNIQUIFY_BASE_URL", "https://api.shopaikey.com/v1")
     # The system prompt asks for "multiple versions"; for one reel we need one.
     user_msg = (
         "Rewrite the description below into exactly ONE unique version, following "
         "all the rules. Output only that single rewritten description.\n\n" + base
     )
-    try:
-        out = _llm_chat(UNIQUIFY_SYSTEM_PROMPT, user_msg, model=model, base_url=base_url,
-                        api_key=api_key).strip()
-    except Exception as e:
-        logger.warning("uniquify: LLM call failed (%s); posting original caption", e)
-        return base
+    # Try each backend in order (ShopAIKey primary -> Gemini fallback). A primary
+    # that is out of balance / has an invalid token fails here and we fall through.
+    out = ""
+    served: str | None = None
+    errors: dict[str, str] = {}
+    for prov in provs:
+        try:
+            out = _llm_chat(UNIQUIFY_SYSTEM_PROMPT, user_msg, model=prov["model"],
+                            base_url=prov["base_url"], api_key=prov["api_key"])
+        except Exception as e:
+            errors[prov["name"]] = _short_err(e)
+            logger.warning("uniquify: provider %r failed (%s); trying next",
+                           prov["name"], errors[prov["name"]])
+            continue
+        if out:
+            served = prov["name"]
+            break
+        errors[prov["name"]] = "empty response"
+        logger.warning("uniquify: provider %r returned empty; trying next", prov["name"])
+    has_primary = any(p["name"] == "shopaikey" for p in provs)
+    primary_ok = ("shopaikey" not in errors) if has_primary else None
     if not out:
-        logger.warning("uniquify: empty rewrite; posting original caption")
+        logger.warning("uniquify: all providers failed (%s); posting original caption", errors)
+        _record_uniquify(False, None, primary_ok=primary_ok, errors=errors)
+        if raise_on_unavailable:
+            raise UniquifyUnavailable("all uniquifier backends failed", errors)
         return base
+    if served != "shopaikey":
+        logger.warning("uniquify: primary down (%s); served via fallback %r",
+                       errors.get("shopaikey", "n/a"), served)
+    # A backend responded -> the uniquifier service is healthy. (Content-validation
+    # rejections below return the original caption but do not mark the API unhealthy.)
+    _record_uniquify(True, served, primary_ok=primary_ok, errors=errors or None)
 
     want = _last_n_hashtags(base)
     # Safety: if the model still emitted multiple versions, keep only the first
