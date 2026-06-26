@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
 import signal
@@ -91,6 +92,15 @@ CAD_PRIOR_DAYS = 7        # historical prior window
 CAD_MIN_SAMPLE = 8        # min gaps before a window's cadence is trusted
 CAD_BLEND_TARGET_N = 40   # recent posts needed to fully trust today over the prior
 CAD_DEFAULT_MIN = 120     # cold-start cadence when there is no history at all
+
+# Low-content alerts (configured per chat via /alerts). Both alerts fire ONCE
+# when a threshold is crossed downward while posting is actually running; a
+# single "shortage episode" coalesces them so there is at most one ping. The
+# episode recovers on a content target (in videos), so it resolves even after
+# the fleet has stopped. See the design discussion.
+ALERT_RUN_GRACE_MIN = 15  # "posting is running" = a post landed within this many minutes
+ALERT_VIDEOS_HYST = 1.2   # episode recovers when remaining climbs back above threshold * this
+ALERT_HOURS_HYST = 1.3    # ... and above the hours threshold's video-equivalent * this
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +601,19 @@ def _tg(method: str, http_timeout: int = 20, **params) -> dict:
 _lock = threading.Lock()          # guards reads/writes of _state fields
 _send_lock = threading.Lock()     # serializes the whole edit/send network op
 _save_lock = threading.Lock()     # serializes the atomic state-file write
-_state = {"chat_id": None, "message_id": None, "offset": 0, "last_text": None}
+
+
+def _default_alerts() -> dict:
+    return {
+        "videos_threshold": None,   # int, or None = off
+        "hours_threshold": None,    # float hours, or None = off
+        # one shortage episode at a time; recovers on a video-count target
+        "episode": {"active": False, "started_at": None, "target": None, "reasons": []},
+    }
+
+
+_state = {"chat_id": None, "message_id": None, "offset": 0, "last_text": None,
+          "alerts": _default_alerts()}
 _stop = threading.Event()
 
 
@@ -600,6 +622,15 @@ def _load_state() -> None:
     for k in ("chat_id", "message_id", "offset"):
         if d.get(k) is not None:
             _state[k] = d[k]
+    al = d.get("alerts")
+    if isinstance(al, dict):
+        base = _default_alerts()
+        for k in ("videos_threshold", "hours_threshold"):
+            if k in al:
+                base[k] = al[k]
+        if isinstance(al.get("episode"), dict):
+            base["episode"].update(al["episode"])
+        _state["alerts"] = base
     env_chat = os.environ.get("TELEGRAM_STATUS_CHAT")
     if env_chat and not _state["chat_id"]:
         try:
@@ -612,6 +643,7 @@ def _save_state() -> None:
     """Atomic, serialized write so a crash mid-write can't truncate the file."""
     with _lock:
         snap = {k: _state[k] for k in ("chat_id", "message_id", "offset")}
+        snap["alerts"] = json.loads(json.dumps(_state["alerts"]))  # deep copy under lock
     with _save_lock:
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -685,7 +717,214 @@ def push(force: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# command handling (/bind, /unbind, /refresh)
+# low-content alerts
+# ---------------------------------------------------------------------------
+def _notify(text: str, loud: bool = True) -> int | None:
+    """Send a standalone notification message (NOT the edited status message)."""
+    with _lock:
+        chat = _state["chat_id"]
+    if not chat:
+        return None
+    r = _tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+            disable_web_page_preview=True, disable_notification=not loud)
+    if not r.get("ok"):
+        print(f"[status_bot] notify failed: {r.get('description')}", flush=True)
+        return None
+    return r["result"]["message_id"]
+
+
+def _fmt_hours(h: float | None) -> str:
+    if h is None:
+        return "—"
+    return f"{h / 24:.1f} дн" if h >= 48 else f"{round(h)} ч"
+
+
+def _fmt_thr(x):
+    """Drop a trailing .0 so an hours threshold of 6.0 shows as 6."""
+    if isinstance(x, float) and x.is_integer():
+        return int(x)
+    return x
+
+
+def _added_since(started_at: float | None) -> int:
+    """How many videos entered the 'new' queue since the shortage began."""
+    if not started_at:
+        return 0
+    ts = datetime.fromtimestamp(started_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00")
+    rows = _mgmt_query(
+        "SELECT count(*) AS n FROM fffbt.videos "
+        f"WHERE platform='Instagram' AND status='new' AND created_at > '{ts}'"
+    )
+    try:
+        return int(rows[0]["n"]) if rows else 0
+    except Exception:
+        return 0
+
+
+def _alert_text(remaining: int, pace: dict, reasons: list, vth, hth) -> str:
+    parts = [f"🎬 осталось <b>{remaining}</b>" + (f" (порог {vth})" if "videos" in reasons else "")]
+    rmid = pace.get("runway_mid")
+    if rmid is not None:
+        parts.append(f"⏳ запас ~{_fmt_hours(rmid)}" + (f" (порог {_fmt_thr(hth)} ч)" if "hours" in reasons else ""))
+    return ("⚠️ <b>Мало контента</b> (выкладка идёт)\n"
+            + " · ".join(parts)
+            + f"\nТемп ~{_fmt_rate(pace.get('rate_mid'))}/ч. Пора заливать видео.")
+
+
+def _recovery_text(added: int, remaining) -> str:
+    return ("✅ <b>Контент пополнен</b>\n"
+            f"Залито <b>+{added}</b> видео в S3 · в очереди теперь <b>{fmt(remaining)}</b>\n"
+            "Флот готов к запуску — есть что выкладывать ▶️")
+
+
+def _alert_metrics():
+    """Best-effort snapshot for the alert engine: (remaining, pace, posting) or
+    None if data is missing (we never fire on missing data)."""
+    state = _dash_get("/api/state")
+    if not state or "error" in state:
+        return None
+    extras = db_extras()
+    remaining = (extras or {}).get("remaining_new")
+    if remaining is None:
+        remaining = (state.get("backlog") or {}).get("new")
+    if remaining is None:
+        return None
+    control = _dash_get("/api/control/state")
+    counts = classify(state, control)
+    pace = _estimate_pace(counts["active"], remaining, (extras or {}).get("cad"))
+    last_pub = _parse_pg_ts((extras or {}).get("last_published_at")) or _fleet_last_post_ts(state)
+    last_post_age = (time.time() - last_pub) if last_pub else None
+    posting = (counts.get("active", 0) > 0 and last_post_age is not None
+               and last_post_age < ALERT_RUN_GRACE_MIN * 60)
+    return remaining, pace, posting
+
+
+def _check_alerts() -> None:
+    """Edge-triggered, fire-once-per-episode low-content alerts. Runs each
+    refresh tick (daemon only)."""
+    with _lock:
+        chat = _state["chat_id"]
+        vth = _state["alerts"].get("videos_threshold")
+        hth = _state["alerts"].get("hours_threshold")
+        ep = dict(_state["alerts"].get("episode") or {})
+    if not chat or (vth is None and hth is None and not ep.get("active")):
+        return
+    m = _alert_metrics()
+    if m is None:
+        return
+    remaining, pace, posting = m
+
+    if not ep.get("active"):
+        if not posting:
+            return  # both alerts gated on the fleet actually posting
+        reasons = []
+        if vth is not None and remaining < vth:
+            reasons.append("videos")
+        rmid = pace.get("runway_mid")
+        if hth is not None and rmid is not None and rmid < hth:
+            reasons.append("hours")
+        if not reasons:
+            return
+        target = remaining + 1  # must climb at least somewhat to recover
+        if "videos" in reasons and vth:
+            target = max(target, math.ceil(round(vth * ALERT_VIDEOS_HYST, 6)))
+        if "hours" in reasons and hth:
+            rate = pace.get("rate_mid") or 0
+            target = max(target, math.ceil(round(hth * ALERT_HOURS_HYST * rate, 6)))
+        with _lock:
+            _state["alerts"]["episode"] = {
+                "active": True, "started_at": time.time(),
+                "target": target, "reasons": reasons,
+            }
+        _save_state()
+        _notify(_alert_text(remaining, pace, reasons, vth, hth), loud=True)
+    else:
+        if remaining >= (ep.get("target") or 0):  # content-based recovery (no posting gate)
+            added = _added_since(ep.get("started_at"))
+            with _lock:
+                _state["alerts"]["episode"] = {
+                    "active": False, "started_at": None, "target": None, "reasons": [],
+                }
+            _save_state()
+            _notify(_recovery_text(added, remaining), loud=False)
+
+
+def _alerts_status_text() -> str:
+    with _lock:
+        vth = _state["alerts"].get("videos_threshold")
+        hth = _state["alerts"].get("hours_threshold")
+        active = bool((_state["alerts"].get("episode") or {}).get("active"))
+    remaining = runway = None
+    m = _alert_metrics()
+    if m is not None:
+        remaining, pace, _posting = m
+        runway = pace.get("runway_mid")
+
+    def line(label, thr, cur, unit, low):
+        if thr is None:
+            return f"{label}: выкл"
+        s = f"{label}: &lt; {_fmt_thr(thr)}{unit}"
+        if cur is not None:
+            mark = " ⚠️" if low else " ✅"
+            shown = f"{cur}" if unit == "" else f"~{_fmt_hours(cur)}"
+            s += f" — сейчас {shown}{mark}"
+        return s
+
+    vlow = remaining is not None and vth is not None and remaining < vth
+    hlow = runway is not None and hth is not None and runway < hth
+    return (
+        "🔔 <b>Алерты</b>\n"
+        + line("🎬 Мало видео", vth, remaining, "", vlow) + "\n"
+        + line("⏳ Мало времени", hth, runway, " ч", hlow) + "\n"
+        + ("📦 Эпизод: открыт" if active else "📦 Эпизод: нет")
+    )
+
+
+def _reply(chat, text: str) -> None:
+    _tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+        disable_web_page_preview=True, disable_notification=True)
+
+
+def _handle_alerts_cmd(chat, text: str) -> None:
+    args = text.split()[1:]
+    usage = ("Команды алертов:\n"
+             "/alerts — настройки и текущее состояние\n"
+             "/alerts videos N|off — порог по числу видео\n"
+             "/alerts hours H|off — порог по часам запаса\n"
+             "/alerts test — тестовый пинг")
+    if not args:
+        _reply(chat, _alerts_status_text())
+        return
+    sub = args[0].lower()
+    if sub in ("videos", "hours") and len(args) >= 2:
+        val = args[1].lower()
+        key = "videos_threshold" if sub == "videos" else "hours_threshold"
+        if val == "off":
+            with _lock:
+                _state["alerts"][key] = None
+        else:
+            try:
+                num = int(val) if sub == "videos" else float(val.replace(",", "."))
+                if num <= 0:
+                    raise ValueError
+            except ValueError:
+                ex = "/alerts videos 50" if sub == "videos" else "/alerts hours 6"
+                _reply(chat, f"Нужно положительное число или off. Пример: {ex}")
+                return
+            with _lock:
+                _state["alerts"][key] = num
+        _save_state()
+        _reply(chat, _alerts_status_text())
+    elif sub == "test":
+        if _notify("⚠️ <b>Тест алерта</b>\nЕсли это пришло со звуком — уведомления работают.",
+                   loud=True) is None:
+            _reply(chat, "Не смог отправить тест (бот не привязан к чату?).")
+    else:
+        _reply(chat, usage)
+
+
+# ---------------------------------------------------------------------------
+# command handling (/bind, /unbind, /refresh, /alerts)
 # ---------------------------------------------------------------------------
 def _handle_update(u: dict) -> None:
     msg = u.get("message") or u.get("channel_post") or {}
@@ -711,6 +950,8 @@ def _handle_update(u: dict) -> None:
         print("[status_bot] unbound", flush=True)
     elif cmd in ("/refresh", "/status"):
         push(force=True)
+    elif cmd == "/alerts":
+        _handle_alerts_cmd(chat, text)
 
 
 _POLL_SECS = 30  # getUpdates server-side long-poll seconds
@@ -740,6 +981,10 @@ def _updates_loop() -> None:
 def _refresh_loop() -> None:
     while not _stop.is_set():
         push(force=False)
+        try:
+            _check_alerts()
+        except Exception as e:
+            print(f"[status_bot] alert check error: {e}", flush=True)
         _stop.wait(REFRESH_SECS)
 
 
